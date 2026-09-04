@@ -1,0 +1,118 @@
+"""Agent 工作流节点包。
+
+保持向后兼容：集中重新导出所有节点函数与基础辅助函数。
+"""
+
+from __future__ import annotations
+
+from app.agent.nodes.base import (
+    append_step,
+    _paper_identity_key,
+    _select_search_keywords,
+    _select_branch_diverse_keywords,
+    _select_batch_first_keywords,
+    _compact_debug_value,
+    _preview_text,
+    _paper_debug_item,
+    _summarize_papers,
+    _latest_step,
+    _needs_current_time_tool,
+)
+from app.agent.nodes.planning import (
+    plan_node,
+    provisional_route_node,
+    diagnose_evidence_gaps_node,
+    recovery_controller_node,
+    scope_revision_node,
+)
+from app.agent.nodes.retrieval import (
+    search_node,
+    rank_node,
+    refine_search_node,
+    expand_search_year_node,
+    fetch_detail_node,
+    retrieval_shortfall_node,
+)
+from app.agent.nodes.extraction import (
+    download_pdf_node,
+    parse_pdf_node,
+    extract_card_node,
+)
+from app.agent.nodes.verification import (
+    claim_plan_node,
+    claim_evidence_gate_node,
+    global_evidence_gate_node,
+    citation_check_node,
+    verify_claims_node,
+    _remove_unsupported_claims,
+)
+from app.agent.nodes.synthesis import (
+    validate_routes_node,
+    cluster_node,
+    generate_deliverables_node,
+    final_answer_node,
+    _remediate_invalid_taxonomy,
+    _global_deliverable_citation_quotas,
+    _is_two_part_background_status_request,
+    _with_display_number,
+    _research_status_evidence_disclosure,
+    _add_scope_disclosure,
+    _infer_evidence_role,
+    _plan_citation_allocation,
+    _citation_allocation_budget,
+    _citation_section_fit_score,
+    _apply_final_quality_gate,
+    _global_gate_warning_banner,
+    _assemble_answer,
+)
+
+__all__ = [
+    "append_step",
+    "_paper_identity_key",
+    "_select_search_keywords",
+    "_select_branch_diverse_keywords",
+    "_select_batch_first_keywords",
+    "_compact_debug_value",
+    "_preview_text",
+    "_paper_debug_item",
+    "_summarize_papers",
+    "_latest_step",
+    "_needs_current_time_tool",
+    "plan_node",
+    "provisional_route_node",
+    "diagnose_evidence_gaps_node",
+    "recovery_controller_node",
+    "scope_revision_node",
+    "search_node",
+    "rank_node",
+    "refine_search_node",
+    "expand_search_year_node",
+    "fetch_detail_node",
+    "retrieval_shortfall_node",
+    "download_pdf_node",
+    "parse_pdf_node",
+    "extract_card_node",
+    "claim_plan_node",
+    "claim_evidence_gate_node",
+    "global_evidence_gate_node",
+    "citation_check_node",
+    "verify_claims_node",
+    "_remove_unsupported_claims",
+    "validate_routes_node",
+    "cluster_node",
+    "generate_deliverables_node",
+    "final_answer_node",
+    "_remediate_invalid_taxonomy",
+    "_global_deliverable_citation_quotas",
+    "_is_two_part_background_status_request",
+    "_with_display_number",
+    "_research_status_evidence_disclosure",
+    "_add_scope_disclosure",
+    "_infer_evidence_role",
+    "_plan_citation_allocation",
+    "_citation_allocation_budget",
+    "_citation_section_fit_score",
+    "_apply_final_quality_gate",
+    "_global_gate_warning_banner",
+    "_assemble_answer",
+]

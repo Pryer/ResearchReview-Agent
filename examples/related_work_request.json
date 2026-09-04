@@ -1,0 +1,25 @@
+{
+  "name": "related_work_with_our_work",
+  "request": {
+    "session_id": "example-related-work-001",
+    "user_query": "生成少样本动作识别的相关工作章节",
+    "state": {
+      "our_work": {
+        "research_problem": "低样本条件下的动作类别泛化",
+        "method_name": "TempFSL",
+        "method_summary": "时序原型网络结合跨域迁移",
+        "innovations": [
+          "动态时间规整模块",
+          "跨域自适应策略"
+        ]
+      }
+    }
+  },
+  "expected": {
+    "guard": "allowed",
+    "deliverable": "related_work",
+    "requires": "our_work",
+    "missing_our_work_behavior": "ask_for_clarification_or_generate_domain_draft"
+  }
+}
+

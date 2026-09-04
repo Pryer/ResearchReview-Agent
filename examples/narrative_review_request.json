@@ -1,0 +1,19 @@
+{
+  "name": "narrative_review_minimal",
+  "request": {
+    "session_id": "example-narrative-001",
+    "user_query": "调研近三年课堂行为分析相关论文，引用不少于10篇，并生成中文叙述性综述"
+  },
+  "expected": {
+    "guard": "allowed",
+    "deliverable": "narrative_review",
+    "reference_requirement": 10,
+    "external_calls": "mock_in_tests",
+    "must_not": [
+      "invent papers or citations",
+      "silently expand the explicit date range",
+      "treat citation_count as a per-paper filter"
+    ]
+  }
+}
+

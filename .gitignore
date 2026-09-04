@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual Environment
+venv/
+env/
+.venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 项目数据（二进制 / 本地生成）
+data/
+pytest_temp/
+pytest_tmp*/
+.pytest-tmp*/
+\.pytest_cache/
+data/pdfs/*.pdf
+data/parsed/*.json
+data/reviews/*.md
+data/reviews/*.json
+data/vector_index/
+data/*.db
+
+# 本地 Agent、IDE 与计划缓存
+.agents/
+.claude/
+.cursor/
+.zcode/
+/plan.md
+/1.md
+/指令.py
+
+# 浏览器驱动（二进制）
+chromedriver-win64/
+
+# 日志
+logs/
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db

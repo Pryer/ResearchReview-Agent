@@ -1,0 +1,13 @@
+{
+  "name": "unsupported_method_request",
+  "request": {
+    "session_id": "example-unsupported-001",
+    "user_query": "帮我设计一个少样本动作识别实验并编写完整论文方法章节"
+  },
+  "expected": {
+    "guard": "blocked",
+    "retrieval_started": false,
+    "must_explain": "supported deliverables and why the request is outside scope"
+  }
+}
+
