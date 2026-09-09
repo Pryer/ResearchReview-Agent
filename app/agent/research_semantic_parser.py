@@ -256,6 +256,10 @@ def derive_research_semantics(frame: ResearchSemanticFrame) -> ResearchSemanticF
     requirements = frame.evidence_requirements or _generic_evidence_requirements(
         frame.model_copy(update={"methods": methods})
     )
+    requirements = _annotate_requirement_provenance(
+        requirements,
+        frame.model_copy(update={"methods": methods}),
+    )
     return frame.model_copy(update={
         "methods": methods,
         "research_mode": mode,
@@ -268,6 +272,56 @@ def derive_research_semantics(frame: ResearchSemanticFrame) -> ResearchSemanticF
         ),
         "evidence_requirements": requirements,
     })
+
+
+def _annotate_requirement_provenance(
+    requirements: Iterable[EvidenceRequirement],
+    frame: ResearchSemanticFrame,
+) -> list[EvidenceRequirement]:
+    """用落定后的源实体覆盖模型自报的 requirement 来源。"""
+    entities = {
+        str(item.id): item
+        for items in (
+            frame.application_domains,
+            frame.research_objects,
+            frame.research_actions,
+            frame.analysis_targets,
+            frame.methods,
+        )
+        for item in items
+    }
+    annotated: list[EvidenceRequirement] = []
+    for requirement in requirements:
+        linked = [
+            entities[str(source_id)]
+            for source_id in requirement.source_ids
+            if str(source_id) in entities
+        ]
+        if not linked:
+            annotated.append(requirement.model_copy(update={
+                "explicit": False,
+                "inferred": True,
+                "source": "legacy_unknown",
+            }))
+            continue
+        explicit = all(bool(item.explicit) for item in linked)
+        sources = {str(item.source or "unknown") for item in linked}
+        basis = "; ".join(dict.fromkeys(
+            str(item.inference_basis).strip()
+            for item in linked
+            if str(item.inference_basis or "").strip()
+        )) or None
+        annotated.append(requirement.model_copy(update={
+            "explicit": explicit,
+            "inferred": not explicit,
+            "source": (
+                "user_explicit" if explicit
+                else next(iter(sources)) if len(sources) == 1
+                else "mixed"
+            ),
+            "inference_basis": basis,
+        }))
+    return annotated
 
 
 def _empty_frame(topic: str) -> ResearchSemanticFrame:

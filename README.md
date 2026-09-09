@@ -236,6 +236,21 @@ ResearchReview-Agent/
 | `SEMANTIC_SCHOLAR_API_KEY` | S2 可选密钥 | 空 |
 | `APP_API_KEY` | 共享部署时保护业务接口的可选密钥 | 空（仅建议本地） |
 | `CORS_ALLOWED_ORIGINS` | 允许访问API的前端来源，逗号分隔 | 本机8501端口 |
+| `RECOVERY_TOTAL_ACTION_BUDGET` | 路线补证、结构修复、引用重分配和章节重写共享的任务级动作预算 | `6` |
+| `ENABLE_REFERENCE_COVERAGE_BEST_EFFORT_RELEASE` | 恢复预算耗尽且仅剩引用篇数缺口时，是否允许发布明确标注的部分完成草稿 | `true` |
+| `REFERENCE_COVERAGE_BEST_EFFORT_RATIO` | 上述部分完成草稿所需的最低有效引用覆盖率；原始篇数要求不会被改写 | `0.85` |
+| `ENABLE_RECOVERY_EXHAUSTED_BEST_EFFORT_GENERATION` | 有界恢复耗尽后，是否基于当前可用证据执行一次最终草稿生成并以 `partial` 发布 | `true` |
+| `ROUTE_SECTION_MIN_PLAIN_CHARS` | 正式研究路线小节的最低正文字符数；章节引用下限仍由 WritingPlan 单独给出 | `80` |
+
+写作门禁失败后，系统会依据实际缺口在预算内自动重算状态、重建主张授权、
+调整引用或只重写失败章节。只有缺少访问条件、用户材料，或必须改变显式范围/
+篇数约束时才请求用户决定；“仅用现有证据”会禁止自动补检索。
+语义主张核验未完成时，系统会保留正文并只重试核验，不重新检索或整篇改写；
+报告会分别显示证据不支持数量与尚未完成核验数量。
+有界恢复耗尽且仍有可归属证据时，默认再生成一次明确标注限制的 `partial`
+草稿。API 调用方可在 `AgentRequest` 顶层传入
+`"best_effort_on_failure": false` 保持严格阻断；该开关不会降低原始篇数、
+时间或主题要求。blocked 会话可直接输入“生成可用草稿”复用已保存证据。
 
 ---
 

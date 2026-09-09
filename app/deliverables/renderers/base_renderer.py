@@ -23,6 +23,7 @@ from app.core.text_quality import (
     EDITORIAL_LEAKAGE_RE,
     detect_english_sentences,
     detect_incomplete_fragments,
+    detect_token_only_fragments,
     strip_evidence_meta_language,
 )
 
@@ -94,10 +95,26 @@ def _write_sections_in_chinese(
         return ""
 
     def rewrite(section) -> tuple[str, str, dict[str, Any]]:
+        reusable = state.get("_reusable_section_texts") or {}
+        if section.id in reusable:
+            retained = str(reusable[section.id])
+            return section.id, retained, {
+                "section_id": section.id,
+                "status": "reused_checkpoint",
+                "attempts": 0,
+                "required_citations": len(_citation_ids(retained)),
+            }
         original = sections[section.id]
         required_ids = _citation_ids(original)
+        force_targets = {
+            str(value) for value in state.get("target_section_ids") or [] if value
+        }
+        force_rewrite = bool(state.get("force_section_rewrite")) and (
+            not force_targets or section.id in force_targets
+        )
         if (
-            not required_ids
+            not force_rewrite
+            and not required_ids
             and not _english_sentences(original)
             and not re.search(r"论文明确报告|从其他纳入证据看", original)
             and len(re.sub(r"^#{2,4}[^\n]*", "", original).strip()) >= 20
@@ -540,7 +557,7 @@ def _conservative_evidence_section(section, cards: list[dict[str, Any]]) -> str:
     entries: list[str] = []
     for card in section_cards[:60]:
         pid = str(card.get("paper_id") or "")
-        title = str(card.get("title") or "").strip()
+        title = _safe_title_for_body(card.get("title"))
         if not pid or not title:
             continue
         year = card.get("year") or "年份未知"
@@ -558,16 +575,11 @@ def _conservative_evidence_section(section, cards: list[dict[str, Any]]) -> str:
             detail = f"采用{method}"
         if detail:
             entries.append(f"《{title}》（{source_note}）{detail}[{pid}]。")
-        else:
-            entries.append(f"《{title}》（{source_note}）[{pid}]。")
 
     if not entries:
         return "\n".join([heading, "当前证据池中没有分配给本节的论文。"])
 
-    lead = (
-        f"本节纳入 {len(entries)} 篇文献，以下按各文献自身报告的问题设定与方法"
-        "如实列出，不作跨文献综合："
-    )
+    lead = "已有文献分别从以下问题设定与方法路径展开研究："
     return "\n".join([heading, lead, *entries])
 
 
@@ -579,6 +591,73 @@ def _first_sentence(value: Any, limit: int = 80) -> str:
     text = re.split(r"[。；;！!？?\n]", text)[0].strip()
     text = text.rstrip("，,、").strip()
     return text[:limit]
+
+
+def _safe_title_for_body(value: Any) -> str:
+    """返回可放入中文正文的书目标签，避免英文题名被当成正文句子。"""
+    title = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not title:
+        return ""
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", title))
+    latin_count = len(re.findall(r"[A-Za-z]+(?:[-'][A-Za-z]+)?", title))
+    # 纯英文题名来自检索元数据，不能未经转述直接写入正文；混合题名在
+    # 英文词较多时同样可能触发“完整英文句子”门禁，统一使用中性标签。
+    if latin_count and (cjk_count == 0 or (latin_count >= 7 and cjk_count <= 3)):
+        return "该研究"
+    return title
+
+
+def _safe_claim_for_body(value: Any) -> str:
+    """返回可直接放入中文兜底正文的授权主张；英文整句留给可用模型转述。"""
+    text = _neutralize_evidence_self_reference(str(value or "")).strip()
+    latin_chars = len(re.findall(r"[A-Za-z]", text))
+    cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
+    # 部分抽取器会把英文空格去掉，导致 detect_english_sentences 只看到
+    # 一个超长拉丁词；按字符量补一层保守识别，避免英文原句泄漏正文。
+    if (
+        not text
+        or _english_sentences(text)
+        or (latin_chars >= 24 and cjk_chars <= 3)
+        # 指标名、模型名或数据集名不是可独立成句的学术主张。抽取器把
+        # "accuracy/F1" 等字段粘连时，必须留在证据层等待重新转述。
+        or cjk_chars < 6
+    ):
+        return ""
+    return text.rstrip("。，；、,.; ")
+
+
+def _claim_plan_claims_by_paper(state: dict[str, Any]) -> dict[str, list[str]]:
+    """按论文索引当前 Claim Plan 中已授权的可写主张。"""
+    try:
+        from app.agent.claim_plan import _paper_id_from_evidence
+    except Exception:
+        return {}
+    result: dict[str, list[str]] = {}
+    for plan in state.get("claim_plans") or []:
+        for claim in plan.get("claims") or []:
+            text = _neutralize_evidence_self_reference(
+                claim.get("claim_text") or claim.get("claim") or ""
+            ).strip()
+            if not text:
+                continue
+            for evidence_id in claim.get("evidence_ids") or []:
+                paper_id = _paper_id_from_evidence(evidence_id)
+                if paper_id and text not in result.setdefault(paper_id, []):
+                    result[paper_id].append(text)
+    return result
+
+
+def _allocated_paper_ids_for_section(state: dict[str, Any], section_id: str) -> list[str]:
+    """读取当前交付物为章节分配的额外论文，兼容旧版 section/title 字段。"""
+    ids: list[str] = []
+    for item in (state.get("citation_allocation_plan") or {}).get("sections") or []:
+        if str(item.get("section_id") or "") != str(section_id):
+            continue
+        for paper_id in item.get("paper_ids") or []:
+            value = str(paper_id or "")
+            if value and value not in ids:
+                ids.append(value)
+    return ids
 
 
 def _heading(title: str, heading_level: int | None = 2) -> str:
@@ -1056,6 +1135,12 @@ def _validate_rewritten_section(
         errors.append("泄漏了检索、证据可用性或代理运行语言")
     if _incomplete_section_fragments(text):
         errors.append("章节末尾存在疑似截断句")
+    token_fragments = detect_token_only_fragments(text)
+    if token_fragments:
+        errors.append(
+            "包含缺少主体或谓词的词元碎片："
+            + json.dumps(token_fragments[:3], ensure_ascii=False)
+        )
     if len(re.sub(r"^#{2,4}[^\n]*", "", text or "").strip()) < 20:
         errors.append("章节正文过短")
     return errors
@@ -1085,6 +1170,7 @@ def _section_candidate_score(
     score -= 30 if _EDITORIAL_LEAKAGE_RE.search(text or "") else 0
     score -= 30 if _AGENT_PROCESS_LANGUAGE_RE.search(text or "") else 0
     score -= 30 * len(_incomplete_section_fragments(text))
+    score -= 30 * len(detect_token_only_fragments(text))
     if re.search(r"论文明确报告|从其他纳入证据看", text or ""):
         score -= 10
     return score
@@ -1106,6 +1192,7 @@ def _is_safe_partial_section(
         or _EDITORIAL_LEAKAGE_RE.search(text)
         or _AGENT_PROCESS_LANGUAGE_RE.search(text)
         or _incomplete_section_fragments(text)
+        or detect_token_only_fragments(text)
     ):
         return False
     if re.findall(r"^(#{2,4})\s+(.+?)\s*$", text, re.M) != [
@@ -1217,6 +1304,14 @@ def _normalize_evidence_citations(text: str, cards: list[dict[str, Any]]) -> str
     evidence_to_paper: dict[str, str] = {}
     for card in cards:
         paper_id = str(card.get("paper_id") or "")
+        # 证据卡片可能来自 PDF/摘要抽取，只有 evidence_spans 而没有
+        # 结构化 claims。两者都是同一篇论文的证据授权，不能因为缺少
+        # claims 镜像就把模型正确引用的 ``paper_id:eNNN`` 判成越权引用。
+        for span in card.get("evidence_spans") or []:
+            if isinstance(span, dict):
+                evidence_id = str(span.get("evidence_id") or "")
+                if paper_id and evidence_id:
+                    evidence_to_paper[evidence_id] = paper_id
         for claim in card.get("claims") or []:
             evidence_id = str(claim.get("evidence_id") or "")
             if paper_id and evidence_id:
@@ -1346,6 +1441,7 @@ class BaseRenderer:
     ) -> str:
         """证据约束的降级写作器。用自然段落综合论文证据，不堆砌机械引用句式。"""
         claims_by_paper = {card["paper_id"]: card.get("claims") or [] for card in cards}
+        claim_plan_claims_by_paper = _claim_plan_claims_by_paper(state)
         synthesis_by_name = {
             str(item.get("theme_name")): item for item in state.get("theme_synthesis") or []
         }
@@ -1408,6 +1504,26 @@ class BaseRenderer:
                 continue
 
             # ── 主题综合章节（research_status / related_work 的分主题节） ─────────
+            # 保守重写必须使用当前 Claim Plan 已授权的句子；主题综合缓存或
+            # 通用字段可能来自上一轮，直接复用会造成“引用存在但 CCC 无授权”。
+            if state.get("conservative_regeneration") and claim_plan_claims_by_paper:
+                authorized_points: list[tuple[str, str]] = []
+                section_paper_ids = list(dict.fromkeys([
+                    *section.supporting_paper_ids,
+                    *_allocated_paper_ids_for_section(state, section.id),
+                ]))
+                for pid in section_paper_ids:
+                    claim_texts = claim_plan_claims_by_paper.get(str(pid)) or []
+                    if claim_texts:
+                        authorized_points.append((claim_texts[0], str(pid)))
+                if authorized_points:
+                    parts.append(
+                        "围绕该研究路线，已有证据分别报告："
+                        + "；".join(f"{text}[{pid}]" for text, pid in authorized_points)
+                        + "。"
+                    )
+                    continue
+
             synthesis = synthesis_by_name.get(section.title)
             if synthesis:
                 para_parts: list[str] = []
@@ -1621,7 +1737,9 @@ class BaseRenderer:
             int(state.get("required_reference_count") or 0),
         )
         if llm is not None and (
-            minimum_references >= 20 or global_reference_target >= 20
+            state.get("_reusable_section_texts")
+            or minimum_references >= 20
+            or global_reference_target >= 20
         ):
             fallback = self.render_fallback(plan, safe_state, cards)
             sectionwise = _write_sections_in_chinese(

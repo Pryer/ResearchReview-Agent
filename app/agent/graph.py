@@ -142,7 +142,13 @@ def run_research_agent(
     # ---------- 初始化状态 ----------
     state: ResearchAgentState = {
         "user_query": user_query,
-        "state_schema_version": "1",
+        "state_schema_version": "2",
+        "allow_evidence_expansion": True,
+        "recovery_action_count": 0,
+        "quality_recovery_history": [],
+        "section_checkpoints": {},
+        "section_candidate_checkpoints": {},
+        "writing_version": 0,
         "steps": [],
         "errors": [],
     }
@@ -152,7 +158,7 @@ def run_research_agent(
         state.update(initial_state)
         # 这些字段定义一次执行的身份与审计边界，不能被初始上下文覆盖。
         state["user_query"] = user_query
-        state["state_schema_version"] = "1"
+        state["state_schema_version"] = "2"
         state["steps"] = []
         state["errors"] = []
 
@@ -426,10 +432,18 @@ def run_research_agent(
             # 模式补一轮检索（refine 反馈携带缺口数量）并重新生成，修复后
             # 若引用数反而变少则回滚到修复前草稿。
             if _should_repair_citation_gap(state):
+                # 在修复前建立授权基线。引用数量增加只有在不引入更多
+                # 主张—引用错配时才算真实进展；否则会把错误引用扩散到正文。
+                _check_claim_citation_consistency(state)
                 cited_before = int(state.get("unique_cited_paper_count") or 0)
                 required_refs = int(state.get("required_reference_count") or 0)
                 support_before = float(
                     (state.get("claim_verification") or {}).get("support_rate") or 0.0
+                )
+                consistency_before = int(
+                    (state.get("claim_citation_consistency") or {}).get(
+                        "inconsistent_sentences", 0
+                    )
                 )
                 logger.info(
                     "Citation gap repair: cited=%d < required=%d, running incremental retrieval",
@@ -481,9 +495,15 @@ def run_research_agent(
                         checkpoint=_mark_repair_verification,
                         check_citation_authorization=False,
                     )
+                    _check_claim_citation_consistency(state)
                     cited_after = int(state.get("unique_cited_paper_count") or 0)
                     support_after = float(
                         (state.get("claim_verification") or {}).get("support_rate") or 0.0
+                    )
+                    consistency_after = int(
+                        (state.get("claim_citation_consistency") or {}).get(
+                            "inconsistent_sentences", 0
+                        )
                     )
                     append_step(
                         state,
@@ -493,19 +513,24 @@ def run_research_agent(
                         output_data={"cited_after": cited_after, "repaired": cited_after > cited_before},
                         duration_ms=0,
                     )
-                    # 回滚采用帕累托规则：只有引用数与支持率同时退化才回滚。
-                    # 引用略减但主张支持率明显提升的修复版本仍是更好的草稿。
-                    if cited_after < cited_before and support_after <= support_before:
+                    # 回滚采用带授权安全边界的帕累托规则：引用增加不能以
+                    # 新增错配为代价；引用略减但支持率明显提升的版本仍可保留。
+                    if (
+                        consistency_after > consistency_before
+                        or (cited_after < cited_before and support_after <= support_before)
+                    ):
                         _restore_pre_repair_snapshot(state)
                         logger.info(
-                            "Citation gap repair regressed (cited %d -> %d, support %.1f%% -> %.1f%%); rolled back draft",
+                            "Citation gap repair regressed (cited %d -> %d, support %.1f%% -> %.1f%%, mismatches %d -> %d); rolled back draft",
                             cited_before, cited_after, support_before * 100, support_after * 100,
+                            consistency_before, consistency_after,
                         )
                     else:
                         state.pop("_citation_gap_repair_snapshot", None)
                         logger.info(
-                            "Citation gap repair kept (cited %d -> %d, support %.1f%% -> %.1f%%)",
+                            "Citation gap repair kept (cited %d -> %d, support %.1f%% -> %.1f%%, mismatches %d -> %d)",
                             cited_before, cited_after, support_before * 100, support_after * 100,
+                            consistency_before, consistency_after,
                         )
             # Claim-Citation Consistency: 引用的论文是否在 claim 的允许证据中
             _check_claim_citation_consistency(state)
@@ -594,6 +619,11 @@ _GENERATION_PRODUCT_KEYS = (
     "citation_registry", "citation_validation", "claim_verification",
     "generation_quality", "deliverable_validation", "final_review_integrity",
     "quality_gate", "generation_blocked", "quarantined_draft",
+    # 写作就绪与章节诊断是本轮派生结果。若恢复时继续保留，状态不变量会把
+    # 上一轮的 ready/失败章节误当作当前轮结论，导致尚未写作就被阻断。
+    "generation_readiness", "deliverable_readiness", "evidence_quality_report",
+    "search_report", "writer_diagnostics", "writer_section_diagnostics",
+    "citation_allocation_plan", "claim_repairs",
     "claim_plans", "claim_evidence_gate", "claim_alignment",
     "claim_citation_consistency", "unique_cited_paper_count",
     "unique_valid_cited_paper_count", "final_requirement_met",
@@ -611,6 +641,12 @@ _LOCAL_REWRITE_ISSUE_CODES = {
     "claim_citation_consistency_not_met",
     "invalid_citations",
     "minimum_cited_references_not_met",
+}
+
+# 用户选择“直接生成最佳草稿”是恢复策略，不是新的写作失败。它会被记录在
+# quality_gate 供审计，但不能阻止随后针对真实章节/主张问题的局部重写。
+_RECOVERY_STRATEGY_ISSUE_CODES = {
+    "user_accepted_best_effort_generation",
 }
 
 
@@ -661,11 +697,20 @@ def _derive_local_verification_targets(state: ResearchAgentState) -> Dict[str, A
     # through the existing writing plan and map the section's sentences back to
     # the prior claim report; this remains diagnostic-only and does not alter
     # scope or rendering behavior.
+    successful_section_statuses = {
+        "success", "already_valid", "success_after_english_repair",
+        "success_after_route_merge", "reused", "validated",
+    }
     section_ids = {
         str(item.get("section_id") or "")
         for run in section_diagnostics if isinstance(run, dict)
         for item in (run.get("sections") or [])
-        if isinstance(item, dict) and item.get("section_id")
+        if isinstance(item, dict)
+        and item.get("section_id")
+        and (
+            str(item.get("status") or "") not in successful_section_statuses
+            or bool(item.get("errors"))
+        )
     }
     prior_claims = (state.get("claim_verification") or {}).get("claims") or []
     review_text = str(state.get("review") or state.get("related_work") or state.get("introduction") or "")
@@ -698,6 +743,7 @@ def _derive_local_verification_targets(state: ResearchAgentState) -> Dict[str, A
     return {
         "target_sentence_indices": sorted(index for index in sentence_indices if index > 0),
         "target_claim_ids": sorted(claim_ids),
+        "target_section_ids": sorted(section_id for section_id in section_ids if section_id),
     }
 
 
@@ -708,7 +754,12 @@ def _build_regeneration_recovery_plan(state: ResearchAgentState) -> Dict[str, An
         for item in (state.get("quality_gate") or {}).get("blocking_issues") or []
         if isinstance(item, dict) and item.get("code")
     }
+    issue_codes -= _RECOVERY_STRATEGY_ISSUE_CODES
     targets = _derive_local_verification_targets(state)
+    targets["target_section_ids"] = list(dict.fromkeys([
+        *[str(value) for value in state.get("target_section_ids") or [] if value],
+        *targets["target_section_ids"],
+    ]))
     same_evidence_local_rewrite = bool(
         state.get("conservative_regeneration")
         and issue_codes
@@ -716,7 +767,17 @@ def _build_regeneration_recovery_plan(state: ResearchAgentState) -> Dict[str, An
         and state.get("validated_routes")
         and state.get("claim_plans")
         and not state.get("force_taxonomy_remediation")
+        and not state.get("force_claim_plan_rebuild")
     )
+    # 旧版本在章节失败路径没有保存 claim-citation 审计。此时继续复用旧
+    # Claim Plan 会把新一轮正文的引用绑定到过期授权，表现为正文有引用但
+    # 有效引用数骤降；先完整重建授权，才能安全决定是否回到局部重写。
+    if (
+        same_evidence_local_rewrite
+        and "section_generation_failed" in issue_codes
+        and not state.get("claim_citation_consistency")
+    ):
+        same_evidence_local_rewrite = False
     return {
         "issue_codes": sorted(issue_codes),
         "mode": "local_rewrite" if same_evidence_local_rewrite else "full_rebuild",
@@ -727,6 +788,7 @@ def _build_regeneration_recovery_plan(state: ResearchAgentState) -> Dict[str, An
         ),
         "target_sentence_indices": targets["target_sentence_indices"],
         "target_claim_ids": targets["target_claim_ids"],
+        "target_section_ids": targets["target_section_ids"],
         "previous_claim_verification": state.get("claim_verification") if same_evidence_local_rewrite else None,
     }
 
@@ -834,6 +896,10 @@ def _check_claim_citation_consistency(state: ResearchAgentState) -> None:
     state["claim_citation_consistency"] = ccc_result
     validly_authorized = set(ccc_result.get("validly_authorized_paper_ids") or [])
     state["unique_valid_cited_paper_count"] = len(validly_authorized)
+    stats = dict(state.get("reference_coverage_stats") or {})
+    stats["actual_cited"] = int(state.get("unique_cited_paper_count") or 0)
+    stats["final_valid"] = len(validly_authorized)
+    state["reference_coverage_stats"] = stats
     if ccc_result.get("inconsistent_sentences"):
         logger.warning(
             "Claim-Citation Consistency: %d/%d sentences have mismatched citations",
@@ -1027,6 +1093,14 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
         public_body = state.get("body") or state.get("review") or state.get("related_work") or state.get("introduction") or ""
         public_related_work = state.get("related_work")
         public_introduction = state.get("introduction")
+        if quality_gate.get("passed") is False and quality_gate.get("draft_released") is True:
+            # WHY: API body 和类型化正文也可能被直接下载，不能只在 answer
+            # 添加限制说明，否则同一 partial 草稿会出现有标识和无标识两版。
+            public_body = public_answer
+            if public_related_work:
+                public_related_work = public_answer
+            if public_introduction:
+                public_introduction = public_answer
     output = {
         "status": output_status,
         "answer": public_answer,
@@ -1101,6 +1175,11 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
         "claim_alignment": state.get("claim_alignment", {}),
         "claim_citation_consistency": state.get("claim_citation_consistency", {}),
         "global_evidence_gate": state.get("global_evidence_gate", {}),
+        "reference_coverage_stats": state.get("reference_coverage_stats", {}),
+        "quality_recovery_history": state.get("quality_recovery_history", []),
+        "active_quality_recovery": state.get("active_quality_recovery"),
+        "quality_recovery_decision": state.get("quality_recovery_decision"),
+        "recovery_candidate_rejections": state.get("recovery_candidate_rejections", []),
     }
     # 只保存增量重生成真正需要的研究状态，避免下一轮重新检索和补全详情。
     output["research_state"] = {
@@ -1109,6 +1188,7 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
             "user_query", "intent", "topic", "canonical_topic", "keywords", "core_keywords", "expanded_keywords", "keyword_batches", "scope_search_queries", "scope_query_roles", "required_concepts",
             "start_year", "end_year", "max_papers",
             "required_reference_count", "retrieval_target", "generation_limit",
+            "max_papers_explicit",
             "evidence_pool_target", "evidence_yield",
             "requested_sections", "language", "citation_style", "workflow",
             "core_deliverables", "user_paper_profile", "search_report",
@@ -1118,16 +1198,34 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
             "source_diagnostics", "paper_details", "paper_cards", "pdf_paths",
             "clusters", "dynamic_taxonomy",
             "taxonomy_validation", "taxonomy_remediation", "theme_synthesis", "deliverable_readiness",
-            "writing_plans", "citation_allocation_plans", "deliverable_validation",
+            "writing_plans", "citation_allocation_plan", "citation_allocation_plans", "deliverable_validation",
             "route_merge_diagnostics",
             "writer_diagnostics", "writer_section_diagnostics", "final_review_integrity",
+            # WHY: 这些字段既是公开结果的一部分，也是同证据修复的事务快照。
+            # 私有状态若不保存它们，候选退化后的回滚会丢失旧引用表和质量向量。
+            "references", "reference_papers", "citation_map", "citation_registry",
+            "citation_validation", "claim_verification", "generation_quality",
+            "evidence_quality_report", "unique_cited_paper_count",
+            "unique_valid_cited_paper_count", "final_requirement_met",
             "our_work", "background",
             "existing_limitations", "verified_results", "target_length",
             "unsupported_task_guard",
             "state_schema_version",
-            "generation_readiness", "quality_gate", "quality_recovery_attempts",
+            "generation_readiness", "quality_gate", "generation_blocked",
+            "quality_recovery_attempts",
+            "recovery_action_count", "quality_recovery_history",
+            "active_quality_recovery", "quality_recovery_decision",
+            "recovery_candidate_rejections", "allow_evidence_expansion",
+            "reference_coverage_stats", "writing_version", "target_section_ids",
+            "target_claim_ids",
+            "section_checkpoints", "section_candidate_checkpoints",
+            # 隔离正文和当前写作文本只进入可编辑研究状态；公开 body 仍由
+            # quality_gate 的发布边界控制。
+            "review", "quarantined_draft",
             "state_invariant_check",
-            "best_effort_generation", "allow_unvalidated_taxonomy",
+            "best_effort_generation", "best_effort_on_failure",
+            "best_effort_policy_source", "automatic_best_effort_attempted",
+            "automatic_best_effort_generation", "allow_unvalidated_taxonomy",
             "draft_available", "draft_released", "draft_disposition",
             "forced_generation_issues",
             "contract_violations",
@@ -1175,6 +1273,39 @@ def derive_result_status(state: Dict[str, Any]) -> str:
     return "success"
 
 
+def _restore_explicit_constraint_markers(state: ResearchAgentState) -> None:
+    """从持久化研究请求恢复用户显式约束的标记。
+
+    旧会话可能只保存了 ``required_reference_count``，却丢失
+    ``max_papers_explicit``；数字仍在但门禁会把它当作默认值。研究请求是
+    约束来源，恢复入口据此补回标记，不能从默认篇数反向猜测用户意图。
+    """
+    request = state.get("research_request") or {}
+    # v2 增加恢复权限、共享预算和章节检查点。旧会话没有这些字段时采用
+    # 保守且可继续的默认值；已有用户限制一律保留。
+    if str(state.get("state_schema_version") or "1") != "2":
+        legacy_recovery_count = (
+            int(state.get("quality_recovery_attempts") or 0)
+            + int(state.get("recovery_round") or 0)
+        )
+        state.setdefault("allow_evidence_expansion", True)
+        state.setdefault("recovery_action_count", legacy_recovery_count)
+        state.setdefault("quality_recovery_history", [])
+        state.setdefault("section_checkpoints", {})
+        state.setdefault("section_candidate_checkpoints", {})
+        state.setdefault("writing_version", 0)
+        state["state_schema_version"] = "2"
+    explicit = request.get("max_papers_explicit")
+    if explicit is not None:
+        state["max_papers_explicit"] = bool(explicit)
+    if explicit is True:
+        # 旧版本输出可能只在 research_request 中保留了数值；保持顶层门禁
+        # 与请求一致，避免恢复时因为字段缺失而跳过显式篇数检查。
+        for key in ("required_reference_count", "max_papers"):
+            if state.get(key) is None and request.get(key) is not None:
+                state[key] = request[key]
+
+
 def continue_research_agent(
     research_state: Dict[str, Any],
     should_cancel: Callable[[], bool] | None = None,
@@ -1199,6 +1330,7 @@ def continue_research_agent(
     state["incremental_search_new_candidates"] = 0
     state["steps"] = []
     state["errors"] = []
+    _restore_explicit_constraint_markers(state)
     # 与 run 主路径共用同一清理清单：旧版列表缺 claim_plans/writing_plans 等，
     # 上一轮的失效授权会残留进 writer（见 _GENERATION_PRODUCT_KEYS 注释）。
     _reset_generation_products(state)
@@ -1287,6 +1419,10 @@ def continue_research_agent(
     _verify_generated_draft(state, checkpoint=_advance_verification)
     _checkpoint(state, "final_answer", step_idx, total, should_cancel, progress_callback)
     final_answer_node(state)
+    if state.get("active_quality_recovery"):
+        from app.agent.generation_recovery import complete_recovery_action
+
+        complete_recovery_action(state)
     state.pop("incremental_retrieval", None)
     state.pop("incremental_search_window", None)
     if progress_callback:
@@ -1338,6 +1474,25 @@ def regenerate_research_agent(
     state: ResearchAgentState = dict(research_state)
     state["steps"] = []
     state["errors"] = []
+    _restore_explicit_constraint_markers(state)
+    verification_only_recovery = bool(state.pop("verification_only_recovery", False))
+    if verification_only_recovery:
+        # WHY: 语义核验未完成不说明正文或证据错误。保留正文、写作计划与引用
+        # 映射，只重跑统一验证链；成功缓存继续复用，遗漏项会重新请求验证。
+        total = 3
+        _checkpoint(state, "verify_claims", 0, total, should_cancel, progress_callback)
+        _verify_generated_draft(state)
+        _checkpoint(state, "final_answer", 2, total, should_cancel, progress_callback)
+        final_answer_node(state)
+        if state.get("active_quality_recovery"):
+            from app.agent.generation_recovery import complete_recovery_action
+
+            complete_recovery_action(state)
+        state.pop("target_section_ids", None)
+        state.pop("target_claim_ids", None)
+        if progress_callback:
+            progress_callback("completed", total, total)
+        return _build_output(state)
     recovery_llm_calls_before = None
     try:
         from app.core.metrics import get_metrics_collector
@@ -1345,6 +1500,8 @@ def regenerate_research_agent(
     except Exception:
         recovery_llm_calls_before = None
     recovery_plan = _build_regeneration_recovery_plan(state)
+    previous_generation_state = dict(state)
+    previous_generation_snapshot = _snapshot_generation_products(state)
     reusable_products = {
         key: state.get(key)
         for key in (
@@ -1356,11 +1513,29 @@ def regenerate_research_agent(
     # 与 run/continue 共用同一清理清单：旧版列表缺 claim_plans/writing_plans、
     # related_work/introduction 等，上一轮产物会残留进输出与 writer。
     _reset_generation_products(state)
+    state["target_section_ids"] = list(recovery_plan.get("target_section_ids") or [])
     if recovery_plan["reuse_claim_plans"]:
         # WHY: 这里仅复用同一证据池上的授权计划；写作计划、引用分配、正文和
         # 验证结果仍全部重建。证据池编辑或检索缺口会落入 full_rebuild。
         state.update(reusable_products)
     total = 5
+
+    refreshed_existing_evidence = bool(state.pop("refresh_existing_evidence", False))
+    if refreshed_existing_evidence:
+        # WHY: 元数据/证据刷新只重新获取当前论文，不执行检索或改变范围；随后
+        # 路线、主张和全部写作验证仍按刷新后的证据重建。
+        refresh_papers = list(
+            state.get("paper_details") or state.get("candidate_papers") or []
+        )
+        state["candidate_papers"] = refresh_papers
+        state["ranked_papers"] = refresh_papers
+        _checkpoint(
+            state, "refresh_existing_evidence", 0, total,
+            should_cancel, progress_callback,
+        )
+        fetch_detail_node(state, should_cancel=should_cancel)
+        card_llm = _get_llm() if get_settings().enable_llm_card_extraction else None
+        extract_card_node(state, llm=card_llm, should_cancel=should_cancel)
 
     append_step(
         state,
@@ -1433,6 +1608,31 @@ def regenerate_research_agent(
     )
     _checkpoint(state, "final_answer", 4, total, should_cancel, progress_callback)
     final_answer_node(state)
+    if (
+        previous_generation_snapshot
+        and previous_generation_state.get("review")
+        and not refreshed_existing_evidence
+    ):
+        from app.agent.generation_recovery import candidate_is_not_worse
+
+        if not candidate_is_not_worse(previous_generation_state, state):
+            for key in _GENERATION_PRODUCT_KEYS:
+                state.pop(key, None)
+            state.update(previous_generation_snapshot)
+            state.setdefault("recovery_candidate_rejections", []).append({
+                "writing_version": state.get("writing_version"),
+                "reason": "候选版本新增硬错误或完整质量向量退化",
+            })
+            final_answer_node(state)
+    if state.get("active_quality_recovery"):
+        from app.agent.generation_recovery import complete_recovery_action
+
+        complete_recovery_action(state)
+    state.pop("target_section_ids", None)
+    state.pop("target_claim_ids", None)
+    state.pop("force_claim_plan_rebuild", None)
+    state.pop("force_taxonomy_remediation", None)
+    state.pop("force_section_rewrite", None)
     _record_recovery_statistics(
         state,
         reused_claims=(

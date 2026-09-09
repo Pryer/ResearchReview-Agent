@@ -20,6 +20,7 @@ from app.agent.nodes import (
     final_answer_node,
     generate_deliverables_node,
 )
+from app.agent.nodes.synthesis import _backfill_global_citation_union
 from app.agent.writing_plan import build_writing_plan
 from app.schemas.deliverable_schema import (
     CoreDeliverableType,
@@ -36,6 +37,7 @@ from app.deliverables.renderers import (
     _merge_failed_or_missing_sections,
     _write_sections_in_chinese,
 )
+from app.deliverables.renderers.base_renderer import _safe_claim_for_body
 from app.tools.write_deliverable import write_deliverable
 
 
@@ -63,6 +65,56 @@ def _card(index: int) -> dict:
     }
 
 
+def test_global_citation_backfill_normalizes_evidence_ids(monkeypatch):
+    """回填分支必须能调用引用归一化，并把 evidence_id 还原为 paper_id。"""
+    plan = WritingPlan(
+        deliverable_type=CoreDeliverableType.RESEARCH_BACKGROUND,
+        purpose="测试引用回填",
+        organizing_strategy="evidence_driven",
+        sections=[WritingSection(
+            id="background",
+            title="研究背景",
+            purpose="说明研究背景",
+            supporting_paper_ids=["p1", "p2"],
+        )],
+        citation_policy={"minimum_unique_references": 2},
+    )
+    cards = [_card(1), _card(2)]
+    cards[1]["evidence_spans"] = [{"evidence_id": "p2:e001"}]
+    original = "## 研究背景\n\n已有研究分析课堂互动编码及其教育应用[p1]。"
+
+    class BackfillLLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            return (
+                original
+                + "相关研究进一步讨论了人工智能支持的课堂行为编码[p2:e001]。"
+            )
+
+    monkeypatch.setattr(
+        "app.tools.validate_deliverable.validate_deliverable",
+        lambda text, writing_plan, state: {"valid": True, "errors": []},
+    )
+
+    outputs, validations = _backfill_global_citation_union(
+        {
+            "required_reference_count": 2,
+            "paper_cards": cards,
+        },
+        BackfillLLM(),
+        [original],
+        [{"valid": True, "errors": []}],
+        [plan.model_dump(mode="json")],
+        [{
+            "deliverable_type": "research_background",
+            "sections": [{"section_id": "background", "paper_ids": ["p1", "p2"]}],
+        }],
+    )
+
+    assert validations[0]["valid"] is True
+    assert "[p2]" in outputs[0]
+    assert "[p2:e001]" not in outputs[0]
+
+
 def test_explicit_minimum_reference_count_is_a_pre_generation_hard_gate():
     state = {
         "max_papers_explicit": True,
@@ -77,6 +129,39 @@ def test_explicit_minimum_reference_count_is_a_pre_generation_hard_gate():
     assert result.usable_reference_count == 28
     assert result.blocking_issues[0]["code"] == "minimum_references_not_met"
     assert result.blocking_issues[0]["requested"] == 40
+
+
+def test_metric_token_fragment_is_not_rendered_as_academic_claim():
+    assert _safe_claim_for_body("accuracyf1") == ""
+    assert _safe_claim_for_body("F1 accuracy mAP") == ""
+
+
+def test_final_gate_separates_unverified_claims_from_evidence_failures():
+    state = {
+        "review": "## 研究现状\n\n已有研究分析课堂互动[p1]。",
+        "generation_quality": {
+            "passed": False,
+            "support_rate": 0.0,
+            "unsupported_claims": 1,
+            "verified_unsupported_claims": 0,
+            "unverified_claims": 1,
+            "verification_coverage": 0.0,
+        },
+        "claim_verification": {
+            "claims": [{"claim_id": "c001", "verification_status": "not_completed"}],
+        },
+        "paper_cards": [_card(1)],
+        "references": ["参考文献"],
+        "citation_validation": {"valid": True},
+        "deliverable_validation": [{"valid": True, "errors": [], "metrics": {}}],
+        "writer_section_diagnostics": [],
+    }
+
+    _apply_final_quality_gate(state)
+
+    codes = {item["code"] for item in state["quality_gate"]["blocking_issues"]}
+    assert "claim_verification_incomplete" in codes
+    assert "claim_evidence_quality_not_met" not in codes
 
 
 def _detail(index: int, decision: str) -> dict:
@@ -259,6 +344,56 @@ def test_best_effort_final_gate_replaces_stale_pre_generation_gate():
         issue["code"] == "user_accepted_best_effort_generation"
         for issue in state["quality_gate"]["blocking_issues"]
     )
+
+
+def test_automatic_best_effort_draft_keeps_gate_failure_and_releases_partial():
+    state = {
+        "intent": "generate_review",
+        "best_effort_generation": True,
+        "automatic_best_effort_generation": True,
+        "forced_generation_issues": [{
+            "code": "required_focus_evidence_not_met",
+            "message": "部分研究重点缺少直接证据",
+        }],
+        "taxonomy_validation": {"valid": True},
+        "review": "## 研究现状\n\n当前证据支持形成最佳可用综合[p1]。",
+        "paper_cards": [_card(1)],
+        "deliverable_validation": [],
+    }
+
+    _apply_final_quality_gate(state)
+
+    gate = state["quality_gate"]
+    assert gate["passed"] is False
+    assert gate["draft_released"] is True
+    assert gate["draft_disposition"] == "released_best_effort"
+    assert any(
+        issue["code"] == "recovery_exhausted_best_effort_generation"
+        for issue in gate["blocking_issues"]
+    )
+
+
+def test_pre_generation_state_conflict_is_not_rewritten_as_post_generation_failure():
+    """没有正文时，best-effort 也不能覆盖状态一致性阻断。"""
+    state = {
+        "intent": "generate_review",
+        "best_effort_generation": True,
+        "quality_gate": {
+            "passed": False,
+            "phase": "pre_generation",
+            "blocking_issues": [{
+                "code": "recovery_readiness_conflict",
+                "message": "证据缺口与写作就绪状态冲突",
+            }],
+        },
+        "review": "",
+    }
+
+    _apply_final_quality_gate(state)
+
+    assert state["quality_gate"]["phase"] == "pre_generation"
+    assert state["quality_gate"]["blocking_issues"][0]["code"] == "recovery_readiness_conflict"
+    assert state["quality_gate"].get("draft_released") is not True
 
 
 def test_best_effort_generation_still_reports_cited_reference_shortfall():
@@ -446,6 +581,34 @@ def test_writer_normalizes_evidence_id_to_paper_id():
             )
 
     text = write_deliverable(plan, state, llm=EvidenceIdLLM())
+
+    assert "[p1:e001]" not in text
+    assert "[p1]" in text
+
+
+def test_writer_normalizes_evidence_span_id_without_claim_mirror():
+    """只有 evidence_spans 的卡片也必须把证据 ID 映射为论文 ID。"""
+    card = _card(1)
+    card.pop("claims", None)
+    card["evidence_spans"] = [{"evidence_id": "p1:e001", "text": "课堂互动研究"}]
+    state = {
+        "topic": "课堂行为分析",
+        "canonical_topic": "课堂行为分析",
+        "paper_cards": [card],
+        "theme_synthesis": [],
+        "search_report": {},
+        "evidence_quality_report": {},
+    }
+    plan = build_writing_plan("research_background", state)
+
+    class EvidenceSpanLLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            return "\n\n".join(
+                f"## {section.title}\n\n课堂互动研究得到讨论。[p1:e001]"
+                for section in plan.sections
+            )
+
+    text = write_deliverable(plan, state, llm=EvidenceSpanLLM())
 
     assert "[p1:e001]" not in text
     assert "[p1]" in text
@@ -756,6 +919,21 @@ def test_final_integrity_rechecks_text_after_claim_repair():
     assert report["metrics"]["incomplete_fragment_count"] == 1
 
 
+def test_final_integrity_rejects_token_fragment_created_after_rewrite():
+    state = {
+        "writing_plans": [{
+            "sections": [{"id": "theme_a", "title": "评价指标"}],
+        }],
+    }
+    report = validate_final_review_integrity(
+        "## 评价指标\n\naccuracyf1。",
+        state,
+    )
+
+    assert report["valid"] is False
+    assert report["metrics"]["token_only_fragment_count"] == 1
+
+
 def test_final_integrity_rejects_duplicate_sentences_from_claim_rewrite():
     """主张改写发生在写作期校验之后，终审必须自己查重句。"""
     duplicated = (
@@ -775,6 +953,7 @@ def test_final_integrity_rejects_duplicate_sentences_from_claim_rewrite():
     assert report["valid"] is False
     assert any("重复" in error for error in report["errors"]), report["errors"]
     assert report["metrics"]["duplicate_sentence_count"] == 1
+    assert report["metrics"]["duplicate_section_ids"] == ["theme_a"]
 
     gate_state = {
         "intent": "generate_review",
@@ -965,7 +1144,7 @@ def test_final_integrity_ignores_renumbered_theme_sections():
     assert not any("缺少计划章节" in error for error in report["errors"])
 
 
-def test_explicit_reference_minimum_has_no_eighty_percent_shortcut():
+def test_reference_coverage_ratio_does_not_bypass_recovery_before_budget_exhaustion():
     state = {
         "intent": "generate_review",
         "review": "## 研究现状\n\n课堂行为分析已有可核验证据[p1]。",
@@ -989,6 +1168,126 @@ def test_explicit_reference_minimum_has_no_eighty_percent_shortcut():
     assert issue["requested"] == 40
     assert issue["actual"] == 34
     assert state["quality_gate"]["passed"] is False
+    assert state["quality_gate"]["draft_released"] is False
+
+
+def test_count_only_shortfall_releases_partial_after_recovery_budget_exhaustion():
+    state = {
+        "intent": "generate_review",
+        "review": "## 研究现状\n\n课堂行为分析已有可核验证据[p1]。",
+        "max_papers_explicit": True,
+        "required_reference_count": 40,
+        "unique_cited_paper_count": 34,
+        "citation_validation": {"valid": True},
+        "generation_quality": {
+            "passed": True, "support_rate": 1.0, "unsupported_claims": 0,
+        },
+        "deliverable_validation": [],
+        "writing_plans": [],
+        "recovery_action_count": 6,
+        "steps": [],
+        "errors": [],
+    }
+
+    final_answer_node(state)
+
+    gate = state["quality_gate"]
+    assert gate["passed"] is False
+    assert gate["partial_success"] is True
+    assert gate["draft_released"] is True
+    assert gate["draft_disposition"] == "released_best_effort"
+    assert gate["reference_coverage_best_effort_release"] is True
+    assert gate["reference_coverage_ratio"] == 0.85
+    assert state["required_reference_count"] == 40
+    assert state["body"] == state["review"]
+
+
+def test_reference_coverage_below_ratio_remains_quarantined():
+    state = {
+        "intent": "generate_review",
+        "review": "## 研究现状\n\n课堂行为分析已有可核验证据[p1]。",
+        "max_papers_explicit": True,
+        "required_reference_count": 40,
+        "unique_cited_paper_count": 33,
+        "citation_validation": {"valid": True},
+        "generation_quality": {
+            "passed": True, "support_rate": 1.0, "unsupported_claims": 0,
+        },
+        "deliverable_validation": [],
+        "writing_plans": [],
+        "recovery_action_count": 6,
+        "steps": [],
+        "errors": [],
+    }
+
+    final_answer_node(state)
+
+    assert state["quality_gate"]["draft_released"] is False
+    assert state["quality_gate"]["partial_success"] is False
+    assert state["body"] == ""
+
+
+def test_reference_coverage_best_effort_release_can_be_disabled(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "app.agent.nodes.synthesis.get_settings",
+        lambda: SimpleNamespace(
+            enable_reference_coverage_best_effort_release=False,
+            reference_coverage_best_effort_ratio=0.85,
+            recovery_total_action_budget=6,
+        ),
+    )
+    state = {
+        "intent": "generate_review",
+        "review": "## 研究现状\n\n课堂行为分析已有可核验证据[p1]。",
+        "max_papers_explicit": True,
+        "required_reference_count": 40,
+        "unique_cited_paper_count": 39,
+        "citation_validation": {"valid": True},
+        "generation_quality": {
+            "passed": True, "support_rate": 1.0, "unsupported_claims": 0,
+        },
+        "deliverable_validation": [],
+        "writing_plans": [],
+        "recovery_action_count": 6,
+        "steps": [],
+        "errors": [],
+    }
+
+    final_answer_node(state)
+
+    assert state["quality_gate"]["draft_released"] is False
+    assert state["body"] == ""
+
+
+def test_reference_ratio_never_masks_other_quality_failures():
+    state = {
+        "intent": "generate_review",
+        "review": "## 研究现状\n\n课堂行为分析已有待核验结论[p1]。",
+        "max_papers_explicit": True,
+        "required_reference_count": 40,
+        "unique_cited_paper_count": 39,
+        "citation_validation": {"valid": True},
+        "generation_quality": {
+            "passed": False, "support_rate": 0.5, "unsupported_claims": 8,
+        },
+        "deliverable_validation": [],
+        "writing_plans": [],
+        "recovery_action_count": 6,
+        "steps": [],
+        "errors": [],
+    }
+
+    final_answer_node(state)
+
+    codes = {
+        item["code"] for item in state["quality_gate"]["blocking_issues"]
+    }
+    assert "minimum_cited_references_not_met" in codes
+    assert "claim_evidence_quality_not_met" in codes
+    assert state["quality_gate"]["draft_released"] is False
+    assert state["body"] == ""
 
 
 def test_background_plan_keeps_full_requested_reference_target():
@@ -1270,6 +1569,57 @@ def test_second_deliverable_prefers_papers_not_used_by_first_deliverable():
 
     assert len(assigned) == 30
     assert assigned.isdisjoint({f"p{index}" for index in range(1, 11)})
+
+
+def test_two_part_status_allocation_can_complete_global_authorized_union():
+    """两部分交付物的研究现状概述可承载背景未覆盖的授权论文。"""
+    cards = [_card(index) for index in range(1, 5)]
+    state = {
+        "topic": "课堂行为分析",
+        "canonical_topic": "课堂行为分析",
+        "paper_cards": cards,
+        "ranked_papers": cards,
+        "required_reference_count": 4,
+        "max_papers_explicit": True,
+        "requested_sections": ["background", "research_status"],
+        "core_deliverables": ["research_background", "research_status"],
+        "claim_plans": [{
+            "route_id": "R1",
+            "claims": [{
+                "claim_id": f"c{index}",
+                "claim_text": f"论文{index}明确研究课堂行为分析。",
+                "evidence_ids": [f"p{index}:e001"],
+            } for index in range(1, 5)],
+        }],
+    }
+    plan = WritingPlan(
+        deliverable_type=CoreDeliverableType.RESEARCH_STATUS,
+        purpose="梳理研究现状",
+        organizing_strategy="按研究路线组织",
+        sections=[WritingSection(
+            id="status_overview",
+            title="研究概述",
+            purpose="概述",
+            supporting_paper_ids=["p1", "p2"],
+            heading_level=2,
+        )],
+    )
+
+    allocation = _plan_citation_allocation(
+        state=state,
+        llm=None,
+        ranked_papers=cards,
+        required_count=4,
+        writing_plan=plan,
+        selection_target=4,
+    )
+    assigned = {
+        paper_id
+        for section in allocation["sections"]
+        for paper_id in section["paper_ids"]
+    }
+
+    assert assigned == {f"p{index}" for index in range(1, 5)}
 
 
 def test_sparse_citation_plan_is_completed_and_executed_by_fallback():

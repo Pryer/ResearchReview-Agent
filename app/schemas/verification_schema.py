@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 
 
 SupportStatus = Literal["supported", "partially_supported", "unsupported", "not_applicable"]
+VerificationStatus = Literal["verified", "not_required", "not_completed"]
+VerificationMethod = Literal["deterministic", "semantic", "none"]
 
 
 class AtomicClaimEvidence(BaseModel):
@@ -16,6 +18,10 @@ class AtomicClaimEvidence(BaseModel):
     text: str
     citations: List[str] = Field(default_factory=list)
     support_status: SupportStatus
+    # WHY: 支持结论与“验证是否执行完成”是两个维度。语义验证失败时仍按
+    # unsupported 安全处理，但不能把它统计成已经证实的证据不足。
+    verification_status: VerificationStatus = "verified"
+    verification_method: VerificationMethod = "deterministic"
     support_score: float = Field(default=0.0, ge=0.0, le=1.0)
     evidence_ids: List[str] = Field(default_factory=list)
     evidence_snippets: List[dict] = Field(default_factory=list)
@@ -31,6 +37,8 @@ class ClaimEvidenceResult(BaseModel):
     claim_type: str = "general"
     factual: bool = True
     support_status: SupportStatus
+    verification_status: VerificationStatus = "verified"
+    verification_method: VerificationMethod = "deterministic"
     support_score: float = Field(default=0.0, ge=0.0, le=1.0)
     evidence_ids: List[str] = Field(default_factory=list)
     evidence_snippets: List[dict] = Field(default_factory=list)
@@ -50,6 +58,8 @@ class ClaimVerificationReport(BaseModel):
     supported: int
     partially_supported: int
     unsupported: int
+    unverified: int = 0
+    verification_coverage: float = Field(default=1.0, ge=0.0, le=1.0)
     support_rate: float = Field(default=0.0, ge=0.0, le=1.0)
     claims: List[ClaimEvidenceResult] = Field(default_factory=list)
     evidence_summary: dict = Field(default_factory=dict)

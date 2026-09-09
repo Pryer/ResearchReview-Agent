@@ -354,10 +354,13 @@ def plan_node(state: "ResearchAgentState", llm=None, current_year: int | None = 
             for keyword in state["keywords"]
         )
         planning_error = plan.get("planning_error")
-        if planning_error or (
+        # 独立论文检索可以交由具体来源按原语言查询；综述/生成任务仍须
+        # 通过双语规划门禁，避免把中文兜底词误当成国际检索策略。
+        standalone_search = intent_result.intent == "search_papers"
+        if (planning_error or (
             re.search(r"[\u4e00-\u9fff]", state["topic"])
             and not has_english_keyword
-        ):
+        )) and not (standalone_search and state.get("keywords")):
             reason = planning_error or "未生成可用于国际论文库的英文检索词"
             # P1 集成：用 PlanningError 统一构造错误上下文，但仍只把字符串
             # 消息写入 state["errors"]（下游多处按 list[str] 消费该字段），

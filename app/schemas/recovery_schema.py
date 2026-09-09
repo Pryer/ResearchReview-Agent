@@ -25,6 +25,14 @@ class RecoveryAction(str, Enum):
     QUERY_FILTER_REVISION = "QUERY_FILTER_REVISION"
     ROUTE_REVISION = "ROUTE_REVISION"
     SCOPE_REVISION = "SCOPE_REVISION"
+    RECOMPUTE_STATE = "RECOMPUTE_STATE"
+    REFRESH_EVIDENCE = "REFRESH_EVIDENCE"
+    REBUILD_STRUCTURE = "REBUILD_STRUCTURE"
+    REBUILD_CLAIMS = "REBUILD_CLAIMS"
+    REALLOCATE_CITATIONS = "REALLOCATE_CITATIONS"
+    REWRITE_SECTIONS = "REWRITE_SECTIONS"
+    REVERIFY_CLAIMS = "REVERIFY_CLAIMS"
+    REQUEST_USER_INPUT = "REQUEST_USER_INPUT"
     DEGRADE = "DEGRADE"
 
 
@@ -97,6 +105,61 @@ class RecoveryHistoryEntry(BaseModel):
     stop_reason: str = ""
     # 每条路线的 core_before / core_after / target，供边际收益按路线判定。
     route_progress: dict[str, dict[str, int]] = Field(default_factory=dict)
+
+
+class RecoveryProgressVector(BaseModel):
+    """跨路线恢复与正文恢复共用的可比较进展。"""
+
+    missing_required_sections: int = 0
+    unsupported_claims: int = 0
+    unverified_claims: int = 0
+    citation_mismatches: int = 0
+    valid_reference_shortfall: int = 0
+    structure_issues: int = 0
+    metadata_issues: int = 0
+    hard_issue_codes: list[str] = Field(default_factory=list)
+
+
+class GenerationRecoveryIssue(BaseModel):
+    """把质量门禁输出转换为稳定、可执行的问题契约。"""
+
+    code: str
+    phase: str = "post_generation"
+    category: str
+    message: str = ""
+    blocking: bool = True
+    affected_section_ids: list[str] = Field(default_factory=list)
+    affected_claim_ids: list[str] = Field(default_factory=list)
+    available_actions: list[RecoveryAction] = Field(default_factory=list)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class GenerationRecoveryDecision(BaseModel):
+    """正文恢复控制器的确定性决策。"""
+
+    action: RecoveryAction
+    status: RecoveryStatus
+    reason: str
+    issues: list[GenerationRecoveryIssue] = Field(default_factory=list)
+    target_section_ids: list[str] = Field(default_factory=list)
+    target_claim_ids: list[str] = Field(default_factory=list)
+    progress: RecoveryProgressVector = Field(default_factory=RecoveryProgressVector)
+    action_fingerprint: str = ""
+    requires_user_input: bool = False
+    user_input_reason: str = ""
+    remaining_budget: int = 0
+
+
+class GenerationRecoveryHistoryEntry(BaseModel):
+    action: RecoveryAction
+    action_fingerprint: str
+    issue_codes: list[str] = Field(default_factory=list)
+    target_section_ids: list[str] = Field(default_factory=list)
+    progress_before: RecoveryProgressVector = Field(default_factory=RecoveryProgressVector)
+    progress_after: RecoveryProgressVector | None = None
+    input_fingerprint: str = ""
+    outcome: str = "started"
+    stop_reason: str = ""
 
 
 class ClaimGapType(str, Enum):

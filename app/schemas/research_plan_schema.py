@@ -111,6 +111,13 @@ class EvidenceRequirement(BaseModel):
     )
     aliases: list[str] = Field(default_factory=list)
     source_ids: list[str] = Field(default_factory=list)
+    explicit: bool = False
+    inferred: bool = False
+    source: str = Field(
+        default="unknown",
+        description="user_explicit/llm_inference/mixed/legacy_unknown",
+    )
+    inference_basis: Optional[str] = None
     minimum_direct_sources: int = Field(default=1, ge=1)
     exact_method_required: bool = False
     route_required: bool = True

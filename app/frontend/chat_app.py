@@ -22,6 +22,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.core.config import get_settings
+from app.frontend.progress_labels import (
+    can_offer_best_effort_draft,
+    describe_job_step,
+    recovery_progress_view,
+)
 from app.frontend.query_utils import build_agent_request_payload
 
 st.set_page_config(
@@ -46,7 +51,6 @@ EXAMPLE_QUERIES = (
     "我的论文研究少样本时序动作定位，采用原型对齐与时序建模方法，请生成论文相关工作",
     "围绕多模态学习分析生成一份叙述性综述初稿，重点比较数据模态、方法和评价指标",
 )
-
 
 def _api_headers() -> dict[str, str]:
     key = get_settings().app_api_key.strip()
@@ -150,6 +154,7 @@ def _is_clarification_answer(messages: list[dict]) -> bool:
 def _result_metadata(result: dict) -> dict:
     return {
         "status": result.get("status"),
+        "body": result.get("body") or "",
         "clarification": result.get("clarification"),
         "paper_cards": result.get("paper_cards") or [],
         "claim_verification": result.get("claim_verification") or {},
@@ -158,6 +163,9 @@ def _result_metadata(result: dict) -> dict:
         "intent": result.get("intent"),
         "topic": result.get("topic"),
         "quality_gate": result.get("quality_gate") or {},
+        "quality_recovery_decision": result.get("quality_recovery_decision") or {},
+        "quality_recovery_history": result.get("quality_recovery_history") or [],
+        "reference_coverage_stats": result.get("reference_coverage_stats") or {},
         "source_diagnostics": (result.get("search_report") or {}).get("source_diagnostics") or result.get("source_diagnostics") or [],
         "session_id": result.get("session_id"),
     }
@@ -198,7 +206,7 @@ def render_active_job() -> None:
     status = job.get("status", "queued")
     current = int(job.get("progress_current") or 0)
     total = max(int(job.get("progress_total") or 14), 1)
-    step = job.get("current_step") or "等待执行"
+    step = describe_job_step(job.get("current_step") or "等待执行")
     st.info(f"后台任务：{status} · {step}")
     st.progress(min(current / total, 1.0), text=f"进度 {current}/{total}")
 
@@ -221,11 +229,16 @@ def render_user_message(content: str) -> None:
         st.markdown(content)
 
 
-def render_assistant_message(content: str, metadata: dict | None = None) -> None:
+def render_assistant_message(
+    content: str,
+    metadata: dict | None = None,
+    *,
+    allow_actions: bool = False,
+) -> None:
     with st.chat_message("assistant", avatar="🤖"):
         st.markdown(content)
         if metadata:
-            render_message_metadata(metadata)
+            render_message_metadata(metadata, allow_actions=allow_actions)
 
 
 _SOURCE_OUTCOME_LABELS = {
@@ -272,20 +285,64 @@ def render_source_diagnostics(diagnostics: list) -> None:
             )
 
 
-def render_message_metadata(metadata: dict) -> None:
+def render_message_metadata(metadata: dict, *, allow_actions: bool = False) -> None:
     cards = metadata.get("paper_cards") or []
     verification = metadata.get("claim_verification") or {}
     steps = metadata.get("steps") or []
     references = metadata.get("references") or []
     quality_gate = metadata.get("quality_gate") or {}
+    recovery = recovery_progress_view(
+        metadata.get("quality_recovery_decision"),
+        metadata.get("quality_recovery_history"),
+        metadata.get("reference_coverage_stats"),
+        quality_gate,
+    )
 
     if metadata.get("status") == "needs_clarification":
         st.caption("请直接在下方输入框中用自然语言回答这个问题。")
     render_source_diagnostics(metadata.get("source_diagnostics") or [])
+    if recovery.get("action"):
+        with st.expander("♻️ 自动恢复", expanded=False):
+            st.caption(f"当前动作：{recovery['action']}")
+            st.caption(str(recovery["verification"]))
+            col1, col2, col3 = st.columns(3)
+            col1.metric("主张授权", recovery["claim_authorized"])
+            col2.metric("计划覆盖", recovery["planned"])
+            col3.metric("最终有效引用", recovery["final_valid"])
     if quality_gate and not quality_gate.get("passed", True):
         with st.expander("⚠️ 质量门禁"):
             for issue in quality_gate.get("blocking_issues") or []:
                 st.markdown(f"- {issue.get('message') or issue}")
+    if (
+        allow_actions
+        and can_offer_best_effort_draft(metadata)
+        and not st.session_state.active_job
+    ):
+        session_id = str(
+            metadata.get("session_id")
+            or st.session_state.current_session_id
+            or ""
+        )
+        if session_id and st.button(
+            "生成可用草稿",
+            key=f"best_effort_draft_{session_id}",
+            help="复用当前会话的证据生成带限制说明的草稿，不降低原始要求。",
+        ):
+            action_text = "生成可用草稿"
+            add_message(session_id, "user", action_text)
+            job = submit_agent_job(
+                action_text,
+                session_id,
+                action_text if metadata.get("status") == "needs_clarification" else None,
+            )
+            if job:
+                st.session_state.active_job = {
+                    "job_id": job.get("job_id"),
+                    "session_id": session_id,
+                }
+            else:
+                add_message(session_id, "assistant", "❌ 提交草稿生成任务失败，请检查 API 服务。")
+            st.rerun()
     if cards:
         with st.expander(f"📄 论文与证据卡片（{len(cards)}）"):
             render_papers_compact(cards)
@@ -298,6 +355,19 @@ def render_message_metadata(metadata: dict) -> None:
     if references:
         with st.expander(f"📚 参考文献（{len(references)}）"):
             render_references_compact(references)
+    if (
+        allow_actions
+        and metadata.get("status") == "partial"
+        and quality_gate.get("draft_released") is True
+        and str(metadata.get("body") or "").strip()
+    ):
+        st.download_button(
+            "下载带限制说明的草稿",
+            data=str(metadata["body"]),
+            file_name="research_best_effort_draft.md",
+            mime="text/markdown",
+            key=f"download_best_effort_{metadata.get('session_id') or 'current'}",
+        )
 
 
 def render_papers_compact(papers: list) -> None:
@@ -405,13 +475,21 @@ def render_chat_interface() -> None:
             st.markdown("👋 你好！请告诉我研究主题、时间范围、期望篇数和需要生成的内容。")
             render_capability_guide(show_examples=True)
     else:
-        for message in messages:
+        last_assistant_index = max(
+            (
+                index for index, item in enumerate(messages)
+                if item.get("role") == "assistant"
+            ),
+            default=-1,
+        )
+        for index, message in enumerate(messages):
             if message.get("role") == "user":
                 render_user_message(message.get("content") or "")
             else:
                 render_assistant_message(
                     message.get("content") or "",
                     message.get("metadata") or {},
+                    allow_actions=index == last_assistant_index,
                 )
 
     active = st.session_state.active_job

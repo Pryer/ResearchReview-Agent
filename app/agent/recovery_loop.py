@@ -63,9 +63,26 @@ def _refresh_evidence_snapshot(state: ResearchAgentState) -> None:
     """在论文或路线归属变化时递增证据快照版本。"""
     payload = {
         "papers": sorted(
-            str(card.get("paper_id") or "")
+            (
+                str(card.get("paper_id") or ""),
+                str((card.get("evidence_state") or {}).get("access_level") or card.get("evidence_source") or ""),
+                str(card.get("quality_status") or ""),
+                hashlib.sha256(json.dumps({
+                    "field_evidence": card.get("field_evidence") or {},
+                    "field_claims": card.get("field_claims") or {},
+                    "evidence_spans": card.get("evidence_spans") or [],
+                }, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16],
+            )
             for card in state.get("paper_cards") or []
             if card.get("paper_id")
+        ),
+        "screening": sorted(
+            (
+                str(paper.get("paper_id") or ""),
+                str(paper.get("_screening_decision") or ""),
+            )
+            for paper in state.get("paper_details") or []
+            if paper.get("paper_id")
         ),
         "routes": sorted(
             (
@@ -162,11 +179,22 @@ def run_route_evidence_recovery(
     state.setdefault("route_recovery_attempts", {})
     state.setdefault("scope_revision_count", 0)
     state.setdefault("recovery_history", [])
+    from app.agent.generation_recovery import recovery_action_count
+
+    # WHY: v1 会话分别保存路线轮次和写作尝试；迁移后以两类旧计数之和作为
+    # 下界，避免新增共享计数从零开始而绕过任务总预算。
+    state["recovery_action_count"] = recovery_action_count(state)
     action_budget = (
         settings.evidence_recovery_max_rounds
         + settings.evidence_recovery_max_scope_revisions
         + 1
     )
+    remaining_task_budget = max(
+        0,
+        int(settings.recovery_total_action_budget)
+        - int(state["recovery_action_count"]),
+    )
+    action_budget = min(action_budget, remaining_task_budget)
     llm = _get_llm()
     _refresh_evidence_snapshot(state)
 
@@ -180,6 +208,14 @@ def run_route_evidence_recovery(
             decision = state.get("recovery_decision") or {}
             action = str(decision.get("action") or RecoveryAction.DEGRADE.value)
             status = str(decision.get("status") or RecoveryStatus.DEGRADED.value)
+
+            if (
+                action not in {RecoveryAction.CONTINUE.value, RecoveryAction.DEGRADE.value}
+                and int(state.get("recovery_action_count") or 0)
+                >= int(settings.recovery_total_action_budget)
+            ):
+                state["evidence_recovery_status"] = RecoveryStatus.EXHAUSTED.value
+                break
 
             if action in {RecoveryAction.CONTINUE.value, RecoveryAction.DEGRADE.value}:
                 state["evidence_recovery_status"] = status
@@ -195,6 +231,9 @@ def run_route_evidence_recovery(
                 break
 
             if action == RecoveryAction.SCOPE_REVISION.value:
+                state["recovery_action_count"] = int(
+                    state.get("recovery_action_count") or 0
+                ) + 1
                 before = float(
                     (state.get("evidence_gap_report") or {}).get("coverage_score") or 0.0
                 )
@@ -240,6 +279,10 @@ def run_route_evidence_recovery(
                 # 让同一组证据在这里重复 MERGE/SPLIT 并造成振荡。
                 state["evidence_recovery_status"] = RecoveryStatus.NOT_REQUIRED.value
                 break
+
+            state["recovery_action_count"] = int(
+                state.get("recovery_action_count") or 0
+            ) + 1
 
             queries = [
                 str(query).strip()

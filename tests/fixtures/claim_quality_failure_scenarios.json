@@ -1,0 +1,33 @@
+{
+  "scenarios": [
+    {
+      "id": "log_replay_2026_09_06_1902",
+      "source_kind": "rotated_log_summary",
+      "evidence_card_count": 153,
+      "valid_reference_count": 39,
+      "factual_claims": 41,
+      "supported": 20,
+      "partially_supported": 6,
+      "unsupported": 15,
+      "weighted_support_rate": 0.561,
+      "known_structure_issues": [
+        "duplicate_or_highly_similar_sentences",
+        "sparse_route_section",
+        "deliverable_structure_invalid"
+      ],
+      "has_sentence_level_snapshot": false
+    },
+    {
+      "id": "persisted_state_2026_09_06_1711",
+      "source_kind": "sanitized_persisted_state_summary",
+      "evidence_card_count": 72,
+      "weighted_support_rate": 0.573,
+      "unsupported": 15,
+      "low_overlap_issues": 14,
+      "structure_validation_passed": true,
+      "has_metadata_gaps": true,
+      "has_sentence_level_snapshot": true
+    }
+  ],
+  "note": "两个场景来自不同正文与证据版本，只能分别复现和统计。"
+}

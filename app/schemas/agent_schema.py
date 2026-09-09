@@ -118,6 +118,10 @@ class AgentRequest(BaseModel):
         max_length=10_000,
         description="对上一轮主题澄清问题的回答，可传 scope_id、序号或选项名称",
     )
+    best_effort_on_failure: Optional[bool] = Field(
+        default=None,
+        description="正式门禁最终仍未通过时是否自动生成带限制说明的可用草稿",
+    )
     state: Optional[Dict[str, Any]] = Field(
         default=None,
         description="可选的初始状态，用于传入本文工作信息、研究背景等写作所需字段"

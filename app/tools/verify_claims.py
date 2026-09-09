@@ -361,6 +361,8 @@ def _verify_review_claims_legacy(
                 claim_type="non_factual",
                 factual=False,
                 support_status="not_applicable",
+                verification_status="not_required",
+                verification_method="none",
             ))
             continue
 
@@ -410,6 +412,7 @@ def _verify_review_claims_legacy(
                 "section": item.get("section"),
                 "page": item.get("page"),
                 "source_type": item.get("source_type"),
+                "card_access_level": item.get("card_access_level"),
                 "score": round(score, 4),
             }
             for score, item in best
@@ -472,6 +475,8 @@ def _verify_review_claims_legacy(
             claim_type=claim_type,
             factual=True,
             support_status=status,
+            verification_status="verified",
+            verification_method="deterministic",
             support_score=round(best_score, 4),
             evidence_ids=evidence_ids,
             evidence_snippets=evidence_snippets,
@@ -502,6 +507,8 @@ def _verify_review_claims_legacy(
                 issues.append("entailment_not_verified")
                 revised_claims.append(claim.model_copy(update={
                     "support_status": "unsupported",
+                    "verification_status": "not_completed",
+                    "verification_method": "semantic",
                     "issues": list(dict.fromkeys(issues)),
                     "suggested_revision": "未完成语义蕴含验证；请重试验证或删除该主张。",
                 }))
@@ -534,6 +541,8 @@ def _verify_review_claims_legacy(
                 )
             revised_claims.append(claim.model_copy(update={
                 "support_status": status,
+                "verification_status": "verified",
+                "verification_method": "semantic",
                 "support_score": round(confidence, 4),
                 "issues": list(dict.fromkeys(issues)),
                 "suggested_revision": (
@@ -547,6 +556,7 @@ def _verify_review_claims_legacy(
     supported = sum(claim.support_status == "supported" for claim in factual_claims)
     partial = sum(claim.support_status == "partially_supported" for claim in factual_claims)
     unsupported = sum(claim.support_status == "unsupported" for claim in factual_claims)
+    unverified = sum(claim.verification_status == "not_completed" for claim in factual_claims)
     support_rate = (supported + 0.5 * partial) / len(factual_claims) if factual_claims else 1.0
     evidence_quality = build_evidence_quality_report(paper_cards)
     report = ClaimVerificationReport(
@@ -556,6 +566,11 @@ def _verify_review_claims_legacy(
         supported=supported,
         partially_supported=partial,
         unsupported=unsupported,
+        unverified=unverified,
+        verification_coverage=(
+            round((len(factual_claims) - unverified) / len(factual_claims), 4)
+            if factual_claims else 1.0
+        ),
         support_rate=round(support_rate, 4),
         claims=claims,
         evidence_summary=evidence_quality["evidence_summary"],
@@ -653,6 +668,8 @@ def _aggregate_atomic_results(
             text=result.sentence,
             citations=result.citations,
             support_status=result.support_status,
+            verification_status=result.verification_status,
+            verification_method=result.verification_method,
             support_score=result.support_score,
             evidence_ids=result.evidence_ids,
             evidence_snippets=result.evidence_snippets,
@@ -661,10 +678,22 @@ def _aggregate_atomic_results(
         for result in factual
     ]
     first = factual[0]
+    verification_status = (
+        "not_completed"
+        if any(result.verification_status == "not_completed" for result in factual)
+        else "verified"
+    )
+    verification_method = (
+        "semantic"
+        if any(result.verification_method == "semantic" for result in factual)
+        else "deterministic"
+    )
     return first.model_copy(update={
         "claim_id": "c001",
         "sentence": sentence,
         "support_status": status,
+        "verification_status": verification_status,
+        "verification_method": verification_method,
         "support_score": round(min(scores), 4) if scores else 0.0,
         "evidence_ids": evidence_ids,
         "evidence_snippets": snippets,
@@ -741,14 +770,26 @@ def verify_review_claims(
         )
 
     previous_claims: Dict[int, ClaimEvidenceResult] = {}
+    previous_by_sentence: Dict[str, list[tuple[int, ClaimEvidenceResult]]] = {}
+    previous_contract_complete = True
     for item in (previous_report.get("claims") or []) if isinstance(previous_report, dict) else []:
+        # 旧会话没有记录验证方式，不能把旧的词面结论冒充已完成语义核验。
+        if not isinstance(item, dict) or (
+            "verification_status" not in item or "verification_method" not in item
+        ):
+            previous_contract_complete = False
+            continue
         try:
             claim = ClaimEvidenceResult.model_validate(item)
         except Exception:
             continue
         match = re.match(r"^c(\d+)$", claim.claim_id)
         if match:
-            previous_claims[int(match.group(1))] = claim
+            previous_index = int(match.group(1))
+            previous_claims[previous_index] = claim
+            previous_by_sentence.setdefault(claim.sentence, []).append(
+                (previous_index, claim)
+            )
 
     # Explicit targets plus a previous report select local mode. A missing prior
     # report cannot safely fill the untouched sentences, so it becomes full mode.
@@ -757,16 +798,42 @@ def verify_review_claims(
     # 验证，因为最终质量门禁仍必须基于完整、当前正文的报告。
     if not explicit_scope_mode and previous_claims and (target_indices or target_ids):
         local_mode = True
-    local_mode = bool(local_mode and previous_claims and (target_indices or target_ids))
+    local_mode = bool(
+        local_mode
+        and previous_contract_complete
+        and previous_claims
+        and (target_indices or target_ids)
+    )
+    reusable_claims: Dict[int, ClaimEvidenceResult] = {}
     if not local_mode:
         target_indices = set(range(1, len(sentences) + 1))
     else:
-        # A changed sentence must not silently inherit an old result even when the
-        # caller only supplied a narrow target list.
+        used_previous_indices: set[int] = set()
+        for index, sentence in enumerate(sentences, 1):
+            if index in target_indices:
+                continue
+            same_index = previous_claims.get(index)
+            if same_index is not None and same_index.sentence == sentence:
+                reusable_claims[index] = same_index
+                used_previous_indices.add(index)
+                continue
+            # WHY: 删除或插入句子会改变后续序号。只有正文（含引用）完全相同
+            # 且旧结果未被复用时才按内容迁移；重复句无法唯一关联时重新验证。
+            candidates = [
+                (old_index, claim)
+                for old_index, claim in previous_by_sentence.get(sentence, [])
+                if old_index not in used_previous_indices
+            ]
+            if len(candidates) == 1:
+                old_index, claim = candidates[0]
+                reusable_claims[index] = claim.model_copy(update={
+                    "claim_id": f"c{index:03d}",
+                    "sentence": sentence,
+                })
+                used_previous_indices.add(old_index)
         target_indices.update(
-            index for index, sentence in enumerate(sentences, 1)
-            if index not in previous_claims
-            or previous_claims[index].sentence != sentence
+            index for index in range(1, len(sentences) + 1)
+            if index not in reusable_claims
         )
 
     sentence_units: list[tuple[int, str, list[ClaimEvidenceResult]]] = []
@@ -820,16 +887,17 @@ def verify_review_claims(
     for sentence_index, sentence in enumerate(sentences, 1):
         if sentence_index in claims_by_index:
             claims.append(claims_by_index[sentence_index])
-        elif local_mode and sentence_index in previous_claims:
+        elif local_mode and sentence_index in reusable_claims:
             # WHY: 未命中的句子保留上一轮完整结果（包括 issues/evidence），
             # 仅目标句进入解析和 LLM 验证，避免局部修复扩大验证范围。
-            claims.append(previous_claims[sentence_index])
+            claims.append(reusable_claims[sentence_index])
             reused_sentences += 1
 
     factual_claims = [claim for claim in claims if claim.factual]
     supported = sum(claim.support_status == "supported" for claim in factual_claims)
     partial = sum(claim.support_status == "partially_supported" for claim in factual_claims)
     unsupported = sum(claim.support_status == "unsupported" for claim in factual_claims)
+    unverified = sum(claim.verification_status == "not_completed" for claim in factual_claims)
     support_rate = (supported + 0.5 * partial) / len(factual_claims) if factual_claims else 1.0
     evidence_quality = build_evidence_quality_report(paper_cards)
     report = ClaimVerificationReport(
@@ -839,6 +907,11 @@ def verify_review_claims(
         supported=supported,
         partially_supported=partial,
         unsupported=unsupported,
+        unverified=unverified,
+        verification_coverage=(
+            round((len(factual_claims) - unverified) / len(factual_claims), 4)
+            if factual_claims else 1.0
+        ),
         support_rate=round(support_rate, 4),
         claims=claims,
         evidence_summary=evidence_quality["evidence_summary"],
@@ -856,10 +929,17 @@ def verify_review_claims(
         "skipped_sentences": max(0, len(sentences) - len(claims)),
     }
     output["verification_stats"] = output["verification_scope"]
+    output["verification_mode"] = "semantic" if llm is not None else "deterministic"
+    output["semantic_verification"] = {
+        "requested": cache_stats["reused"] + cache_stats["computed"] + unverified,
+        "cache_reused": cache_stats["reused"],
+        "completed": cache_stats["reused"] + cache_stats["computed"],
+        "not_completed": unverified,
+    }
     return output
 
 
-_ENTAILMENT_VERIFIER_VERSION = "atomic-entailment-v2"
+_ENTAILMENT_VERIFIER_VERSION = "atomic-entailment-v3"
 
 
 def _entailment_fingerprint(claim: ClaimEvidenceResult) -> str:
@@ -867,10 +947,17 @@ def _entailment_fingerprint(claim: ClaimEvidenceResult) -> str:
     payload = {
         "version": _ENTAILMENT_VERIFIER_VERSION,
         "claim": re.sub(r"\s+", " ", _clean_claim(claim.sentence)).strip().casefold(),
+        "citations": sorted(str(value) for value in claim.citations),
+        "required_access_level": claim.required_access_level,
+        "actual_access_level": claim.actual_access_level,
         "evidence": [
             {
                 "evidence_id": str(item.get("evidence_id") or ""),
                 "text": re.sub(r"\s+", " ", str(item.get("text") or "")).strip(),
+                "source_type": str(item.get("source_type") or ""),
+                "card_access_level": str(item.get("card_access_level") or ""),
+                "section": str(item.get("section") or ""),
+                "page": item.get("page"),
             }
             for item in claim.evidence_snippets
         ],
@@ -933,6 +1020,8 @@ def _apply_llm_entailment(
             issues.append("entailment_not_verified")
             revised.append(claim.model_copy(update={
                 "support_status": "unsupported",
+                "verification_status": "not_completed",
+                "verification_method": "semantic",
                 "issues": list(dict.fromkeys(issues)),
                 "suggested_revision": "未完成语义蕴含验证；请重试验证或删除该主张。",
             }))
@@ -964,6 +1053,8 @@ def _apply_llm_entailment(
             )
         revised.append(claim.model_copy(update={
             "support_status": status,
+            "verification_status": "verified",
+            "verification_method": "semantic",
             "support_score": round(confidence, 4),
             "issues": list(dict.fromkeys(issues)),
             "suggested_revision": (

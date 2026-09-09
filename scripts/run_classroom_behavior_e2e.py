@@ -1,17 +1,15 @@
-"""端到端测试：调研近三年课堂行为分析论文，生成研究背景+研究现状，引用不少于40篇。
-
-真实调用 LLM（.env 配置的 longcat）和真实检索 arxiv/semantic_scholar/openalex/
-crossref/cnki（cnki 会启动 Selenium 浏览器，较慢）。运行结果写入
-data/classroom_behavior_e2e_result.txt 和 .json（含完整 answer/references/steps 摘要）。
-"""
+"""真实课堂行为研究端到端验收；默认走会话服务及其自动恢复控制器。"""
 
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PROJECT_ROOT not in sys.path:
@@ -29,28 +27,80 @@ def _force_utf8(stream):
 sys.stdout = _force_utf8(sys.stdout)
 sys.stderr = _force_utf8(sys.stderr)
 
-from app.agent.graph import run_research_agent  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
 
 settings = get_settings()
 
-QUERY = "调研近三年课堂行为分析论文，并生成研究背景和研究现状，不少于40篇引用论文"
-
-OUT_TXT = Path("data/classroom_behavior_e2e_result.txt")
-OUT_JSON = Path("data/classroom_behavior_e2e_result.json")
+QUERY = (
+    "调研近三年课堂行为分析论文，侧重教育技术视角下的行为编码与教学互动分析，"
+    "并生成研究背景和研究现状，引用论文不少于40篇"
+)
 
 
 def _progress(step: str, current: int, total: int) -> None:
     print(f"[progress] {current}/{total} {step}", flush=True)
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--query", default=QUERY)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="独立输出目录；默认按时间写入 data/e2e_runs/，不会覆盖旧快照",
+    )
+    parser.add_argument(
+        "--graph-only",
+        action="store_true",
+        help="只运行 Agent 图；默认运行带持久化和自动恢复的会话服务",
+    )
+    return parser.parse_args()
+
+
+def _run_conversation(query: str, output_dir: Path) -> dict:
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.database.models import Base
+    from app.schemas.agent_schema import AgentRequest
+    from app.services.research_conversation_service import ResearchConversationService
+
+    database_path = (output_dir / "session.db").resolve()
+    engine = create_engine(
+        f"sqlite:///{database_path.as_posix()}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    with session_factory() as db:
+        service = ResearchConversationService(db, progress_callback=_progress)
+        return service.handle(AgentRequest(
+            session_id=f"classroom-e2e-{uuid4().hex}",
+            user_query=query,
+        ))
+
+
 def main() -> None:
-    print(f"query: {QUERY}")
+    args = _parse_args()
+    run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    output_dir = args.output_dir or Path("data/e2e_runs") / run_stamp
+    output_dir.mkdir(parents=True, exist_ok=False)
+    out_txt = output_dir / "result.txt"
+    out_json = output_dir / "result.json"
+
+    print(f"query: {args.query}")
     print(f"configured sources: {settings.search_sources_list}")
     print(f"llm provider={settings.llm_provider} model={settings.llm_model}")
+    print(f"mode={'graph' if args.graph_only else 'conversation'}")
 
     t0 = time.perf_counter()
-    result = run_research_agent(QUERY, progress_callback=_progress)
+    if args.graph_only:
+        from app.agent.graph import run_research_agent
+
+        result = run_research_agent(args.query, progress_callback=_progress)
+    else:
+        result = _run_conversation(args.query, output_dir)
     dt = time.perf_counter() - t0
 
     intent = result.get("intent")
@@ -68,12 +118,18 @@ def main() -> None:
 
     lines = []
     lines.append("=" * 70)
-    lines.append(f"query: {QUERY}")
+    lines.append(f"query: {args.query}")
+    lines.append(f"mode: {'graph' if args.graph_only else 'conversation'}")
     lines.append(f"耗时: {dt:.1f}s")
     lines.append(f"intent: {intent}")
     lines.append(f"core_deliverables: {core_deliverables}")
     lines.append(f"generation_blocked: {generation_blocked}")
-    lines.append(f"参考文献数: {len(references)}  (要求 >= 40)")
+    required = int(
+        result.get("required_reference_count")
+        or (result.get("research_state") or {}).get("required_reference_count")
+        or 0
+    )
+    lines.append(f"参考文献数: {len(references)}  (要求 >= {required})")
     lines.append(f"paper_cards 数: {len(paper_cards)}")
     lines.append(f"errors 数: {len(errors)}")
     lines.append(f"失败/异常步骤数: {len(failed_steps)}")
@@ -99,14 +155,13 @@ def main() -> None:
     for i, ref in enumerate(references, start=1):
         lines.append(f"  [{i}] {ref}")
 
-    OUT_TXT.parent.mkdir(parents=True, exist_ok=True)
-    OUT_TXT.write_text("\n".join(lines), encoding="utf-8")
-    OUT_JSON.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    out_txt.write_text("\n".join(lines), encoding="utf-8")
+    out_json.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
     print("\n" + "=" * 70)
-    print(f"结果已写入 {OUT_TXT} 和 {OUT_JSON}")
+    print(f"结果已写入 {out_txt} 和 {out_json}")
     print(f"intent={intent} core_deliverables={core_deliverables}")
-    print(f"参考文献数={len(references)} (要求>=40)  errors={len(errors)}  耗时={dt:.1f}s")
+    print(f"参考文献数={len(references)} (要求>={required})  errors={len(errors)}  耗时={dt:.1f}s")
     print(f"generation_blocked={generation_blocked}")
 
 

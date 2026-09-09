@@ -129,6 +129,23 @@ class ResearchConversationService:
         if existing_session and existing_session.get("status") == "needs_clarification":
             request.clarification_answer = request.user_query
             return self._resume_after_clarification(request)
+        if existing_session and existing_session.get("status") == "blocked":
+            saved_state = dict(existing_session.get("state") or {})
+            snapshot = dict(saved_state.get("result_snapshot") or {})
+            clarification = self._quality_clarification(snapshot)
+            decision = self._parse_quality_decision(
+                request.user_query, clarification or {}
+            )
+            if clarification and decision and decision.get("action") == "force_generate":
+                # WHY: blocked 会话中的“生成可用草稿”是对原任务的交付策略，
+                # 不是一个以该短句为主题的新检索请求；复用保存的证据和约束。
+                return self._resume_after_quality_decision(
+                    session_id=str(request.session_id),
+                    session=existing_session,
+                    state=saved_state,
+                    clarification=clarification,
+                    answer=request.user_query,
+                )
         return self._start_turn(request)
 
     def _start_turn(
@@ -140,6 +157,16 @@ class ResearchConversationService:
         # trusted_state 只由服务内部的会话恢复路径提供；外部请求仍经过
         # AgentRequest 的公开字段白名单校验。
         initial_state = dict(trusted_state if trusted_state is not None else (request.state or {}))
+        if request.best_effort_on_failure is not None:
+            initial_state["best_effort_on_failure"] = request.best_effort_on_failure
+            initial_state["best_effort_policy_source"] = "request"
+        elif "best_effort_on_failure" not in initial_state:
+            from app.core.config import get_settings
+
+            initial_state["best_effort_on_failure"] = bool(
+                get_settings().enable_recovery_exhausted_best_effort_generation
+            )
+            initial_state["best_effort_policy_source"] = "configuration"
         # 顶层意图只在新研究请求上重新识别。澄清恢复由专用路径显式标记为
         # ``working_query``，避免把同一 session 携带的旧状态误当成当前请求。
         initial_state["intent_context_role"] = "request"
@@ -517,9 +544,8 @@ class ResearchConversationService:
         })
         if decision is None:
             question = (
-                "我还不能确定你希望如何调整。请直接说明：直接生成当前最佳草稿、"
-                "接受当前篇数、扩大到近几年、纳入更多文献类型、放宽主题范围，"
-                "还是保持条件继续检索？"
+                "我无法把这句话映射为可执行的恢复动作。请按上一条消息明确提供"
+                "所需输入或访问条件；如果不再继续，请说明结束任务。"
             )
             updated = {
                 **clarification,
@@ -565,32 +591,6 @@ class ResearchConversationService:
             or clarification.get("recovery_attempts")
             or 0
         )
-        if (
-            recovery_attempts >= 3
-            and decision["action"] not in {"force_generate", "accept_available", "stop"}
-        ):
-            question = (
-                "已经连续尝试3次调整，但同一写作门禁仍未通过。为避免无限循环，"
-                "系统不再自动重复检索或放宽范围。你可以回答“直接生成”以输出当前"
-                "最佳可用草稿，或回答“结束任务”。"
-            )
-            updated = {
-                **clarification,
-                "question": question,
-                "recovery_attempts": recovery_attempts,
-                "recovery_options": ["直接生成当前最佳可用草稿", "结束任务"],
-            }
-            history.append({"role": "assistant", "content": question, "type": "clarification"})
-            state["conversation_history"] = history[-50:]
-            self.repo.save(
-                session_id=session_id,
-                status="needs_clarification",
-                original_query=session["original_query"],
-                state=state,
-                clarification=updated,
-            )
-            self.db.commit()
-            return self._clarification_result(session_id, state, updated, question)
         from app.agent.topic_disambiguation import reconcile_selected_scope_from_history
 
         reconciled_scope = reconcile_selected_scope_from_history(
@@ -606,6 +606,15 @@ class ResearchConversationService:
             or state.get("research_request")
             or {}
         )
+        # 旧会话可能只将“至少 N 篇”保存在 research_request；恢复时把约束
+        # 来源同步到工作状态，确保重试仍执行同一篇数门禁。
+        if research_request.get("max_papers_explicit") is not None:
+            editable["max_papers_explicit"] = bool(
+                research_request.get("max_papers_explicit")
+            )
+        for key in ("required_reference_count", "max_papers"):
+            if editable.get(key) is None and research_request.get(key) is not None:
+                editable[key] = research_request[key]
         refreshed_frame = self._refresh_open_alternative_semantics(
             session["original_query"],
             history,
@@ -633,6 +642,7 @@ class ResearchConversationService:
             # accept_available 分支执行（用户明确说"接受当前 N 篇"，属授权路径）。
             editable.update({
                 "best_effort_generation": True,
+                "automatic_best_effort_generation": False,
                 "allow_unvalidated_taxonomy": True,
                 "quality_recovery_attempts": recovery_attempts,
                 "research_request": research_request,
@@ -667,6 +677,16 @@ class ResearchConversationService:
                 })
             else:
                 editable["conservative_regeneration"] = True
+                if decision["action"] == "regenerate_existing":
+                    # “保守重写”要求回到严格证据边界；之前获准发布的
+                    # best-effort 标记不能继续让本轮失败正文被当作可发布草稿。
+                    editable["best_effort_generation"] = False
+                    editable["automatic_best_effort_generation"] = False
+                    editable["allow_unvalidated_taxonomy"] = False
+                    editable.pop("forced_generation_issues", None)
+                    if re.search(r"基于(?:当前|现有).{0,8}证据", str(answer or "")):
+                        editable["allow_evidence_expansion"] = False
+                        research_request["allow_evidence_expansion"] = False
                 
             if decision["action"] == "repair_taxonomy":
                 from app.schemas.taxonomy_schema import DynamicTaxonomy
@@ -677,7 +697,10 @@ class ResearchConversationService:
                     current_fp = taxonomy_fingerprint(DynamicTaxonomy.model_validate(taxonomy_data))
                     last_fp = editable.get("last_taxonomy_fingerprint")
                     if last_fp and current_fp == last_fp:
-                        raise ValueError("分类结果已稳定无法继续细分。请尝试'扩大年份'、'加入预印本'或'接受现有论文'。")
+                        raise ValueError(
+                            "分类结果与上一版本相同，不能通过重复分类取得进展；"
+                            "系统会保留现有证据和已验证检查点。"
+                        )
                     editable["last_taxonomy_fingerprint"] = current_fp
                 
                 editable["force_taxonomy_remediation"] = True
@@ -749,6 +772,8 @@ class ResearchConversationService:
             query_suffix = f"用户在质量决策中放宽研究范围：{answer}"
         else:
             editable["incremental_retrieval"] = True
+            editable["allow_evidence_expansion"] = True
+            research_request["allow_evidence_expansion"] = True
             query_suffix = "用户要求保持当前约束并继续补充检索。"
 
         state["research_request"] = research_request
@@ -907,7 +932,10 @@ class ResearchConversationService:
             r"|直接.{0,12}(?:生成|草稿|输出|写)"
             r"|基于(?:当前|现有).{0,12}(?:生成|草稿|输出|写)"
             r"|(?:当前|现有).{0,6}最佳.{0,6}(?:草稿|版本|结果)"
-            r"|最佳(?:可用)?草稿",
+            r"|最佳(?:可用)?草稿"
+            # blocked 会话提供的短动作也必须被当作交付策略。限定“草稿”可避免
+            # 把普通的“生成研究现状”误识别为绕过门禁。
+            r"|(?:强制)?生成.{0,6}(?:可用)?草稿",
             text,
         ):
             return {"action": "force_generate"}
@@ -943,12 +971,19 @@ class ResearchConversationService:
         if gate.get("draft_released") is True:
             return None
         issues = gate.get("blocking_issues") or []
+        issue_codes = {str(issue.get("code") or "") for issue in issues}
+        if "deliverable_generation_failed" in issue_codes:
+            # WHY: 运行时编程错误无法通过检索、重写或重验改善。让它进入质量
+            # 恢复会重复执行同一故障并耗尽任务预算；保留原始技术错误终态，
+            # 修复部署后由下一次研究请求使用全新的任务预算重新执行。
+            return None
         phase = str(gate.get("phase") or "post_generation")
         count_issue = next(
             (
                 issue for issue in issues
                 if issue.get("code") in {
                     "minimum_references_not_met",
+                    "minimum_planned_references_not_met",
                     "minimum_cited_references_not_met",
                 }
             ),
@@ -962,7 +997,6 @@ class ResearchConversationService:
             or len(result.get("paper_cards") or [])
         )
         evidence_pool_available = len(result.get("paper_cards") or [])
-        issue_codes = {str(issue.get("code") or "") for issue in issues}
         if count_issue and phase == "post_generation" and evidence_pool_available >= requested:
             question = (
                 f"现有证据池包含 {evidence_pool_available} 篇论文，但正文当前只有效引用了 {available} 篇，"
@@ -988,16 +1022,13 @@ class ResearchConversationService:
             )
         elif phase == "pre_generation":
             question = (
-                "当前动态分类或证据结构未达到写作条件。"
-                f"你可以{_quality_option_label('best_effort_draft')}，也可以"
-                f"{_quality_option_label('broaden_scope')}、"
-                f"{_quality_option_label('retry_search')}或{_quality_option_label('stop')}。"
+                "当前会话缺少执行自动恢复所需的可编辑检查点。请重新提交原始研究请求；"
+                "系统会重新核验已有证据后再决定是否需要补充检索。"
             )
         else:
             question = (
-                "生成草稿未通过引用或主张证据检查。"
-                f"你希望{_quality_option_label('conservative_rewrite')}、"
-                f"{_quality_option_label('retry_search')}，还是{_quality_option_label('stop')}？"
+                "未通过验证的草稿已被隔离，但当前会话缺少可恢复检查点。"
+                "请重新提交原始研究请求，系统将从已保存证据重建写作计划。"
             )
         return {
             "kind": "quality_decision",
@@ -1104,21 +1135,22 @@ class ResearchConversationService:
         }
         clarification = self._quality_clarification(result)
         if clarification:
+            automatic = self._auto_recover_actionable_result(
+                session_id=session_id,
+                original_query=original_query,
+                state=persisted_state,
+                result=result,
+                clarification=clarification,
+                history=history,
+            )
+            if automatic is not None:
+                return automatic
             recovery_attempts = int(
                 (result.get("research_state") or {}).get("quality_recovery_attempts")
                 or persisted_state.get("quality_recovery_attempts")
                 or 0
             )
             clarification["recovery_attempts"] = recovery_attempts
-            if recovery_attempts >= 3:
-                clarification.update({
-                    "question": (
-                        "已经连续尝试3次调整，但同一写作门禁仍未通过。为避免无限循环，"
-                        "系统不再自动重复检索或放宽范围。你可以回答“直接生成”以输出"
-                        "当前最佳可用草稿，或回答“结束任务”。"
-                    ),
-                    "recovery_options": ["直接生成当前最佳可用草稿", "结束任务"],
-                })
             question = clarification["question"]
             history.append({"role": "assistant", "content": question, "type": "quality_decision"})
             persisted_state["conversation_history"] = history[-50:]
@@ -1158,6 +1190,372 @@ class ResearchConversationService:
             status=result_status,
             original_query=original_query,
             state=persisted_state,
+        )
+        self.db.commit()
+        return result
+
+    def _auto_recover_actionable_result(
+        self,
+        *,
+        session_id: str,
+        original_query: str,
+        state: dict[str, Any],
+        result: dict[str, Any],
+        clarification: dict[str, Any],
+        history: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """诊断写作缺口，并在共享预算内执行无需用户改约束的恢复动作。"""
+        from app.agent.generation_recovery import decide_generation_recovery
+        from app.core.config import get_settings
+        from app.schemas.recovery_schema import RecoveryAction, RecoveryStatus
+
+        private_state = result.get("research_state") or {}
+        # 兼容修复前保存的会话：旧 research_state 没有携带引用表和逐句验证，
+        # 但本轮 result 顶层仍有这些可信产物。恢复前把它们补进私有状态，确保
+        # 候选版本退化时能事务式回到完整旧稿，而不是正文和引用表各回一半。
+        recoverable_products = {
+            key: result.get(key)
+            for key in (
+                "quality_gate", "generation_readiness", "paper_cards",
+                "claim_verification", "claim_citation_consistency",
+                "final_review_integrity", "citation_allocation_plan",
+                "citation_allocation_plans", "references", "reference_papers",
+                "citation_map", "citation_registry", "citation_validation",
+                "generation_quality", "evidence_quality_report",
+                "unique_cited_paper_count", "unique_valid_cited_paper_count",
+                "final_requirement_met", "reference_coverage_stats",
+                "required_reference_count", "review", "draft_available",
+                "generation_blocked",
+            )
+            if result.get(key) is not None
+        }
+        private_state.update(recoverable_products)
+        coverage = private_state.get("reference_coverage_stats") or {}
+        private_state.setdefault(
+            "unique_cited_paper_count", int(coverage.get("actual_cited") or 0)
+        )
+        private_state.setdefault(
+            "unique_valid_cited_paper_count", int(coverage.get("final_valid") or 0)
+        )
+        result["research_state"] = private_state
+        recovery_state = dict(private_state)
+        settings = get_settings()
+        decision = decide_generation_recovery(
+            recovery_state,
+            max_actions=int(settings.recovery_total_action_budget),
+        )
+        decision_data = decision.model_dump(mode="json")
+        result["quality_recovery_decision"] = decision_data
+        private_state["quality_recovery_decision"] = decision_data
+
+        if decision.status == RecoveryStatus.EXHAUSTED:
+            best_effort_on_failure = private_state.get(
+                "best_effort_on_failure",
+                state.get(
+                    "best_effort_on_failure",
+                    settings.enable_recovery_exhausted_best_effort_generation,
+                ),
+            )
+            if bool(best_effort_on_failure):
+                forced = self._run_exhausted_best_effort_generation(
+                    session_id=session_id,
+                    original_query=original_query,
+                    state=state,
+                    result=result,
+                    decision=decision_data,
+                    history=history,
+                )
+                if forced is not None:
+                    return forced
+            return self._persist_exhausted_quality_result(
+                session_id=session_id,
+                original_query=original_query,
+                state=state,
+                result=result,
+                decision=decision_data,
+                history=history,
+            )
+        if decision.action == RecoveryAction.REQUEST_USER_INPUT:
+            requested = int(clarification.get("requested") or 0)
+            available = int(clarification.get("available") or 0)
+            gap = max(requested - available, 0)
+            if any(issue.get("category") == "reference_coverage" for issue in decision_data["issues"]):
+                clarification.update({
+                    "question": (
+                        f"自动恢复已完成现有证据内可执行的分配和写作修复；当前有 "
+                        f"{available} 篇通过有效性检查，距离要求的 {requested} 篇还差 {gap} 篇。"
+                        "若保持原篇数，需要允许系统在原主题和时间范围内定向补充证据；"
+                        "若只使用现有证据，请明确接受当前篇数。"
+                    ),
+                    "recovery_options": [
+                        "允许在原主题和时间范围内定向补充证据",
+                        f"接受当前 {available} 篇有效引用",
+                        "结束任务",
+                    ],
+                    "required_user_input": decision.user_input_reason,
+                })
+            else:
+                clarification.update({
+                    "question": (
+                        "系统已完成当前权限和预算内的自动恢复，但仍缺少继续执行所需的"
+                        f"外部输入：{decision.user_input_reason}。已验证内容和检查点均已保存。"
+                    ),
+                    "recovery_options": ["提供所需材料或访问条件", "结束任务"],
+                    "required_user_input": decision.user_input_reason,
+                })
+            return None
+        if decision.action in {RecoveryAction.CONTINUE, RecoveryAction.DEGRADE}:
+            return None
+        return self._execute_quality_recovery_decision(
+            session_id=session_id,
+            original_query=original_query,
+            state=state,
+            result=result,
+            decision=decision_data,
+            history=history,
+        )
+
+    def _execute_quality_recovery_decision(
+        self,
+        *,
+        session_id: str,
+        original_query: str,
+        state: dict[str, Any],
+        result: dict[str, Any],
+        decision: dict[str, Any],
+        history: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        from app.agent.generation_recovery import start_recovery_action
+        from app.schemas.recovery_schema import GenerationRecoveryDecision, RecoveryAction
+
+        editable = dict(state.get("editable_research_state") or result.get("research_state") or {})
+        if not editable or not editable.get("paper_cards"):
+            return None
+        decision_obj = GenerationRecoveryDecision.model_validate(decision)
+        start_recovery_action(editable, decision_obj)
+        attempts = int(editable.get("quality_recovery_attempts") or 0) + 1
+        editable["quality_recovery_attempts"] = attempts
+        editable["conversation_history"] = history[-50:]
+        editable["best_effort_generation"] = False
+        editable["automatic_best_effort_generation"] = False
+        editable["allow_unvalidated_taxonomy"] = False
+        editable.pop("forced_generation_issues", None)
+
+        action = decision_obj.action
+        step_by_action = {
+            RecoveryAction.RECOMPUTE_STATE: "quality_recovery:recompute_state",
+            RecoveryAction.REFRESH_EVIDENCE: "quality_recovery:refresh_evidence",
+            RecoveryAction.REBUILD_STRUCTURE: "quality_recovery:rebuild_structure",
+            RecoveryAction.REBUILD_CLAIMS: "quality_recovery:rebuild_claims",
+            RecoveryAction.REALLOCATE_CITATIONS: "quality_recovery:reallocate_citations",
+            RecoveryAction.REWRITE_SECTIONS: "quality_recovery:rewrite_sections",
+            RecoveryAction.REVERIFY_CLAIMS: "quality_recovery:reverify_claims",
+            RecoveryAction.TARGETED_SEARCH: "quality_recovery:targeted_search",
+        }
+        message_by_action = {
+            RecoveryAction.RECOMPUTE_STATE: "正在刷新与当前证据版本不一致的派生状态。",
+            RecoveryAction.REFRESH_EVIDENCE: "正在重新核验并提取现有论文的元数据与证据。",
+            RecoveryAction.REBUILD_STRUCTURE: "正在依据现有证据重建研究结构并重新验证。",
+            RecoveryAction.REBUILD_CLAIMS: "正在为可用证据重建主张授权和引用覆盖。",
+            RecoveryAction.REALLOCATE_CITATIONS: "正在重新分配引用并修复缺少来源的章节。",
+            RecoveryAction.REWRITE_SECTIONS: "正在仅重写未通过验证的章节。",
+            RecoveryAction.REVERIFY_CLAIMS: "正在保留当前正文并重试未完成的语义主张验证。",
+            RecoveryAction.TARGETED_SEARCH: "正在原主题和时间范围内定向补充缺失证据。",
+        }
+        history.append({
+            "role": "assistant",
+            "content": message_by_action.get(action, decision_obj.reason),
+            "type": "quality_recovery_progress",
+            "action": action.value,
+            "attempt": attempts,
+        })
+        editable["conversation_history"] = history[-50:]
+        editable["target_section_ids"] = list(decision_obj.target_section_ids)
+        editable["target_claim_ids"] = list(decision_obj.target_claim_ids)
+        editable["conservative_regeneration"] = True
+
+        if action == RecoveryAction.REBUILD_STRUCTURE:
+            editable["force_taxonomy_remediation"] = True
+        elif action == RecoveryAction.REBUILD_CLAIMS:
+            editable["force_claim_plan_rebuild"] = True
+        elif action == RecoveryAction.REWRITE_SECTIONS:
+            # 无法从门禁定位章节时为空列表，此标志表示整篇按章节重写；若能
+            # 定位，则 renderer 只强制生成 target_section_ids 中的章节。
+            editable["force_section_rewrite"] = True
+        elif action == RecoveryAction.REVERIFY_CLAIMS:
+            editable["verification_only_recovery"] = True
+        elif action == RecoveryAction.RECOMPUTE_STATE:
+            request = editable.get("research_request") or {}
+            for key in ("start_year", "end_year"):
+                if request.get(key) is not None:
+                    editable[key] = request[key]
+            editable.pop("generation_readiness", None)
+            editable.pop("state_invariant_check", None)
+            gap = editable.get("evidence_gap_report") or {}
+            if gap and (
+                gap.get("evidence_snapshot_version") != editable.get("evidence_snapshot_version")
+                or (
+                    gap.get("evidence_snapshot_fingerprint")
+                    and editable.get("evidence_snapshot_fingerprint")
+                    and gap.get("evidence_snapshot_fingerprint")
+                    != editable.get("evidence_snapshot_fingerprint")
+                )
+            ):
+                editable.pop("evidence_gap_report", None)
+        elif action == RecoveryAction.REFRESH_EVIDENCE:
+            editable["refresh_existing_evidence"] = True
+            editable["force_taxonomy_remediation"] = True
+            editable["force_claim_plan_rebuild"] = True
+
+        state["editable_research_state"] = editable
+        state["quality_recovery_attempts"] = attempts
+        state["recovery_action_count"] = editable.get("recovery_action_count")
+        state["quality_recovery_history"] = editable.get("quality_recovery_history")
+        state["conversation_history"] = history[-50:]
+        if self.progress_callback:
+            current = int(editable.get("recovery_action_count") or 1)
+            self.progress_callback(
+                step_by_action.get(action, "quality_recovery"),
+                current,
+                max(current, current - 1 + int(decision_obj.remaining_budget)),
+            )
+        if action == RecoveryAction.TARGETED_SEARCH:
+            editable["incremental_retrieval"] = True
+            return self._continue_retrieval_and_persist(
+                session_id, original_query, state, editable
+            )
+        return self._regenerate_and_persist(
+            session_id, original_query, state, editable
+        )
+
+    def _run_exhausted_best_effort_generation(
+        self,
+        *,
+        session_id: str,
+        original_query: str,
+        state: dict[str, Any],
+        result: dict[str, Any],
+        decision: dict[str, Any],
+        history: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """恢复耗尽后，基于现有证据执行一次受控的最终草稿生成。"""
+        editable = dict(result.get("research_state") or {})
+        if editable.get("automatic_best_effort_attempted"):
+            return None
+        issue_codes = {
+            str(issue.get("code") or "")
+            for issue in decision.get("issues") or []
+            if isinstance(issue, dict)
+        }
+        non_generatable_codes = {
+            "deliverable_generation_failed",
+            "authentication_required",
+            "human_action_required",
+            "missing_user_material",
+            "state_time_window_mismatch",
+            "stale_evidence_snapshot",
+            "recovery_readiness_conflict",
+        }
+        if issue_codes & non_generatable_codes:
+            return None
+        cards = list(editable.get("paper_cards") or [])
+        coverage = editable.get("reference_coverage_stats") or {}
+        readiness = editable.get("generation_readiness") or {}
+        usable_count = int(
+            coverage.get("evidence_backed")
+            or readiness.get("usable_reference_count")
+            or 0
+        )
+        has_attributable_evidence = any(
+            card.get("evidence_spans")
+            or card.get("field_claims")
+            or card.get("claims")
+            or card.get("abstract")
+            for card in cards
+        )
+        if not cards or usable_count <= 0 or not has_attributable_evidence:
+            return None
+
+        # WHY: 这是任务预算耗尽后的单次终态动作。它允许写作入口越过可写性
+        # 门禁，但不删除门禁问题、不降低篇数要求，也不把草稿标成正式完成。
+        editable.update({
+            "automatic_best_effort_attempted": True,
+            "automatic_best_effort_generation": True,
+            "best_effort_generation": True,
+            "allow_unvalidated_taxonomy": True,
+            "conservative_regeneration": True,
+        })
+        history.append({
+            "role": "assistant",
+            "content": (
+                "自动恢复已耗尽，正在基于当前可用证据生成一次明确标注限制的"
+                "最佳可用草稿。"
+            ),
+            "type": "quality_recovery_progress",
+            "action": "FINAL_BEST_EFFORT_GENERATION",
+        })
+        editable["conversation_history"] = history[-50:]
+        state["editable_research_state"] = editable
+        state["conversation_history"] = history[-50:]
+        if self.progress_callback:
+            self.progress_callback(
+                "quality_recovery:final_best_effort_generation", 1, 1
+            )
+        return self._regenerate_and_persist(
+            session_id, original_query, state, editable
+        )
+
+    def _persist_exhausted_quality_result(
+        self,
+        *,
+        session_id: str,
+        original_query: str,
+        state: dict[str, Any],
+        result: dict[str, Any],
+        decision: dict[str, Any],
+        history: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        vector = decision.get("progress") or {}
+        remaining = [
+            str(item.get("message") or item.get("code") or "未说明问题")
+            for item in decision.get("issues") or []
+        ]
+        private_state = result.get("research_state") or {}
+        saved_items: list[str] = []
+        if private_state.get("section_checkpoints"):
+            saved_items.append("已验证章节检查点")
+        if private_state.get("quarantined_draft") or result.get("draft_available"):
+            saved_items.append("隔离草稿")
+        shortfall = int(vector.get("valid_reference_shortfall") or 0)
+        parts = ["自动恢复已达到任务级预算上限。"]
+        if saved_items:
+            parts.append("系统已保存" + "和".join(saved_items) + "。")
+        if shortfall:
+            parts.append(f"目前仍缺少 {shortfall} 篇有效引用。")
+        if remaining:
+            parts.append("剩余问题：" + "；".join(remaining))
+        answer = "".join(parts)
+        result.update({
+            "session_id": session_id,
+            "status": "blocked",
+            "answer": answer,
+            "quality_recovery_decision": decision,
+        })
+        history.append({
+            "role": "assistant",
+            "content": answer,
+            "type": "quality_recovery_exhausted",
+        })
+        state["conversation_history"] = history[-50:]
+        state["result_snapshot"] = {
+            key: value for key, value in result.items()
+            if key not in {"research_state", "session_id"}
+        }
+        self.repo.save(
+            session_id=session_id,
+            status="blocked",
+            original_query=original_query,
+            state=state,
         )
         self.db.commit()
         return result

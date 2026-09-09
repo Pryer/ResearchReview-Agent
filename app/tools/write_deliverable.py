@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 from typing import Any
 
@@ -14,6 +15,8 @@ from app.deliverables.renderers import (
     get_renderer,
     _allocated_paper_ids,
     _heading,
+    _split_planned_sections,
+    _validate_rewritten_section,
 )
 from app.schemas.deliverable_schema import WritingPlan
 
@@ -21,6 +24,180 @@ _AGENT_PROCESS_LANGUAGE_RE = AGENT_PROCESS_LANGUAGE_RE
 _strip_evidence_meta_language = strip_evidence_meta_language
 
 logger = logging.getLogger(__name__)
+
+
+def _section_checkpoint_key(plan: WritingPlan, section_id: str) -> str:
+    return f"{plan.deliverable_type.value}:{section_id}"
+
+
+def _section_input_fingerprint(
+    plan: WritingPlan,
+    section,
+    state: dict[str, Any],
+) -> str:
+    allocation = next((
+        item for item in (state.get("citation_allocation_plan") or {}).get("sections") or []
+        if str(item.get("section_id") or "") == section.id
+    ), {})
+    cards = {
+        str(card.get("paper_id") or ""): {
+            "access": (card.get("evidence_state") or {}).get("access_level")
+            or card.get("evidence_source"),
+            "quality": card.get("quality_status"),
+            "evidence": {
+                "field_evidence": card.get("field_evidence") or {},
+                "field_claims": card.get("field_claims") or {},
+                "evidence_spans": card.get("evidence_spans") or [],
+            },
+        }
+        for card in state.get("paper_cards") or []
+        if str(card.get("paper_id") or "") in {
+            *[str(value) for value in section.supporting_paper_ids],
+            *[str(value) for value in allocation.get("paper_ids") or []],
+        }
+    }
+    payload = {
+        "deliverable": plan.deliverable_type.value,
+        "section": section.model_dump(mode="json"),
+        "allocation": allocation,
+        "cards": cards,
+        "screening": sorted(
+            (
+                str(item.get("paper_id") or ""),
+                str(item.get("_screening_decision") or ""),
+            )
+            for item in state.get("paper_details") or []
+            if str(item.get("paper_id") or "") in cards
+        ),
+        "evidence_snapshot": state.get("evidence_snapshot_fingerprint") or "",
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:20]
+
+
+def _reusable_checkpoint_sections(
+    plan: WritingPlan,
+    state: dict[str, Any],
+) -> dict[str, str]:
+    """返回本轮无需生成且依赖指纹仍匹配的已验证章节。"""
+    target_ids = {str(value) for value in state.get("target_section_ids") or [] if value}
+    if not target_ids:
+        return {}
+    verified = state.get("section_checkpoints") or {}
+    reusable: dict[str, str] = {}
+    for section in plan.sections:
+        if section.id in target_ids:
+            continue
+        checkpoint = verified.get(_section_checkpoint_key(plan, section.id)) or {}
+        if (
+            checkpoint.get("status") not in {"validated", "writer_validated", "reused"}
+            or checkpoint.get("input_fingerprint")
+            != _section_input_fingerprint(plan, section, state)
+            or not str(checkpoint.get("text") or "").strip()
+        ):
+            continue
+        reusable[section.id] = str(checkpoint["text"])
+    return reusable
+
+
+def _reuse_and_checkpoint_sections(
+    text: str,
+    plan: WritingPlan,
+    state: dict[str, Any],
+) -> str:
+    """复用未受影响的已验证章节，并保存本轮章节候选。"""
+    sections = _split_planned_sections(text, plan)
+    if len(sections) != len(plan.sections):
+        return text
+    target_ids = {str(value) for value in state.get("target_section_ids") or [] if value}
+    verified = state.get("section_checkpoints") or {}
+    candidates = dict(state.get("section_candidate_checkpoints") or {})
+    merged: list[str] = []
+    for section in plan.sections:
+        key = _section_checkpoint_key(plan, section.id)
+        fingerprint = _section_input_fingerprint(plan, section, state)
+        current = sections.get(section.id, "")
+        previous = verified.get(key) or {}
+        reused = bool(
+            target_ids
+            and section.id not in target_ids
+            and previous.get("status") in {"validated", "writer_validated", "reused"}
+            and previous.get("input_fingerprint") == fingerprint
+            and str(previous.get("text") or "").strip()
+        )
+        selected = str(previous.get("text")) if reused else current
+        errors = _validate_rewritten_section(
+            selected,
+            section.title,
+            [str(value) for value in (
+                next((
+                    item.get("paper_ids") or []
+                    for item in (state.get("citation_allocation_plan") or {}).get("sections") or []
+                    if str(item.get("section_id") or "") == section.id
+                ), section.supporting_paper_ids)
+            )],
+            section.heading_level or 2,
+        )
+        candidates[key] = {
+            "deliverable_type": plan.deliverable_type.value,
+            "section_id": section.id,
+            "text": selected,
+            "input_fingerprint": fingerprint,
+            "writing_version": int(state.get("writing_version") or 1),
+            "status": "reused" if reused else "candidate",
+            "local_valid": not errors,
+            "errors": errors,
+        }
+        merged.append(selected)
+    state["section_candidate_checkpoints"] = candidates
+    return "\n\n".join(item for item in merged if item.strip())
+
+
+def promote_section_checkpoints(
+    state: dict[str, Any],
+    plan: WritingPlan | dict[str, Any],
+    validation: dict[str, Any],
+) -> None:
+    """仅提升同时通过局部、证据密度与跨句重复检查的章节候选。"""
+    plan_obj = plan if isinstance(plan, WritingPlan) else WritingPlan.model_validate(plan)
+    candidates = state.get("section_candidate_checkpoints") or {}
+    verified = dict(state.get("section_checkpoints") or {})
+    metrics = validation.get("metrics") or {}
+    floor_by_section = {
+        str(item.get("section_id") or ""): str(item.get("status") or "")
+        for item in metrics.get("section_evidence_floors") or []
+        if item.get("section_id")
+    }
+    duplicate_fragments = [
+        str(sample.get(key) or "").strip()
+        for sample in metrics.get("duplicate_sentence_samples") or []
+        if isinstance(sample, dict)
+        for key in ("first", "duplicate")
+        if str(sample.get(key) or "").strip()
+    ]
+    duplicate_section_ids = {
+        str(value) for value in metrics.get("duplicate_section_ids") or [] if value
+    }
+    for section in plan_obj.sections:
+        key = _section_checkpoint_key(plan_obj, section.id)
+        candidate = candidates.get(key)
+        if not candidate or candidate.get("local_valid") is not True:
+            continue
+        if floor_by_section.get(section.id) not in {None, "ok"}:
+            continue
+        candidate_text = str(candidate.get("text") or "")
+        if section.id in duplicate_section_ids or any(
+            fragment in candidate_text for fragment in duplicate_fragments
+        ):
+            continue
+        verified[key] = {
+            **candidate,
+            # WHY: 全篇可能因其他章节失败；当前章节已通过可归因的局部门禁时
+            # 仍可事务式提交，后续复用后会再次执行完整交付物门禁。
+            "status": "validated",
+        }
+    state["section_checkpoints"] = verified
 
 
 def __getattr__(name: str):
@@ -60,6 +237,10 @@ def write_deliverable(
         section.title for section in plan.sections if section.id.startswith("theme_")
     }
     allocated_paper_ids = set(_allocated_paper_ids(state))
+    # 引用分配可能把证据覆盖计划中的论文补到宽泛概述节；这些论文必须
+    # 进入本轮 Writer 输入，否则分配层虽已授权，SectionWriter 却会因
+    # WritingPlan 的原始 supporting 集合过窄而把它们过滤掉。
+    allowed_paper_ids.update(allocated_paper_ids)
     prompt_paper_ids = (
         allowed_paper_ids & allocated_paper_ids
         if allocated_paper_ids
@@ -166,13 +347,26 @@ def write_deliverable(
         safe_synthesis.append(combined)
 
     renderer = get_renderer(plan.deliverable_type)
-    text = renderer.render(
-        plan=plan,
-        state=state,
-        cards=cards,
-        safe_synthesis=safe_synthesis,
-        llm=llm,
-    )
+    reusable_sections = _reusable_checkpoint_sections(plan, state)
+    sentinel = object()
+    previous_reusable = state.get("_reusable_section_texts", sentinel)
+    if reusable_sections:
+        # WHY: renderer 仍需完整 WritingPlan 维持章节顺序和跨路线语义，但逐节
+        # 写手必须看到可复用集合，才能完全跳过未受影响章节的模型调用。
+        state["_reusable_section_texts"] = reusable_sections
+    try:
+        text = renderer.render(
+            plan=plan,
+            state=state,
+            cards=cards,
+            safe_synthesis=safe_synthesis,
+            llm=llm,
+        )
+    finally:
+        if previous_reusable is sentinel:
+            state.pop("_reusable_section_texts", None)
+        else:
+            state["_reusable_section_texts"] = previous_reusable
     # 交付物级不删空：渲染器全链失败返回空文本时回退确定性渲染器，
     # 保证用户要求的章节（如"二、研究现状"）不会整章消失。
     if not str(text or "").strip():
@@ -188,4 +382,5 @@ def write_deliverable(
     # 引用缺口由引用数量校验和最终质量门禁如实报告。
     from app.core.citation_density import break_citation_dumps
 
-    return break_citation_dumps(str(text or ""))
+    final_text = break_citation_dumps(str(text or ""))
+    return _reuse_and_checkpoint_sections(final_text, plan, state)

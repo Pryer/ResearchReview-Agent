@@ -1,0 +1,34 @@
+{
+  "purpose": "Canonical behavior for generation recovery; tests inject synthetic papers and evidence.",
+  "scenarios": [
+    {
+      "id": "sufficient_evidence_missing_authorization",
+      "request": {"required_reference_count": 6, "allow_evidence_expansion": true},
+      "state": {"evidence_backed": 8, "claim_authorized": 4, "final_valid": 4},
+      "expected_actions": ["REBUILD_CLAIMS", "REALLOCATE_CITATIONS", "REWRITE_SECTIONS"],
+      "expected_result": "complete_only_after_six_final_valid_references"
+    },
+    {
+      "id": "insufficient_evidence_search_allowed",
+      "request": {"required_reference_count": 6, "allow_evidence_expansion": true},
+      "state": {"evidence_backed": 4, "claim_authorized": 4, "final_valid": 4},
+      "expected_actions": ["TARGETED_SEARCH"],
+      "expected_result": "retrieval_stays_inside_original_scope_and_time_window"
+    },
+    {
+      "id": "insufficient_existing_evidence_only",
+      "request": {"required_reference_count": 6, "allow_evidence_expansion": false},
+      "state": {"evidence_backed": 4, "claim_authorized": 4, "final_valid": 4},
+      "expected_actions": ["REQUEST_USER_INPUT"],
+      "expected_result": "report_two_reference_gap_without_search_or_target_reduction"
+    },
+    {
+      "id": "cross_domain_small_target",
+      "topic": "retrieval augmented generation hallucination mitigation",
+      "request": {"required_reference_count": 3, "allow_evidence_expansion": true},
+      "state": {"evidence_backed": 5, "claim_authorized": 2, "final_valid": 2},
+      "expected_actions": ["REBUILD_CLAIMS"],
+      "expected_result": "same_policy_without_domain_or_count_specific_branch"
+    }
+  ]
+}

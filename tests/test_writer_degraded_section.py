@@ -50,7 +50,8 @@ def test_degraded_section_states_problem_and_method_not_bare_titles():
     # 只取首句，句号后的内容不应被带入。
     assert "补充说明不应出现" not in text
     assert "[p1]" in text and "[p2]" in text
-    assert "本节纳入 2 篇文献" in text
+    assert "已有文献分别从以下问题设定与方法路径展开研究" in text
+    assert "本节纳入" not in text
 
 
 def test_degraded_section_avoids_agent_process_language():
@@ -59,12 +60,13 @@ def test_degraded_section_avoids_agent_process_language():
     assert not AGENT_PROCESS_LANGUAGE_RE.search(text)
 
 
-def test_degraded_section_falls_back_to_titles_without_card_fields():
-    """卡片没有问题与方法时仍要产出条目，不能整节丢空。"""
+def test_degraded_section_does_not_turn_bare_metadata_into_body_evidence():
+    """卡片没有问题与方法时不得用题名和引用占位冒充学术正文。"""
     cards = [_card("p1", "仅有标题的论文")]
     text = _conservative_evidence_section(_Section(ids=["p1"]), cards)
-    assert "《仅有标题的论文》" in text
-    assert "[p1]" in text
+    assert "没有分配给本节的论文" in text
+    assert "《仅有标题的论文》" not in text
+    assert "[p1]" not in text
 
 
 def test_degraded_section_reports_empty_allocation():

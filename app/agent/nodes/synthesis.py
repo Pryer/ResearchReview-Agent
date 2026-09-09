@@ -444,6 +444,19 @@ def _citation_allocation_budget(
     return min(usable, ceiling)
 
 
+def _claim_authorized_paper_ids(state: dict[str, Any]) -> set[str]:
+    """返回当前 Claim Plan 中有证据授权的论文 ID。"""
+    from app.agent.claim_plan import _paper_id_from_evidence
+
+    return {
+        paper_id
+        for claim_plan in (state.get("claim_plans") or [])
+        for claim in claim_plan.get("claims") or []
+        for evidence_id in claim.get("evidence_ids") or []
+        if (paper_id := _paper_id_from_evidence(evidence_id))
+    }
+
+
 def _is_two_part_background_status_request(state: "ResearchAgentState") -> bool:
     """是否为仅交付研究背景和研究现状的论文正文请求。"""
     requested = set(state.get("requested_sections") or [])
@@ -496,7 +509,7 @@ def generate_deliverables_node(
         from app.tools.synthesize_themes import build_search_report, synthesize_themes
         from app.tools.validate_deliverable import validate_deliverable
         from app.tools.verify_claims import build_evidence_quality_report
-        from app.tools.write_deliverable import write_deliverable
+        from app.tools.write_deliverable import promote_section_checkpoints, write_deliverable
 
         requested = state.get("core_deliverables") or [
             item.value for item in resolve_core_deliverables(
@@ -564,6 +577,8 @@ def generate_deliverables_node(
                 duration_ms=int((time.time() - t0) * 1000),
             )
             return state
+
+        state["writing_version"] = int(state.get("writing_version") or 0) + 1
 
         outputs: list[str] = []
         plans: list[dict[str, Any]] = []
@@ -691,6 +706,11 @@ def generate_deliverables_node(
                 enabled=number_primary_sections,
             )
             quota = citation_quotas.get(requested_dtype.value, 0)
+            authorized_claim_ids = _claim_authorized_paper_ids(state)
+            if authorized_claim_ids:
+                # 交付物级配额不能超过当前 Claim Plan 真正授权的论文数；
+                # 否则写作计划会要求引用未获主张授权的卡片，CCC 必然阻断。
+                quota = min(quota, len(authorized_claim_ids))
             if quota:
                 plan.citation_policy["minimum_unique_references"] = min(
                     quota,
@@ -715,7 +735,11 @@ def generate_deliverables_node(
                 ),
                 writing_plan=plan,
                 excluded_ids=globally_allocated_ids,
-                selection_target=budget_quotas.get(requested_dtype.value) or 0,
+                selection_target=(
+                    citation_quotas.get(requested_dtype.value) or 0
+                    if _is_two_part_background_status_request(state)
+                    else budget_quotas.get(requested_dtype.value) or 0
+                ),
             )
             # Writer 和确定性 fallback 都消费同一个、已经归一化为 paper_id
             # 的逐章节计划，不能再把 LLM 返回的论文序号当作可选提示。
@@ -730,9 +754,11 @@ def generate_deliverables_node(
                 "deliverable_type": dtype.value,
                 **citation_plan,
             })
-            effective_llm = None if state.get("conservative_regeneration") else llm
-            text = write_deliverable(plan, state, llm=effective_llm)
+            # 保守重写限制可用证据与主张，不应关闭写作模型；关闭后只能落入
+            # 确定性清单模板，容易形成重复句和低密度章节。
+            text = write_deliverable(plan, state, llm=llm)
             validation = validate_deliverable(text, plan, state)
+            promote_section_checkpoints(state, plan, validation)
             plans.append(plan.model_dump(mode="json"))
             validations.append(validation)
             generated_types.add(dtype)
@@ -744,12 +770,16 @@ def generate_deliverables_node(
         # 未被引用的论文补写进所属交付物，而不是留给门禁直接拦截。
         outputs, validations = _backfill_global_citation_union(
             state,
-            llm=None if state.get("conservative_regeneration") else llm,
+            llm=llm,
             outputs=outputs,
             validations=validations,
             plans=plans,
             allocation_plans=allocation_plans,
         )
+
+        coverage_stats = dict(state.get("reference_coverage_stats") or {})
+        coverage_stats["planned"] = len(globally_allocated_ids)
+        state["reference_coverage_stats"] = coverage_stats
 
         state["deliverable_readiness"] = readiness_results
         state["writing_plans"] = plans
@@ -977,10 +1007,11 @@ def _backfill_global_citation_union(
     校验才会被接受，否则保留原稿。
     """
     required = int(state.get("required_reference_count") or 0)
-    if required <= 0 or llm is None or not outputs:
+    if required <= 0 or not outputs:
         return outputs, validations
 
-    from app.core.citation_syntax import extract_citation_ids, normalize_citation_syntax
+    from app.core.citation_syntax import extract_citation_ids
+    from app.deliverables.renderers.base_renderer import _normalize_evidence_citations
     from app.schemas.deliverable_schema import WritingPlan
     from app.tools.validate_deliverable import validate_deliverable
 
@@ -1014,45 +1045,57 @@ def _backfill_global_citation_union(
         if not missing_ids:
             continue
 
-        paper_lines = []
-        for paper_id in missing_ids:
-            card = cards_by_id.get(paper_id) or {}
-            summary = " ".join(filter(None, [
-                str(card.get("method") or ""),
-                str(card.get("contributions") or ""),
-                str(card.get("research_problem") or ""),
-            ]))[:200]
-            paper_lines.append(
-                f"- [{paper_id}] {card.get('title') or '未题名论文'}"
-                f"（{card.get('year') or '年份未知'}）：{summary}"
+        if llm is None:
+            from app.deliverables.renderers.base_renderer import _citation_recovery_paragraph
+
+            recovery_paragraph = _citation_recovery_paragraph(
+                missing_ids, list(cards_by_id.values())
             )
-        papers_block = "\n".join(paper_lines)
-        prompt = (
-            "你是中文学术编辑。下面正文的唯一引用数未达到硬性要求，"
-            "请把列出的论文自然融入最相关的段落：可以并入已有复合引用，"
-            "也可以补一句基于要点的综合转述，但不得新增独立小节或文末凑数段落，"
-            "不得改动既有引用标记和事实表述。引用标记必须原样保留 [paper_id] 形式。"
-            "请完整输出修改后的全文，不要任何解释。\n\n"
-            f"需补入的论文：\n{papers_block}\n\n正文：\n{outputs[index]}"
-        )
-        try:
-            revised = llm.complete(
-                prompt,
-                temperature=0.05,
-                operation=(
-                    "backfill_citations:"
-                    f"{allocation.get('deliverable_type') or index}"
-                ),
-                thinking_enabled=True,
+            if not recovery_paragraph:
+                continue
+            revised = outputs[index].rstrip() + "\n\n" + recovery_paragraph
+        else:
+            paper_lines = []
+            for paper_id in missing_ids:
+                card = cards_by_id.get(paper_id) or {}
+                summary = " ".join(filter(None, [
+                    str(card.get("method") or ""),
+                    str(card.get("contributions") or ""),
+                    str(card.get("research_problem") or ""),
+                ]))[:200]
+                paper_lines.append(
+                    f"- [{paper_id}] {card.get('title') or '未题名论文'}"
+                    f"（{card.get('year') or '年份未知'}）：{summary}"
+                )
+            papers_block = "\n".join(paper_lines)
+            prompt = (
+                "你是中文学术编辑。下面正文的唯一引用数未达到硬性要求，"
+                "请把列出的论文自然融入最相关的段落：可以并入已有复合引用，"
+                "也可以补一句基于要点的综合转述，但不得新增独立小节或文末凑数段落，"
+                "不得改动既有引用标记和事实表述。引用标记必须原样保留 [paper_id] 形式。"
+                "请完整输出修改后的全文，不要任何解释。\n\n"
+                f"需补入的论文：\n{papers_block}\n\n正文：\n{outputs[index]}"
             )
-        except Exception as exc:
-            logger.warning("Citation backfill LLM call failed: %s", exc)
-            continue
+            try:
+                revised = llm.complete(
+                    prompt,
+                    temperature=0.05,
+                    operation=(
+                        "backfill_citations:"
+                        f"{allocation.get('deliverable_type') or index}"
+                    ),
+                    thinking_enabled=True,
+                )
+            except Exception as exc:
+                logger.warning("Citation backfill LLM call failed: %s", exc)
+                continue
         if not revised or not revised.strip():
             continue
 
         valid_ids = set(cards_by_id)
-        revised = normalize_citation_syntax(revised.strip(), valid_ids)
+        # 补写模型有时复用证据清单中的 ``paper_id:eNNN``，与逐节写作
+        # 使用同一映射规则，先还原为论文 ID 再做新增引用检查。
+        revised = _normalize_evidence_citations(revised.strip(), list(cards_by_id.values()))
         new_ids = set(extract_citation_ids(revised, valid_ids=valid_ids))
         old_ids = set(
             extract_citation_ids(outputs[index], valid_ids=valid_ids)
@@ -1063,6 +1106,13 @@ def _backfill_global_citation_union(
                 "Citation backfill rejected: coverage not monotonic "
                 "(deliverable=%s)",
                 allocation.get("deliverable_type"),
+            )
+            continue
+        unexpected_ids = new_ids - (old_ids | set(missing_ids))
+        if unexpected_ids:
+            logger.info(
+                "Citation backfill rejected: model introduced unrequested citations %s",
+                sorted(unexpected_ids),
             )
             continue
 
@@ -1154,6 +1204,19 @@ def _plan_citation_allocation(
         for paper_id in section.supporting_paper_ids
         if str(paper_id) in cards_by_id
     } or set(cards_by_id)
+    authorized_claim_ids = _claim_authorized_paper_ids(state)
+    if authorized_claim_ids:
+        allowed_ids &= authorized_claim_ids
+        if (
+            plan
+            and plan.deliverable_type == CoreDeliverableType.RESEARCH_STATUS
+            and state.get("max_papers_explicit")
+            and _is_two_part_background_status_request(state)
+        ):
+            # WHY: 两份交付物共享同一个“至少 N 篇”全局并集；研究现状的
+            # 概述节可以承载所有已获证据授权的覆盖主张，否则背景先占用的
+            # 论文会让研究现状只能复用，最终并集永远低于用户下限。
+            allowed_ids |= authorized_claim_ids
 
     ordered_ids: list[str] = []
     seen_ids: set[str] = set()
@@ -1362,6 +1425,21 @@ def _plan_citation_allocation(
             "purpose": "按证据组织研究现状",
             "allowed_ids": list(selected_ids),
         }]
+    if section_specs and authorized_claim_ids:
+        # 路线规划只承载核心论文，coverage plan 中的合格论文可能没有原始
+        # 路线归属。把它们放入最宽泛的正文节，保持“每个引用都有章节授权”
+        # 而不把论文重新伪装成新的研究路线。
+        assigned_ids = {
+            paper_id
+            for spec in section_specs
+            for paper_id in spec.get("allowed_ids") or []
+        }
+        uncovered_ids = [
+            paper_id for paper_id in selected_ids
+            if paper_id in authorized_claim_ids and paper_id not in assigned_ids
+        ]
+        if uncovered_ids:
+            section_specs[0]["allowed_ids"].extend(uncovered_ids)
 
     proposed: dict[str, list[str]] = {
         spec["section_id"]: [] for spec in section_specs
@@ -1566,6 +1644,9 @@ def _plan_citation_allocation(
     return {
         "minimum_unique_references": target,
         "assigned_unique_references": len(already_assigned),
+        "reused_paper_ids": sorted(
+            paper_id for paper_id in already_assigned if paper_id in excluded_ids
+        ),
         "sections": normalized_sections,
         "section_floor_deficits": section_floor_deficits,
     }
@@ -1632,10 +1713,35 @@ def _apply_final_quality_gate(state: "ResearchAgentState") -> None:
     if state.get("intent") == "search_papers":
         return
     existing = state.get("quality_gate") or {}
+    pre_generation_issues = {
+        str(item.get("code") or "")
+        for item in existing.get("blocking_issues") or []
+        if isinstance(item, dict) and item.get("code")
+    }
+    # 写作根本没有开始时，必须保留内部状态/契约错误的真实阶段。否则
+    # best-effort 标记会把“没有正文”改写成“正文验证失败”，误导恢复路由。
+    _preserve_pre_generation_codes = {
+        "state_time_window_mismatch",
+        "stale_evidence_snapshot",
+        "recovery_readiness_conflict",
+        "deliverable_generation_failed",
+    }
     if (
         existing.get("passed") is False
         and existing.get("phase") == "pre_generation"
-        and not state.get("best_effort_generation")
+        and pre_generation_issues & _preserve_pre_generation_codes
+    ):
+        state["generation_blocked"] = True
+        return
+    if (
+        existing.get("passed") is False
+        and existing.get("phase") == "pre_generation"
+        and (
+            not state.get("best_effort_generation")
+            or str(state.get("review") or "").lstrip().startswith(
+                "## 正文生成已阻止"
+            )
+        )
     ):
         return
 
@@ -1645,10 +1751,18 @@ def _apply_final_quality_gate(state: "ResearchAgentState") -> None:
     if state.get("best_effort_generation"):
         forced_issues = list(state.get("forced_generation_issues") or [])
         taxonomy_validation = state.get("taxonomy_validation") or {}
+        automatic_best_effort = bool(state.get("automatic_best_effort_generation"))
         issues.append({
-            "code": "user_accepted_best_effort_generation",
+            "code": (
+                "recovery_exhausted_best_effort_generation"
+                if automatic_best_effort
+                else "user_accepted_best_effort_generation"
+            ),
             "message": (
-                "用户已确认基于当前证据直接生成；动态分类或部分证据重点未完全达标"
+                "自动恢复已耗尽，系统基于当前可用证据生成最佳可用草稿；"
+                "部分研究重点或质量要求仍未完全达标"
+                if automatic_best_effort
+                else "用户已确认基于当前证据直接生成；动态分类或部分证据重点未完全达标"
                 if forced_issues or not taxonomy_validation.get("valid", False)
                 else "用户已确认基于当前证据直接生成最佳可用草稿"
             ),
@@ -1657,11 +1771,11 @@ def _apply_final_quality_gate(state: "ResearchAgentState") -> None:
     if state.get("max_papers_explicit", False) and state.get("citation_validation"):
         requested = int(state.get("required_reference_count") or state.get("max_papers") or 0)
         consistency = state.get("claim_citation_consistency") or {}
-        cited = int(
+        cited = int((
             state.get("unique_valid_cited_paper_count")
             if consistency
-            else state.get("unique_cited_paper_count") or 0
-        )
+            else state.get("unique_cited_paper_count")
+        ) or 0)
         # “至少引用 N 篇”是用户明确硬约束，不能再把 80% 当成达标。
         # 旧逻辑使 40 篇要求在 32 篇时被错误放行。
         effective_target = requested
@@ -1816,21 +1930,44 @@ def _apply_final_quality_gate(state: "ResearchAgentState") -> None:
                                   if is_abstract_dominant
                                   else policy.synthesis_fulltext_support_rate)
 
-    if quality and not quality.get("passed", True) and _support_rate < blocking_support_threshold:
+    unverified_claims = int(quality.get("unverified_claims") or 0)
+    verified_unsupported_claims = int(
+        quality.get("verified_unsupported_claims")
+        if quality.get("verified_unsupported_claims") is not None
+        else max(int(quality.get("unsupported_claims") or 0) - unverified_claims, 0)
+    )
+    if unverified_claims:
+        issues.append({
+            "code": "claim_verification_incomplete",
+            "message": (
+                f"仍有 {unverified_claims} 条事实性主张未完成语义核验，"
+                f"当前核验覆盖率为 {float(quality.get('verification_coverage') or 0.0):.1%}"
+            ),
+            "details": {
+                "claim_ids": [
+                    str(item.get("claim_id") or "")
+                    for item in (state.get("claim_verification") or {}).get("claims") or []
+                    if item.get("verification_status") == "not_completed"
+                ],
+            },
+        })
+        recovery.append("保留当前正文与已完成判定，仅重试未完成的语义主张验证")
+
+    if verified_unsupported_claims and _support_rate < blocking_support_threshold:
         issues.append({
             "code": "claim_evidence_quality_not_met",
             "message": (
                 f"主张—证据加权支持率为 {float(quality.get('support_rate') or 0.0):.1%}，"
-                f"仍有 {int(quality.get('unsupported_claims') or 0)} 条事实性主张缺少充分证据"
+                f"仍有 {verified_unsupported_claims} 条已完成核验的事实性主张缺少充分证据"
             ),
         })
         recovery.append("删除、弱化或补证后重新执行逐句主张验证")
-    elif quality and not quality.get("passed", True) and _support_rate >= blocking_support_threshold:
+    elif verified_unsupported_claims and _support_rate >= blocking_support_threshold:
         warnings.append({
             "code": "claim_evidence_quality_low",
             "message": (
                 f"主张—证据加权支持率为 {float(quality.get('support_rate') or 0.0):.1%}，"
-                f"仍有 {int(quality.get('unsupported_claims') or 0)} 条事实性主张缺少充分证据（已降级为警告）"
+                f"仍有 {verified_unsupported_claims} 条已完成核验的事实性主张缺少充分证据（已降级为警告）"
             ),
         })
 
@@ -1881,10 +2018,34 @@ def _apply_final_quality_gate(state: "ResearchAgentState") -> None:
         })
         recovery.append("仅重写失败章节，或补充该章节所需证据后重新生成")
     if invalid_deliverables:
+        invalid_section_ids = list(dict.fromkeys(
+            section_id
+            for validation in invalid_deliverables
+            for section_id in [
+                *[
+                    str(finding.get("section_id") or "")
+                    for finding in (validation.get("metrics") or {}).get("section_evidence_floors") or []
+                    if finding.get("section_id") and finding.get("status") != "ok"
+                ],
+                *[
+                    str(value)
+                    for value in (validation.get("metrics") or {}).get("duplicate_section_ids") or []
+                    if value
+                ],
+            ]
+            if section_id
+        ))
         issues.append({
             "code": "deliverable_structure_invalid",
             "message": "交付物结构或写作边界检查未通过",
-            "details": [error for item in invalid_deliverables for error in item.get("errors") or []],
+            "details": {
+                "section_ids": invalid_section_ids,
+                "errors": [
+                    error
+                    for item in invalid_deliverables
+                    for error in item.get("errors") or []
+                ],
+            },
         })
         recovery.append("修复章节、主题、引用或越权表述后重新验证")
 
@@ -1930,12 +2091,55 @@ def _apply_final_quality_gate(state: "ResearchAgentState") -> None:
             "sections": section_deficits,
         })
 
+    issue_codes = {
+        str(item.get("code") or "")
+        for item in issues
+        if isinstance(item, dict) and item.get("code")
+    }
+    settings = get_settings()
+    requested_count = int(state.get("required_reference_count") or 0)
+    valid_count = int(state.get("unique_valid_cited_paper_count") or 0)
+    if not (state.get("claim_citation_consistency") or {}):
+        valid_count = int(state.get("unique_cited_paper_count") or 0)
+    coverage_ratio = (
+        valid_count / requested_count if requested_count > 0 else 1.0
+    )
+    from app.agent.generation_recovery import recovery_action_count
+
+    recovery_exhausted = recovery_action_count(state) >= int(
+        settings.recovery_total_action_budget
+    )
+    reference_best_effort_release = bool(
+        settings.enable_reference_coverage_best_effort_release
+        and recovery_exhausted
+        and issue_codes == {"minimum_cited_references_not_met"}
+        and coverage_ratio >= float(settings.reference_coverage_best_effort_ratio)
+    )
+    if reference_best_effort_release:
+        # WHY: 原始 required_reference_count 不变，门禁仍为未通过；这里只在
+        # 自动恢复耗尽且没有其他质量失败时释放 partial 草稿，避免 39/40 因
+        # 单篇缺口隐藏正文，也避免用篇数比例稀释主张或引用正确性问题。
+        warnings.append({
+            "code": "reference_coverage_best_effort_released",
+            "message": (
+                f"有效引用覆盖率为 {coverage_ratio:.1%}（{valid_count}/{requested_count}），"
+                f"达到最佳可用草稿阈值 {float(settings.reference_coverage_best_effort_ratio):.1%}；"
+                "原始引用篇数要求仍未完全满足"
+            ),
+            "requested": requested_count,
+            "actual": valid_count,
+            "coverage_ratio": coverage_ratio,
+            "threshold": float(settings.reference_coverage_best_effort_ratio),
+        })
+
     if issues:
         draft = state.get("review") or state.get("related_work") or state.get("introduction") or ""
         if draft:
             state["quarantined_draft"] = draft
         state["generation_blocked"] = True
-        best_effort_released = bool(state.get("best_effort_generation"))
+        best_effort_released = bool(
+            state.get("best_effort_generation") or reference_best_effort_release
+        )
         state["quality_gate"] = {
             "passed": False,
             "draft_available": bool(draft),
@@ -1944,6 +2148,11 @@ def _apply_final_quality_gate(state: "ResearchAgentState") -> None:
                 "released_best_effort" if best_effort_released and draft else "quarantined"
             ) if draft else "none",
             "partial_success": best_effort_released and bool(draft),
+            "reference_coverage_best_effort_release": reference_best_effort_release,
+            "reference_coverage_ratio": coverage_ratio,
+            "reference_coverage_threshold": float(
+                settings.reference_coverage_best_effort_ratio
+            ),
             "phase": "post_generation",
             "blocking_issues": issues,
             "warnings": warnings,

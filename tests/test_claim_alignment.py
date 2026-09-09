@@ -6,6 +6,7 @@ from app.agent.claim_plan import (
     _apply_access_limit,
     _paper_id_from_evidence,
     enforce_claim_evidence_gate,
+    build_reference_coverage_plan,
     validate_claim_citation_consistency,
     validate_claim_support,
 )
@@ -210,3 +211,49 @@ def test_route_sibling_claim_evidence_does_not_authorize_a_citation() -> None:
     assert result["inconsistent_samples"][0]["unauthorized_in_claim"] == ["openalex:W1"]
     assert result["validly_authorized_paper_ids"] == []
     assert result["unauthorized_cited_paper_ids"] == ["openalex:W1"]
+
+
+def test_duplicate_claim_text_uses_cited_paper_as_tie_break():
+    """多篇论文的同文主张并列时，引用论文只解决同分归属。"""
+    plans = [{
+        "route_id": "r1",
+        "claims": [
+            {"claim_id": "c1", "claim_text": "课堂行为编码可支持互动分析",
+             "evidence_ids": ["p1:e1"]},
+            {"claim_id": "c2", "claim_text": "课堂行为编码可支持互动分析",
+             "evidence_ids": ["p2:e1"]},
+        ],
+    }]
+    result = validate_claim_citation_consistency(
+        "课堂行为编码可支持互动分析[2]。",
+        plans,
+        citation_map={"p1": 1, "p2": 2},
+    )
+    assert result["inconsistent_sentences"] == 0
+    assert result["validly_authorized_paper_ids"] == ["p2"]
+
+
+def test_reference_coverage_plan_adds_only_missing_evidence_backed_cards():
+    """显式篇数不足时，补充计划只接纳有证据且在语义范围内的卡片。"""
+    cards = [
+        {"paper_id": "p1", "relation_type": "direct", "quality_status": "valid",
+         "evidence_state": {"access_level": "abstract"},
+         "research_problem": "已有路线问题", "field_evidence": {"research_problem": ["p1:e1"]}},
+        {"paper_id": "p2", "relation_type": "direct", "quality_status": "partial",
+         "evidence_state": {"access_level": "abstract"},
+         "research_problem": "新增路线问题", "field_evidence": {"research_problem": ["p2:e1"]}},
+        {"paper_id": "p3", "relation_type": "direct", "quality_status": "invalid",
+         "evidence_state": {"access_level": "abstract"},
+         "research_problem": "无效卡片", "field_evidence": {"research_problem": ["p3:e1"]}},
+        {"paper_id": "p4", "relation_type": "direct", "quality_status": "valid",
+         "evidence_state": {"access_level": "metadata_only"},
+         "research_problem": "只有元数据", "field_evidence": {"research_problem": ["p4:e1"]}},
+    ]
+    plan = build_reference_coverage_plan(
+        cards,
+        {"canonical_topic": "课堂行为分析"},
+        [{"claims": [{"evidence_ids": ["p1:e1"]}]}],
+        required_reference_count=2,
+    )
+    assert plan is not None
+    assert [claim["evidence_ids"] for claim in plan["claims"]] == [["p2:e1"]]

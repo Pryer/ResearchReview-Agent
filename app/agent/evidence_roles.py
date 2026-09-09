@@ -230,6 +230,8 @@ def evidence_coverage(
     matched_ids: dict[str, list[str]] = {}
     labels: dict[str, str] = {}
     reasons: dict[str, dict[str, str]] = {}
+    requirement_diagnostics: list[dict[str, Any]] = []
+    advisory_missing_ids: list[str] = []
     corpus = [paper_text(paper) for paper in paper_list]
     for requirement in requirements:
         requirement_id = str(requirement.get("requirement_id") or requirement.get("label") or "")
@@ -250,12 +252,48 @@ def evidence_coverage(
                 requirement, paper_list, corpus, per_paper
             )
         minimum = max(1, int(requirement.get("minimum_direct_sources") or 1))
+        has_provenance = any(
+            key in requirement for key in ("explicit", "inferred", "source")
+        )
+        # 新状态只有用户原文落定的要求进入硬门禁。旧会话没有来源字段时
+        # 沿用历史硬约束，避免一次迁移静默改变既有会话的判断。
+        explicit = (
+            bool(requirement.get("explicit", False))
+            if has_provenance else True
+        )
+        required_for_gate = bool(requirement.get("route_required", True)) and explicit
         counts[requirement_id] = len(ids)
         required_counts[requirement_id] = minimum
         matched_ids[requirement_id] = ids
         labels[requirement_id] = str(requirement.get("label") or requirement_id)
         reasons[requirement_id] = per_paper
-    missing_ids = [key for key, count in counts.items() if count < required_counts[key]]
+        requirement_diagnostics.append({
+            "requirement_id": requirement_id,
+            "label": labels[requirement_id],
+            "source": str(requirement.get("source") or "unknown"),
+            "explicit": explicit,
+            "inferred": bool(requirement.get("inferred", not explicit)),
+            "inference_basis": requirement.get("inference_basis"),
+            "required_for_gate": required_for_gate,
+            "actual_direct_sources": len(ids),
+            "minimum_direct_sources": minimum,
+            "matched_paper_ids": ids,
+            "status": (
+                "met" if len(ids) >= minimum
+                else "missing" if required_for_gate
+                else "advisory_missing"
+            ),
+        })
+        if len(ids) < minimum and not required_for_gate:
+            advisory_missing_ids.append(requirement_id)
+    required_by_id = {
+        item["requirement_id"]: bool(item["required_for_gate"])
+        for item in requirement_diagnostics
+    }
+    missing_ids = [
+        key for key, count in counts.items()
+        if count < required_counts[key] and required_by_id.get(key, True)
+    ]
     return {
         "ready": not missing_ids,
         "counts": counts,
@@ -264,7 +302,10 @@ def evidence_coverage(
         "requirement_labels": labels,
         "missing_requirement_ids": missing_ids,
         "missing_focuses": [labels[key] for key in missing_ids],
+        "advisory_missing_requirement_ids": advisory_missing_ids,
+        "advisory_missing_focuses": [labels[key] for key in advisory_missing_ids],
         "match_reasons": reasons,
+        "requirement_diagnostics": requirement_diagnostics,
     }
 
 

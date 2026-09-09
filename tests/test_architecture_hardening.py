@@ -114,6 +114,15 @@ def test_client_state_rejects_internal_control_fields():
         AgentRequest(user_query="研究主题", state={"generation_blocked": False})
 
 
+def test_agent_request_exposes_only_the_public_best_effort_policy_switch():
+    request = AgentRequest(
+        user_query="生成研究现状",
+        best_effort_on_failure=False,
+    )
+
+    assert request.best_effort_on_failure is False
+
+
 def test_status_derivation_treats_blocked_and_failed_as_non_success():
     assert derive_result_status({"generation_blocked": True}) == "blocked"
     assert derive_result_status({"planning_failed": True}) == "failed"

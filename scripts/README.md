@@ -15,6 +15,10 @@ directory. Runtime output is written under `data/` or `logs/` and is not tracked
 
 - `run_agent_tests.py`: run the real-provider Agent scenario set.
 - `run_classroom_behavior_e2e.py`: run the 40-reference classroom-behavior scenario.
+  It uses the persisted conversation service and automatic recovery controller by
+  default, includes the education-technology focus in the request, and writes each
+  run to a new `data/e2e_runs/<timestamp>/` directory. Use `--graph-only` to isolate
+  the raw Agent graph or `--query` / `--output-dir` for another explicit scenario.
 - `cnki_selenium_smoke.py` and `test_cnki_headless.py`: validate CNKI browser access.
 - `inspect_eval_bundle.py`: inspect an exported evaluation bundle.
 

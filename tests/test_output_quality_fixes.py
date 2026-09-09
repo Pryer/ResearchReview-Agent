@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from app.core.citation_density import break_citation_dumps, detect_citation_dumps
 from app.core.source_capabilities import sanitize_search_keyword
+from app.core.text_quality import detect_english_sentences
 from app.tools.generate_citation import render_in_text_citations
 from app.tools.rank_papers import evaluate_topic_anchor_filter, rank_papers
 
@@ -111,7 +112,7 @@ def test_render_in_text_citations_no_longer_splits_into_groups():
 
 # ---------- F2：章节不删空的保守证据段 ----------
 
-def test_conservative_evidence_section_lists_allocated_cards():
+def test_conservative_evidence_section_rejects_metadata_only_citation_fillers():
     from app.deliverables.renderers.base_renderer import _conservative_evidence_section
 
     class _Section:
@@ -127,7 +128,8 @@ def test_conservative_evidence_section_lists_allocated_cards():
     ]
     text = _conservative_evidence_section(_Section(), cards)
     assert "## 研究现状" in text
-    assert "《论文一》（2024，期刊A）[p1]。" in text
+    assert "没有分配给本节的论文" in text
+    assert "[p1]" not in text
     assert "[p3]" not in text
 
 
@@ -208,6 +210,32 @@ def test_background_fallback_cites_each_points_own_source():
     assert "三号论文的局限[p3]" in text
     assert "四号论文的局限[p4]" in text
     assert "[p1" not in text.replace("[p1]", "")  # p1 无内容，不应出现在任何引用组里
+
+
+def test_background_fallback_masks_english_metadata_titles():
+    """英文书目题名不能未经转述进入正文并触发英文句子门禁。"""
+    from app.deliverables.renderers.background_renderer import BackgroundRenderer
+    from app.schemas.deliverable_schema import WritingSection
+
+    plan = type("Plan", (), {})()
+    plan.sections = [WritingSection(
+        id="background_body", title="研究背景", purpose="",
+        supporting_paper_ids=["p1"], supporting_claim_ids=[],
+        target_word_count=200, heading_level=2,
+    )]
+    plan.citation_policy = {"minimum_unique_references": 1}
+    cards = [{
+        "paper_id": "p1",
+        "title": "Real-Time Multimodal Student Behavior Analysis in Smart Classrooms",
+        "research_problem": "智能课堂中的学生行为需要持续分析",
+        "limitations": ["样本范围有限"],
+    }]
+
+    text = BackgroundRenderer().render_fallback(plan, {}, cards)
+
+    assert "Real-Time Multimodal Student Behavior Analysis" not in text
+    assert "[p1]" in text
+    assert detect_english_sentences(text) == []
 
 
 def test_background_fallback_neutralizes_paper_self_reference_only():

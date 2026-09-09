@@ -43,6 +43,7 @@ class ReviewThresholdPolicy:
     synthesis_abstract_dominance: float = 0.70
     synthesis_abstract_support_rate: float = 0.70
     synthesis_fulltext_support_rate: float = 0.80
+    route_section_min_plain_chars: int = 80
     # 正文引用必须由匹配主张授权；低于该一致率视为阻断，达到但仍有错配则降级为警告。
     claim_citation_consistency_rate: float = 0.80
 
@@ -75,6 +76,7 @@ def get_review_threshold_policy() -> ReviewThresholdPolicy:
         synthesis_abstract_dominance=settings.synthesis_abstract_dominance,
         synthesis_abstract_support_rate=settings.synthesis_abstract_support_rate,
         synthesis_fulltext_support_rate=settings.synthesis_fulltext_support_rate,
+        route_section_min_plain_chars=settings.route_section_min_plain_chars,
         claim_citation_consistency_rate=settings.claim_citation_consistency_rate,
     )
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -258,6 +260,15 @@ class Settings(BaseSettings):
     evidence_recovery_min_coverage_gain: float = 0.05
     evidence_recovery_min_query_novelty: float = 0.35
     evidence_recovery_scope_gap_ratio: float = 0.75
+    # 路线补证与写作恢复共同消耗此预算，避免两层循环分别重置次数。
+    recovery_total_action_budget: int = 6
+    # 自动恢复耗尽后，若唯一硬缺口只是有效引用篇数，可发布明确标注的
+    # best-effort 草稿；原始篇数约束仍保留，结果状态为 partial。
+    enable_reference_coverage_best_effort_release: bool = True
+    reference_coverage_best_effort_ratio: float = 0.85
+    # 所有有界恢复动作耗尽后，允许基于当前可用证据执行一次最终草稿生成。
+    # 门禁结论和原始约束仍保留，结果只能作为明确标注的 partial 草稿发布。
+    enable_recovery_exhausted_best_effort_generation: bool = True
     # Route Validator v2 使用离散特征规则而不是预先压成加权相似度。
     route_validator_min_core_evidence: int = 3
     route_validator_drop_ratio_guard: float = 0.60
@@ -283,6 +294,8 @@ class Settings(BaseSettings):
     synthesis_abstract_dominance: float = 0.70
     synthesis_abstract_support_rate: float = 0.70
     synthesis_fulltext_support_rate: float = 0.80
+    # 正式研究路线小节承载综合论述所需的最低正文字符数。
+    route_section_min_plain_chars: int = 80
     # 主张—引用一致率下限：正文每句的引用应由其匹配主张的证据授权。
     claim_citation_consistency_rate: float = 0.80
     # ---------- 全局证据门（Global Evidence Gate）----------
@@ -309,11 +322,13 @@ class Settings(BaseSettings):
         "evidence_recovery_max_route_attempts",
         "evidence_recovery_max_scope_revisions",
         "evidence_recovery_min_new_evidence",
+        "recovery_total_action_budget",
         "route_validator_min_core_evidence",
         "route_recovery_target_min",
         "route_recovery_target_max",
         "route_recovery_competing_work_bonus",
         "route_recovery_diversity_min_years",
+        "route_section_min_plain_chars",
     )
     @classmethod
     def _non_negative_agent_limits(cls, v: int) -> int:
@@ -326,6 +341,7 @@ class Settings(BaseSettings):
         "route_validator_drop_ratio_guard",
         "route_validator_min_keep_rate",
         "route_recovery_status_share",
+        "reference_coverage_best_effort_ratio",
         "global_gate_min_recency_ratio",
         "global_gate_route_balance_min_ratio",
         "global_gate_peer_review_ratio",

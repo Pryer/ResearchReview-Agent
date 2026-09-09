@@ -237,8 +237,47 @@ def check_generation_readiness(state: dict[str, Any]) -> GenerationReadinessResu
         ))
     else:
         eligible_ids = citation_eligible_paper_ids(semantic_frame, cards)
-    eligible_ids &= usable_ids
-    state["citation_eligible_paper_ids"] = sorted(eligible_ids)
+    confirmed_in_scope_ids = {
+        paper_id for paper_id in eligible_ids
+        if paper_id not in unconfirmed_ids
+        and paper_id in {
+            str(card.get("paper_id") or "")
+            for card in cards
+            if card.get("quality_status") != "invalid"
+        }
+    }
+    evidence_backed_ids = confirmed_in_scope_ids & usable_ids
+    eligible_ids = evidence_backed_ids
+    state["citation_eligible_paper_ids"] = sorted(evidence_backed_ids)
+
+    from app.agent.claim_plan import claim_authorized_paper_ids
+
+    has_claim_plans = bool(state.get("claim_plans"))
+    authorized_ids = claim_authorized_paper_ids(state.get("claim_plans") or [])
+    authorized_ids &= eligible_ids
+    # 写作计划尚未建立时，Claim Plan 是最后一个可审计的真实覆盖集合；已有
+    # 分配计划时再收窄到实际计划并集。不能继续用卡片数代替成文能力。
+    allocated_ids = {
+        str(paper_id)
+        for plan in state.get("citation_allocation_plans") or []
+        for section in plan.get("sections") or []
+        for paper_id in section.get("paper_ids") or []
+        if paper_id
+    }
+    planned_ids = (
+        authorized_ids & allocated_ids
+        if allocated_ids else authorized_ids
+    )
+    coverage_stats = {
+        "raw_candidates": len(state.get("candidate_papers") or []),
+        "confirmed_in_scope": len(confirmed_in_scope_ids),
+        "evidence_backed": len(evidence_backed_ids),
+        "claim_authorized": len(authorized_ids),
+        "planned": len(planned_ids),
+        "actual_cited": int(state.get("unique_cited_paper_count") or 0),
+        "final_valid": int(state.get("unique_valid_cited_paper_count") or 0),
+    }
+    state["reference_coverage_stats"] = coverage_stats
 
     if state.get("max_papers_explicit", False) and requested and len(eligible_ids) < requested:
         issues.append({
@@ -253,6 +292,23 @@ def check_generation_readiness(state: dict[str, Any]) -> GenerationReadinessResu
             "明确允许纳入更多会议论文或预印本",
             f"确认接受少于 {requested} 篇后重新提交",
         ])
+    elif (
+        state.get("max_papers_explicit", False)
+        and requested
+        and has_claim_plans
+        and len(authorized_ids) < requested
+    ):
+        issues.append({
+            "code": "minimum_planned_references_not_met",
+            "message": (
+                f"证据池有 {len(eligible_ids)} 篇可用论文，但只有 "
+                f"{len(authorized_ids)} 篇已获得主张授权，低于要求的 {requested} 篇"
+            ),
+            "requested": requested,
+            "available": len(authorized_ids),
+            "eligible": len(eligible_ids),
+        })
+        recovery.append("为未利用的可核验证据补建主张授权后重新规划引用")
 
     if "research_status" in set(state.get("core_deliverables") or []):
         from app.agent.focus_coverage import required_focus_coverage
@@ -270,6 +326,7 @@ def check_generation_readiness(state: dict[str, Any]) -> GenerationReadinessResu
                 "missing_focuses": missing,
                 "counts": coverage.get("counts") or {},
                 "required_counts": coverage.get("required_counts") or {},
+                "requirement_diagnostics": coverage.get("requirement_diagnostics") or [],
             })
             recovery.append("针对缺失重点执行专项补检索后再进入写作")
 
@@ -281,6 +338,9 @@ def check_generation_readiness(state: dict[str, Any]) -> GenerationReadinessResu
         ready=not issues,
         requested_minimum_references=requested,
         usable_reference_count=len(eligible_ids),
+        authorized_reference_count=len(authorized_ids),
+        planned_reference_count=len(planned_ids),
+        reference_coverage_stats=coverage_stats,
         blocking_issues=issues,
         recovery_options=list(dict.fromkeys(recovery)),
     )

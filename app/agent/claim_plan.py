@@ -302,6 +302,140 @@ def build_claim_plans(
     return plans
 
 
+def build_reference_coverage_plan(
+    paper_cards: list[dict[str, Any]],
+    semantic_frame: dict[str, Any] | None,
+    existing_plans: list[dict[str, Any]],
+    required_reference_count: int,
+    *,
+    unconfirmed_ids: set[str] | None = None,
+) -> dict[str, Any] | None:
+    """为尚未进入 Claim Plan、但有可核验证据的论文补建单篇事实主张。
+
+    引用分配使用的是可写证据池，而路线 Claim Plan 只覆盖路线核心论文；两者
+    数量不一致时，写手会引用没有授权主张的论文，最终 CCC 必然把它们判为无效。
+    这里仅从卡片已有字段和 ``field_evidence`` 生成“相关研究涉及……”级别的
+    单篇主张，不做跨论文推断，也不接纳 metadata-only、invalid 或未确认论文。
+    """
+    required = max(0, int(required_reference_count or 0))
+    if required <= 0 or not paper_cards:
+        return None
+
+    from app.agent.evidence_roles import citation_eligible_paper_ids
+
+    card_map = {
+        str(card.get("paper_id") or ""): card
+        for card in paper_cards
+        if card.get("paper_id")
+    }
+    eligible_ids = citation_eligible_paper_ids(
+        semantic_frame or {},
+        paper_cards,
+    )
+    authorized_ids: set[str] = set()
+    for plan in existing_plans or []:
+        for claim in plan.get("claims") or []:
+            for evidence_id in claim.get("evidence_ids") or []:
+                if (paper_id := _paper_id_from_evidence(evidence_id)):
+                    authorized_ids.add(paper_id)
+
+    rejected = {str(value) for value in (unconfirmed_ids or set()) if value}
+    valid_card_ids = {
+        paper_id for paper_id, card in card_map.items()
+        if card.get("quality_status") != "invalid"
+    }
+    # WHY: 旧路线主张可能仍引用范围外、未确认或已经失效的论文；它们不能
+    # 抵扣当前写作所需的授权篇数。缺口必须相对于本轮真正可引用集合计算。
+    authorized_ids &= eligible_ids & valid_card_ids
+    authorized_ids -= rejected
+    candidates: list[dict[str, Any]] = []
+    for card in paper_cards:
+        paper_id = str(card.get("paper_id") or "")
+        if (
+            not paper_id
+            or paper_id in authorized_ids
+            or paper_id in rejected
+            or paper_id not in eligible_ids
+            or card.get("quality_status") == "invalid"
+            or not _can_contribute_factual_claims(card)
+        ):
+            continue
+        access_level = str(
+            (card.get("evidence_state") or {}).get("access_level")
+            or card.get("evidence_source")
+            or ""
+        )
+        if access_level not in {"abstract", "partial_full_text", "full_text"}:
+            continue
+        field_evidence = card.get("field_evidence") or {}
+        text = ""
+        evidence_ids: list[str] = []
+        for field in ("research_problem", "method", "results", "contributions", "study_design"):
+            value = str(card.get(field) or "").strip()
+            if not value:
+                continue
+            text = re.split(r"[。；;!?！？\n]", value)[0].strip()[:180]
+            evidence_ids = [
+                str(item) for item in field_evidence.get(field) or [] if str(item)
+            ]
+            if text and evidence_ids:
+                break
+        if not text or not evidence_ids:
+            spans = [
+                span for span in card.get("evidence_spans") or []
+                if isinstance(span, dict) and span.get("evidence_id") and span.get("text")
+            ]
+            if spans:
+                text = re.split(r"[。；;!?！？\n]", str(spans[0].get("text") or ""))[0].strip()[:180]
+                evidence_ids = [str(spans[0]["evidence_id"])] if text else []
+        if text and evidence_ids:
+            candidates.append({"paper_id": paper_id, "claim_text": text, "evidence_ids": evidence_ids})
+
+    needed = max(0, required - len(authorized_ids))
+    if needed <= 0 or not candidates:
+        return None
+
+    claims: list[dict[str, Any]] = []
+    for item in candidates[:needed]:
+        claim = {
+            "claim_id": _claim_id("coverage", item["paper_id"] + ":" + item["claim_text"]),
+            "claim_text": item["claim_text"],
+            "claim_type": "background_fact",
+            "evidence_ids": list(dict.fromkeys(item["evidence_ids"])),
+            "evidence_count": 1,
+            "independent_source_count": 1,
+            "support_level": "single",
+            "allowed_language": _SUPPORT_LEVEL_MAP["single"]["language"],
+            "allowed_verbs": _SUPPORT_LEVEL_MAP["single"]["verbs"],
+        }
+        claims.append(_apply_access_limit(claim, claim["evidence_ids"], card_map))
+    if not claims:
+        return None
+    return {
+        "route_id": "reference_coverage",
+        "route_name": "证据覆盖补充",
+        "claims": claims,
+        "total_evidence_papers": len(claims),
+        "total_claims": len(claims),
+        "single_evidence_claims": len(claims),
+        "strong_plus_claims": 0,
+    }
+
+
+def claim_authorized_paper_ids(
+    claim_plans: list[dict[str, Any]] | None,
+) -> set[str]:
+    """返回 Claim Plan 中能够解析到真实论文的授权并集。"""
+    authorized: set[str] = set()
+    for plan in claim_plans or []:
+        for claim in plan.get("claims") or []:
+            for evidence_id in claim.get("evidence_ids") or []:
+                paper_id = _paper_id_from_evidence(str(evidence_id))
+                if paper_id:
+                    authorized.add(paper_id)
+    return authorized
+
+
 def apply_claim_budget(
     claim_plans: list[dict[str, Any]],
     required_reference_count: int,
@@ -1491,7 +1625,11 @@ def validate_claim_citation_consistency(
         unmapped_papers.update(unauthorized_papers)
 
         # Fine check: only the exact matched claim authorizes its evidence.
-        best_claim_id = _find_best_matching_claim(sentence, claim_plans)
+        best_claim_id = _find_best_matching_claim(
+            sentence,
+            claim_plans,
+            preferred_paper_ids=set(cited_paper_ids),
+        )
         if best_claim_id:
             matched_claim = next(
                 (
@@ -1560,8 +1698,13 @@ def validate_claim_citation_consistency(
 def _find_best_matching_claim(
     sentence: str,
     claim_plans: list[dict[str, Any]],
+    preferred_paper_ids: set[str] | None = None,
 ) -> str | None:
-    """找与句子最匹配的 claim plan（按 token overlap）。"""
+    """找与句子最匹配的 claim plan（按 token overlap）。
+
+    当多篇论文的主张文本完全相同，引用所指论文只作为同分时的确定性
+    tie-break；语义分数仍优先，避免把引用本身当成语义授权。
+    """
     import re
     sent_tokens = set(re.findall(r"[一-鿿a-z0-9]{2,}", sentence.lower()))
     if not sent_tokens:
@@ -1569,6 +1712,8 @@ def _find_best_matching_claim(
 
     best_id = None
     best_score = 0.0
+    best_preferred = False
+    preferred = {str(value) for value in (preferred_paper_ids or set()) if value}
     for plan in claim_plans:
         route_id = str(plan.get("route_id") or "")
         for claim_index, claim in enumerate(plan.get("claims") or []):
@@ -1583,9 +1728,20 @@ def _find_best_matching_claim(
             if not union:
                 continue
             score = len(sent_tokens & claim_tokens) / len(union)
-            if score > best_score:
+            claim_papers = {
+                paper_id
+                for evidence_id in claim.get("evidence_ids") or []
+                if (paper_id := _paper_id_from_evidence(evidence_id))
+            }
+            preferred_match = bool(preferred & claim_papers)
+            if score > best_score or (
+                score == best_score
+                and preferred_match
+                and not best_preferred
+            ):
                 best_score = score
                 best_id = claim_id
+                best_preferred = preferred_match
 
     return best_id if best_score > 0.05 else None
 

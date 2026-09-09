@@ -739,3 +739,374 @@ what changed and how it was validated; it is not a replacement for Git history.
 - **Known limitations:** Changes are local and have not been committed or pushed.
   Existing modifications to `app/agent/graph.py` and `tests/test_agent_graph.py`
   predate this cleanup and remain intentionally untouched.
+
+
+## 2026-09-05 20:41:06 +08:00
+
+- **Modified files:** plan.md (local plan, ignored by existing repository rules), docs/change-log.md.
+- **Root cause/reason:** The user requested an executable flow-change plan after repeated quality prompts failed to advance generation; current evidence identifies stale readiness, inherited section diagnostics, overwritten pre-generation errors, and recovery routing that does not reach writing.
+- **Behavior change:** Documentation only. Added a six-phase plan covering state lifecycle and migration, bounded recovery actions, evidence-to-citation coverage, section repair, final validation, and actionable user interaction. Explicit scope, time and reference requirements remain mandatory in the proposed design.
+- **Tests/validation:** Verified plan UTF-8 readability, section coverage, balanced fenced blocks and referenced file paths; the proposed new recovery test is explicitly marked as not yet created. git diff --check passed. No production code or session data was changed; application tests were not run for this documentation-only task.
+- **Known limitations:** The plan is pending implementation. No new live CNKI/LLM end-to-end run was performed; the document does not claim that the research task now meets its requested reference count. The existing /plan.md ignore rule was preserved.
+
+
+## 2026-09-05 21:14:10 +08:00
+
+- **Modified files:** app/agent/graph.py, app/agent/nodes/synthesis.py,
+  app/services/research_conversation_service.py,
+  app/deliverables/renderers/base_renderer.py,
+  app/deliverables/renderers/background_renderer.py, tests/test_agent_graph.py,
+  tests/test_generation_quality_gate.py, tests/test_output_quality_fixes.py,
+  tests/test_research_conversation.py, docs/research-workflow.md,
+  docs/quality-gates.md, plan.md.
+- **Root cause/reason:** Recovery reused stale generation-readiness and section
+  diagnostics, converted pre-generation state conflicts into post-generation
+  failures, lost the explicit reference-count marker across sessions, and
+  allowed evidence IDs or citation-count gains to bypass claim-citation checks.
+  The fallback background writer also emitted English metadata titles as body
+  sentences.
+- **Behavior change:** Recovery now clears and recomputes current-round writing
+  products, restores explicit reference constraints from the persisted request,
+  preserves true pre-generation blocking phases, and treats best-effort choice
+  as strategy metadata rather than a failure code. Conservative rewrite returns
+  to strict evidence mode. Evidence-span citations normalize to authorized
+  paper IDs; citation-gap candidates introducing new claim-citation mismatches
+  are rejected. English metadata titles are replaced by neutral Chinese labels
+  in deterministic fallback prose. Added workflow and gate documentation and
+  regression coverage for these paths.
+- **Tests/validation:** Targeted renderer and degraded-section tests: 34 passed.
+  Root-cause suites (state, graph, generation gate, conversation and claim
+  alignment): 166 passed. Full suite:
+  `python -m pytest -q --basetemp=data/_pytest_impl_full` → 1044 passed,
+  3 skipped. `git diff --check` passed; a read-only replay of the latest
+  persisted evidence state produced valid fallback background (16 unique
+  citations) and status (46 unique citations) sections.
+- **Known limitations:** No real CNKI/LLM/Selenium end-to-end run was
+  performed, and the latest session database was not modified. The 40-paper
+  task still requires running the repaired recovery path and final verification
+  with live configured sources/models; insufficient evidence remains a reported
+  block rather than an automatic success.
+
+## 2026-09-05 22:17:26 +08:00
+
+- **Modified files:** app/core/config.py, app/services/research_conversation_service.py,
+  app/agent/graph.py, tests/test_research_conversation.py,
+  docs/research-workflow.md, docs/quality-gates.md, plan.md.
+- **Root cause/reason:** A post-generation citation shortfall with an already
+  sufficient evidence pool still stopped at a user decision, even though the
+  requested scope and reference count did not need to change. The singular
+  citation allocation plan was also not preserved in the editable recovery state.
+- **Behavior change:** Added configurable `quality_recovery_max_attempts` and a
+  service-level automatic conservative rewrite for a validated or quarantined
+  draft when the evidence pool already satisfies the explicit target. The action
+  records progress, reuses authorized evidence, clears best-effort flags, and
+  never lowers the target. After the budget is exhausted, the existing quality
+  decision reports the concrete gap. The allocation plan now survives session
+  recovery, and workflow/gate documentation describes the new boundary.
+- **Tests/validation:** `python -m pytest tests/test_research_conversation.py -q`
+  → 34 passed; generation, claim-alignment and output-quality suites → 102
+  passed; writer/deliverable suites → 31 passed; full local suite excluding the
+  known live-LLM `test_standalone_search_returns_paper_list` → 1048 passed,
+  3 skipped, 1 deselected. `python -m compileall -q app` passed.
+- **Known limitations:** No real CNKI/LLM/Selenium end-to-end run was performed;
+  live source rate limits and metadata quality can still leave the task blocked.
+  Automatic recovery only applies when a generated draft and sufficient evidence
+  are both present; it does not fabricate missing papers or bypass evidence gates.
+
+## 2026-09-05 22:23:06 +08:00
+
+- **Modified files:** app/agent/state.py.
+- **Root cause/reason:** The recovery change persists a singular current-round
+  citation allocation snapshot for renderers, but the TypedDict contract did not
+  declare that field.
+- **Behavior change:** Declared `citation_allocation_plan` in
+  `ResearchAgentState`, documenting its lifecycle alongside the aggregate
+  allocation list.
+- **Tests and validation:** `python -m compileall -q app` and the full local
+  regression run reported above remain green; no runtime logic changed.
+- **Known limitations:** Real external-source and LLM integration remain
+  unverified.
+
+## 2026-09-05 22:24:06 +08:00
+
+- **Modified files:** app/services/research_conversation_service.py.
+- **Root cause/reason:** Automatic recovery initially used the raw card count as
+  its sufficiency signal, which could count invalid or out-of-scope cards.
+- **Behavior change:** Recovery now prioritizes the current generation-readiness
+  usable-reference count (or the explicit eligible-ID list) and falls back to
+  card count only for legacy states without those fields.
+- **Tests and validation:** `python -m pytest tests/test_research_conversation.py
+  -q` → 34 passed; compilation and diff checks remain clean.
+- **Known limitations:** A readiness report produced by an old state may still
+  require one normal recovery pass to be recomputed.
+
+## 2026-09-05 22:24:43 +08:00
+
+- **Modified files:** app/services/research_conversation_service.py.
+- **Root cause/reason:** The automatic path should apply only to a user-explicit
+  reference target; otherwise a diagnostic count must not become an implicit
+  generation requirement.
+- **Behavior change:** Automatic conservative recovery now requires the persisted
+  `max_papers_explicit` marker in addition to a sufficient usable evidence count.
+- **Tests and validation:** `python -m pytest tests/test_research_conversation.py
+  -q` → 34 passed.
+- **Known limitations:** Non-explicit reference preferences continue to follow
+  the normal generation policy and are not auto-promoted to hard constraints.
+
+## 2026-09-06 14:07:26 +08:00
+
+- **Modified files:** `.env.example`, `README.md`, `app/agent/claim_plan.py`,
+  `app/agent/deliverable_router.py`, `app/agent/generation_recovery.py` (new),
+  `app/agent/graph.py`, `app/agent/nodes/synthesis.py`,
+  `app/agent/nodes/verification.py`, `app/agent/recovery_loop.py`,
+  `app/agent/state.py`, `app/core/config.py`, the background/base/status
+  renderers, `app/frontend/chat_app.py`, `app/frontend/progress_labels.py`
+  (new), deliverable/recovery schemas,
+  `app/services/research_conversation_service.py`,
+  `app/tools/write_deliverable.py`, workflow and quality-gate documentation,
+  example recovery scenarios, `plan.md`, and the related graph, claim,
+  generation, frontend, output, and conversation tests.
+- **Root cause/reason:** Recovery previously handled only one citation-shortfall
+  branch. It treated card count as writing capacity, kept separate route/writing
+  budgets, could repeat a no-progress action, regenerated every section, and
+  exposed generic choices that did not resolve classification, authorization,
+  metadata, or section failures. The persisted 40-reference case had 62 usable
+  papers but only 30 currently authorized papers because stale out-of-scope
+  claims incorrectly consumed the coverage target.
+- **Behavior change:** Added one deterministic generation-recovery controller
+  with stable issue classes, evidence/scope fingerprints, a shared task action
+  budget, no-progress action switching, existing-paper evidence refresh, and
+  concrete user-input boundaries. Generation readiness now reports raw,
+  confirmed, evidence-backed, claim-authorized, planned, cited, and final-valid
+  counts and blocks before writing when authorization cannot meet the request.
+  Coverage claims are built against the current eligible set. Private
+  versioned section checkpoints allow matching validated sections to bypass LLM
+  calls during local repair; merged output still runs the shared full validation
+  chain. Candidate adoption compares every quality-vector component and rolls
+  back same-evidence regressions. Session v2 migration preserves explicit
+  constraints, evidence-expansion permission, history, counters, drafts, and
+  checkpoints. The service removes the repeated generic retry menus, reports
+  concrete remaining gaps, and the frontend renders real recovery actions,
+  pending/revalidated state, and coverage counts.
+- **Tests and validation:** `python -m pytest -q
+  --basetemp=data/_pytest_plan_full` passed with 1068 tests and 3 skipped.
+  Targeted recovery/service/frontend tests passed (54 tests); core recovery,
+  evidence, state, and graph tests passed (83 tests); the writing/verification
+  pipeline tests passed (183 tests). `python -m compileall -q app tests`, example
+  JSON parsing, and `git diff --check` passed. A read-only replay of the latest
+  persisted session kept `required_reference_count=40` and produced 40
+  claim-authorized, 40 planned, 40 actually cited, and 40 final-valid papers,
+  CCC consistency 1.0, five section checkpoints, and a passed final gate. The
+  database was not modified.
+- **Convergence review:** Removed the superseded per-writing retry limit and
+  duplicate budget-exhaustion prompt, corrected legacy counter migration, made
+  quality-vector comparison component-wise, and verified local repair skips
+  LLM calls for retained chapters. Recovery never changes the explicit time,
+  topic, or reference target; unknown evidence/citations and unconfirmed reserve
+  papers remain excluded. Retained state-lifetime and migration constraints have
+  Chinese `WHY` comments.
+- **Known limitations:** No live CNKI, external LLM, or Selenium end-to-end run
+  was performed. The read-only replay validates the repaired local orchestration
+  against real persisted evidence, but it does not verify current external
+  credentials, rate limits, or provider availability. No Git commit was made.
+
+## 2026-09-06 15:38:08 +08:00
+
+- **Modified files:** `app/agent/nodes/planning.py`, `app/clients/cnki_client.py`.
+- **Root cause/reason:** Standalone paper-search requests were short-circuited
+  by the bilingual planning gate after an LLM planning outage; CNKI pagination
+  could also abort the whole search when a driver test double lacked Selenium's
+  element lookup method, discarding already collected result-page metadata.
+- **Behavior change:** Standalone searches with usable keywords continue to the
+  configured search sources while review/generation workflows retain the
+  bilingual planning safety gate. Pagination driver capability failures now stop
+  further paging and preserve collected records for metadata conversion.
+- **Tests and validation:** Targeted regression tests passed (2 tests); full
+  suite passed (`1076 passed`); `python -m compileall -q app tests` and
+  `git diff --check` passed.
+- **Known limitations:** No live CNKI or external LLM run was performed; source
+  availability and credentials remain environment-dependent.
+
+## 2026-09-06 19:11:08 +08:00
+
+- **Modified files:** `app/agent/generation_recovery.py`, `app/agent/graph.py`,
+  `app/agent/nodes/synthesis.py`, `app/deliverables/renderers/base_renderer.py`,
+  `app/services/research_conversation_service.py`,
+  `tests/test_generation_recovery.py`, `tests/test_research_conversation.py`,
+  and `plan.md`.
+- **Root cause/reason:** Live recovery exposed four state and control-flow gaps
+  that deterministic fixtures did not cover: persisted `final_valid` coverage
+  was ignored by the progress vector; old private research state omitted the
+  references, verification reports, and valid counts needed for transactional
+  rollback; a present consistency report with a missing valid count raised
+  `int(None)`; and a reference shortfall masked simultaneous claim/section
+  failures, so the controller could exhaust its budget without executing a
+  section rewrite.
+- **Behavior change:** Recovery derives the actual shortfall from persisted
+  coverage, migrates complete generation products and counts into old editable
+  sessions, persists those products in new private states, and safely treats a
+  missing count as zero. For mixed reference and text-quality failures it now
+  reallocates citations, then switches to a real targeted section rewrite
+  before rebuilding claims or searching. A rewrite action forces affected
+  sections through the section writer while retaining matching untargeted
+  checkpoints.
+- **Tests and validation:** Targeted recovery, conversation, and writing tests
+  passed (75 tests); `python -m compileall -q app tests` passed; the final full
+  suite passed (`1078 passed`). A live 2024-2026 classroom-behavior run used
+  CNKI/Selenium and external LLM calls without changing the 40-reference target.
+  Its first graph pass produced 60 evidence cards, 35 final-valid citations,
+  50.0% claim support, and 97.5% claim-citation consistency, so the draft was
+  correctly quarantined. Full service recovery expanded the pool to 153 cards,
+  improved final-valid citations to 39 and consistency to 1.0, then accurately
+  reported the remaining claim and section gaps when the shared budget ended.
+  A post-fix checkpoint replay confirmed the controller executed
+  `REWRITE_SECTIONS` in the mixed-failure sequence.
+- **Convergence review:** The public/private result boundary now preserves the
+  same product set used by generation rollback, legacy migration and new-state
+  serialization share the coverage semantics, and the mixed-failure branch has
+  one ordered action path. Temporary live runs used isolated in-memory sessions;
+  the original session database and explicit topic, year, and count constraints
+  were not modified.
+- **Known limitations:** The successful live-delivery acceptance remains
+  unverified. During the post-fix replay the primary provider began returning
+  insufficient-credit errors; backup calls were only partially available, so
+  deterministic fallbacks could not establish LLM writing quality. Crossref
+  also returned one rate-limit response and Semantic Scholar one timeout during
+  the initial run. No Git commit was made.
+
+## 2026-09-06 19:18:43 +08:00
+
+- **Modified files:** `app/core/config.py`, `app/agent/nodes/synthesis.py`,
+  `.env.example`, `README.md`, `docs/quality-gates.md`,
+  `docs/research-workflow.md`, `tests/test_generation_quality_gate.py`, and
+  `plan.md`.
+- **Root cause/reason:** A draft whose only remaining failure was a small valid
+  reference-count shortfall stayed fully quarantined after all bounded recovery
+  actions. The existing `accept_available` path changed the numeric target,
+  which hid the original request instead of expressing a partial delivery.
+- **Behavior change:** The system now keeps the original reference target and
+  first exhausts normal recovery. If the only remaining hard issue is the final
+  valid-reference count and coverage reaches the configurable threshold (85% by
+  default), it releases the verified draft as `partial` /
+  `released_best_effort`. The quality gate retains the unmet count and records
+  the actual ratio and threshold. Any claim, citation-consistency, metadata,
+  language, section, or integrity failure still quarantines the draft. The
+  fallback can be disabled through configuration.
+- **Tests and validation:** Targeted generation-gate, conversation, and graph
+  tests passed (167 tests). Regression cases cover 34/40 after budget exhaustion,
+  33/40 below threshold, 34/40 before budget exhaustion, 39/40 with another
+  quality failure, and disabling the fallback. The final full suite passed
+  (`1082 passed`); `python -m compileall -q app tests` and `git diff --check`
+  passed.
+- **Known limitations:** This policy exposes a partially satisfied, explicitly
+  labelled draft; it does not make 34-39 references satisfy an exact 40-reference
+  success requirement. No external LLM/CNKI rerun was required for the
+  deterministic gate change. No Git commit was made.
+
+
+## 2026-09-06 19:35:35 +08:00
+
+- **Modified files:** `plan.md`, `docs/change-log.md` (documentation only).
+- **Reason:** Convert the claim verification and writing-quality diagnosis into an actionable follow-up plan without confusing earlier implementation records with new acceptance results.
+- **Behavior change:** No production changes. The active R0-R6 plan covers consistent semantic revalidation, incomplete-verification state, evidence-bound writing, section checkpoints, transactional recovery, provider failures, and end-to-end acceptance. It distinguishes the 56.1% replay from the 57.3% persisted snapshot and avoids treating every low-overlap claim as a confirmed false negative. Existing plan history is retained below the new plan.
+- **Validation:** Document assertions confirmed all seven phases, unchecked new acceptance items, balanced code fences, and all nine historical checked items. Reviewed implementation anchors and existing test/script paths; no runtime tests or external API calls were run for this documentation change.
+- **Known limitations:** R0-R6 are proposed work, not implemented fixes. Historical test counts are not acceptance results for this plan; real semantic and external retrieval acceptance remains pending implementation and available services.
+## 2026-09-06 19:43:42 +08:00
+
+- **Modified files:** `plan.md`, `docs/change-log.md` (documentation only).
+- **Reason:** The user explicitly excluded model quota handling from the repair scope.
+- **Behavior change:** No production changes. The active plan no longer treats quota, provider fallback, or model-service recovery as implementation tasks, blockers, or acceptance prerequisites. The remaining R0-R5 scope covers claim verification, evidence-bound writing, section quality, recovery decisions, and end-to-end validation.
+- **Validation:** Confirmed the active plan contains R0-R5, ten unchecked acceptance items, no checked items, and no quota/provider-fallback references. `git diff --check` passed.
+- **Known limitations:** The plan is not yet implemented. Historical records below the active plan remain unchanged and may mention the conditions under which earlier runs were performed.
+
+## 2026-09-06 20:57:46 +08:00
+
+- **Modified files:** `app/schemas/verification_schema.py`, `app/tools/verify_claims.py`, `app/agent/nodes/verification.py`, `app/schemas/recovery_schema.py`, `app/agent/generation_recovery.py`, `app/services/research_conversation_service.py`, `app/agent/graph.py`, `app/frontend/progress_labels.py`, `app/agent/nodes/synthesis.py`, `app/core/text_quality.py`, `app/core/config.py`, `app/tools/validate_deliverable.py`, `app/tools/write_deliverable.py`, `app/deliverables/renderers/base_renderer.py`, `app/deliverables/renderers/background_renderer.py`, `app/deliverables/renderers/status_renderer.py`, `.env.example`, `README.md`, `docs/quality-gates.md`, `docs/research-workflow.md`, `scripts/README.md`, `scripts/run_classroom_behavior_e2e.py`, `tests/fixtures/claim_quality_failure_scenarios.json`, `tests/test_verify_claims.py`, `tests/test_generation_quality_gate.py`, `tests/test_generation_recovery.py`, `tests/test_agent_graph.py`, `tests/test_writer_degraded_section.py`, `tests/test_output_quality_fixes.py`, and `plan.md`.
+- **Root cause/reason:** Post-rewrite claim checks silently changed from semantic verification to lexical-only checks, so cross-language claims could become false negatives. The writers also generated metadata/count filler and token fragments, while section checkpoints could promote sparse or duplicate candidates. Recovery treated incomplete semantic verification like unsupported evidence and could trigger unrelated generation work.
+- **Behavior change:** Every initial and post-repair claim check now uses one verification contract. Verified lack of support is separate from incomplete verification, cache reuse is bound to complete claim/citation/evidence/provenance/policy inputs, and sentence reuse follows exact content across index changes. Incomplete verification gets a bounded verification-only recovery that preserves the draft. Writers no longer emit count, title-only, metadata-only, or citation-placeholder prose; token fragments, duplicate sections, and configurable section-density failures block checkpoint promotion. Local repair candidates are checked for full-output integrity before adoption. The E2E runner now defaults to the conversation service and writes each run to an isolated output directory.
+- **Tests and validation:** Targeted suites passed (`185 passed`, `97 passed`, and `138 passed` during implementation). The final full suite passed (`1096 passed in 27.64s`). `python -m compileall -q app tests scripts/run_classroom_behavior_e2e.py`, `python scripts/run_classroom_behavior_e2e.py --help`, and `git diff --check` passed. The final convergence scan found one shared `verify_review_claims` invocation in the verification node and no remaining count/citation filler phrases or conservative-writer LLM disable branch.
+- **Known limitations:** This turn did not execute a real CNKI/LLM fixed-evidence replay or a real retrieval-to-delivery run. The script and local regression path are ready, but external-run success is intentionally left unchecked in `plan.md`. Existing unrelated working-tree changes were preserved, and no Git commit was made.
+
+## 2026-09-06 22:54:03 +08:00
+
+- **Modified files:** `app/agent/nodes/synthesis.py`, `app/services/research_conversation_service.py`, `tests/test_generation_quality_gate.py`, `tests/test_research_conversation.py`, and `docs/change-log.md`.
+- **Root cause/reason:** The global citation-backfill path called `_normalize_evidence_citations` without importing it. The branch is reached only when the writing plan has enough authorized papers but the generated text still lacks part of the required citation union, so earlier template-oriented tests did not execute it. The resulting `NameError` was then misclassified as a recoverable quality failure and repeated until the shared recovery budget was exhausted.
+- **Behavior change:** Citation backfill now imports and applies the existing evidence-ID-to-paper-ID normalizer before checking citation monotonicity. A deliverable runtime error is no longer offered to the quality recovery controller, because retrieval, rewriting, and semantic revalidation cannot repair a programming exception; the original technical failure remains visible without consuming all quality recovery actions.
+- **Tests and validation:** A regression test executes the exact backfill branch with an LLM response containing an evidence ID and verifies normalization to the authorized paper ID. A conversation-service test verifies that `deliverable_generation_failed` does not enter quality recovery. Targeted tests passed (`119 passed`), followed by the full suite (`1098 passed in 27.57s`). The convergence review confirmed that the normalizer is imported in the same function that calls it and that the runtime-error bypass is limited to the technical failure code.
+- **Known limitations:** The already failed UI response cannot be retroactively converted into a generated review. A new request must run after the frontend process loads the updated code. No real CNKI/LLM rerun or Git commit was performed in this change.
+
+## 2026-09-06 23:52:17 +08:00
+
+- **Modified files:** `plan.md`, `docs/change-log.md` (documentation only).
+- **Reason:** The latest 23:46:36 run stopped before writing on required-focus coverage despite 82 usable papers and 40 authorized/planned references. The user requests a final usable draft even when formal quality gates fail, and explicitly requests a plan only for this turn.
+- **Behavior change:** No runtime changes. The new active G0-G5 plan covers requirement provenance diagnosis, persistent draft policy, bounded final draft generation including pre-writing failures, old blocked-session resume, evidence-bound text treatment, consistent public fields/downloads, and end-to-end acceptance. The old plan is preserved in full beneath the active plan.
+- **Validation:** Read current logs and implementation/callers for readiness, recovery, generation, serialization and frontend display. Document checks verify six phases, ten unchecked acceptance items, balanced fences and preservation of the historical plan. No runtime tests or external CNKI/LLM calls were made for this documentation task.
+- **Known limitations:** All G0-G5 work remains proposed and unchecked. Nested logs do not expose per-requirement matching details, so the plan does not claim the four focus deficits are all true insufficiency or all false positives. Existing business code, configuration, session data and service processes were not modified in this turn.
+
+## 2026-09-07 00:46:48 +08:00
+
+- **Modified files:** `app/core/config.py`, `app/schemas/agent_schema.py`,
+  `app/schemas/research_plan_schema.py`, `app/agent/state.py`,
+  `app/agent/research_semantic_parser.py`, `app/agent/semantic_consistency.py`,
+  `app/agent/evidence_roles.py`, `app/agent/deliverable_router.py`,
+  `app/agent/graph.py`, `app/agent/nodes/synthesis.py`,
+  `app/services/research_conversation_service.py`, `app/frontend/query_utils.py`,
+  `app/frontend/progress_labels.py`, `app/frontend/chat_app.py`, `.env.example`,
+  `README.md`, `docs/quality-gates.md`, `docs/research-workflow.md`, `plan.md`,
+  `tests/fixtures/focus_gate_failure_2026_09_06.json`,
+  `tests/test_research_semantics.py`, `tests/test_evidence_roles.py`,
+  `tests/test_architecture_hardening.py`, `tests/test_agent_graph.py`,
+  `tests/test_research_conversation.py`, `tests/test_generation_quality_gate.py`,
+  and `tests/test_frontend_query_utils.py`.
+- **Root cause/reason:** The latest run had enough usable, claim-authorized and
+  planned papers, but writing readiness stopped on four zero-match focus
+  requirements. A read-only state inspection showed that the legacy frame omitted
+  requirement provenance and allowed model-generated generic aliases to mark
+  unmentioned focuses as user-explicit. Separately, recovery exhaustion had no
+  guaranteed final writing attempt, old blocked sessions treated a short draft
+  action as a new topic, and only the answer field was guaranteed to carry the
+  partial-draft limitation banner.
+- **Behavior change:** Evidence requirements now inherit provenance from grounded
+  source entities. A model alias cannot establish an explicit user constraint;
+  inferred missing focuses remain diagnostic `advisory_missing` items. After the
+  shared recovery budget is exhausted, the conversation service makes one final
+  evidence-backed writing attempt when no runtime, authentication, missing-input or
+  stale-state condition prevents it. The original count, time and scope remain
+  unchanged; failed gates stay failed and a released draft is `partial` with a
+  limitation banner. The public request field `best_effort_on_failure=false`
+  overrides the enabled default. Old blocked or quality-clarification sessions can
+  type or click “生成可用草稿” and reuse saved evidence. Policy and one-shot attempt
+  fields persist in private research state. Public answer/body/typed deliverables
+  and Markdown download use the same marked text, and uncomputed progress counts
+  display as “尚未统计”.
+- **Tests and validation:** The read-only latest-session inspection fixed the ten
+  focus counts and four missing requirement IDs in a sanitized fixture. The final
+  focused suite passed (`237 passed`); an earlier broader recovery/front-end suite
+  passed (`267 passed`). The full suite passed (`1113 passed in 29.44s`).
+  `python -m compileall -q app tests scripts/run_classroom_behavior_e2e.py`, fixture
+  JSON parsing, the E2E script help command, and `git diff --check` passed.
+- **Convergence review:** There is one service entry for automatic final-draft
+  generation and manual actions reuse the existing regeneration path. The review
+  confirmed that the one-shot marker survives output serialization, the pre-write
+  blocked placeholder cannot be released as a draft, metadata-only cards and
+  technical/access failures remain blocked, explicit constraints are preserved,
+  and the new focus rule is grounded in source-entity provenance rather than a
+  classroom-specific term list. No temporary fallback or duplicate verification
+  chain introduced by this change remains.
+- **Known limitations:** This turn did not run live CNKI/LLM retrieval-to-delivery;
+  local tests therefore do not prove that an external model will produce a
+  satisfactory 40-paper draft on the next run. The running API and Streamlit
+  processes must be restarted to load these changes. Existing unrelated working
+  tree changes were preserved, and no Git commit was made.
+
+## 2026-09-07 00:48:57 +08:00
+
+- **Modified files:** `docs/change-log.md` (operational follow-up only).
+- **Reason and behavior:** Restarted the existing API and Streamlit processes so
+  the final-draft and focus-provenance changes recorded above are active. No
+  database or research-session content was modified.
+- **Validation:** Both replacement processes are listening on their configured
+  ports; the API health check returned HTTP 200 with healthy status and the
+  Streamlit page returned HTTP 200.
+- **Known limitations:** The external CNKI/LLM end-to-end scenario remains unrun.
+  The prior entry's process-restart limitation is resolved. No Git commit was made.

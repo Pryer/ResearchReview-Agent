@@ -6,9 +6,12 @@ from typing import Any
 from app.schemas.deliverable_schema import CoreDeliverableType, WritingPlan
 from app.deliverables.renderers.base_renderer import (
     BaseRenderer,
+    _allocated_paper_ids_for_section,
+    _claim_plan_claims_by_paper,
     _clean_route_title,
     _cross_route_summary,
     _neutralize_evidence_self_reference,
+    _safe_claim_for_body,
     _section_heading,
     _status_overview_lead,
 )
@@ -28,6 +31,20 @@ class StatusRenderer(BaseRenderer):
 
         topic = str(state.get("canonical_topic") or state.get("topic") or "本研究主题")
         claims_by_paper = {card["paper_id"]: card.get("claims") or [] for card in cards}
+        claim_plan_claims_by_paper = _claim_plan_claims_by_paper(state)
+        reused_paper_ids = {
+            str(paper_id)
+            for paper_id in (state.get("citation_allocation_plan") or {}).get("reused_paper_ids") or []
+        }
+
+        def _first_safe_claim(paper_id: str) -> str:
+            if str(paper_id) in reused_paper_ids:
+                return ""
+            for text in claim_plan_claims_by_paper.get(str(paper_id)) or []:
+                safe_text = _safe_claim_for_body(text)
+                if safe_text:
+                    return safe_text
+            return ""
 
         # 构建灵活索引：支持 theme_name、section.title、去除编号后的 title、theme_id 匹配
         synthesis_by_key: dict[str, Any] = {}
@@ -63,23 +80,99 @@ class StatusRenderer(BaseRenderer):
                 ]
                 lead = _status_overview_lead(topic, theme_titles)
                 overview_claims = []
-                for p_id in section.supporting_paper_ids:
-                    if str(p_id) in theme_paper_ids:
+                allocated_overview_ids = _allocated_paper_ids_for_section(state, section.id)
+                overview_ids = (
+                    allocated_overview_ids
+                    if state.get("conservative_regeneration") and allocated_overview_ids
+                    else list(dict.fromkeys([
+                        *(section.supporting_paper_ids or []),
+                        *allocated_overview_ids,
+                    ]))
+                )
+                for p_id in overview_ids:
+                    if (
+                        not (state.get("conservative_regeneration") and claim_plan_claims_by_paper)
+                        and str(p_id) in theme_paper_ids
+                    ):
                         continue
-                    for c in claims_by_paper.get(p_id, []):
-                        if c.get("field") in {"research_problem", "method", "results"} and c.get("claim"):
-                            raw_claim = _neutralize_evidence_self_reference(
-                                c["claim"]
-                            ).strip().rstrip("。，；、,.; ")
-                            if raw_claim:
-                                overview_claims.append(f"{raw_claim}[{p_id}]")
-                                break
+                    if state.get("conservative_regeneration") and claim_plan_claims_by_paper:
+                        raw_claim = _first_safe_claim(str(p_id))
+                        if raw_claim:
+                            overview_claims.append(f"{raw_claim}[{p_id}]")
+                    else:
+                        for c in claims_by_paper.get(p_id, []):
+                            if c.get("field") in {"research_problem", "method", "results"} and c.get("claim"):
+                                raw_claim = _neutralize_evidence_self_reference(
+                                    c["claim"]
+                                ).strip().rstrip("。，；、,.; ")
+                                if raw_claim:
+                                    overview_claims.append(f"{raw_claim}[{p_id}]")
+                                    break
                 if overview_claims:
-                    body = "；".join(overview_claims[:8]) + "。"
-                    parts.append(lead + f"从已有代表性成果看，相关研究在核心机制与性能边界上取得了持续进展：{body}")
+                    # 保守重写需要兑现当前分配层的全局覆盖；只在普通兜底
+                    # 路径限制概述长度，避免将计划论文静默截掉。
+                    visible_claims = (
+                        overview_claims
+                        if state.get("conservative_regeneration") and claim_plan_claims_by_paper
+                        else overview_claims[:8]
+                    )
+                    if state.get("conservative_regeneration") and claim_plan_claims_by_paper:
+                        parts.append("\n".join(f"{claim}。" for claim in visible_claims))
+                    else:
+                        body = "；".join(visible_claims) + "。"
+                        parts.append(lead + f"从已有代表性成果看，相关研究在核心机制与性能边界上取得了持续进展：{body}")
                 else:
                     parts.append(lead + "现有材料可按各研究路线的问题设定、分析方式与适用边界加以梳理。")
                 continue
+
+            # 保守重写只使用当前 Claim Plan 已授权的证据句，并合并分配层
+            # 补充到本节的论文；不能复用上一轮 theme_synthesis 的旧主张。
+            if state.get("conservative_regeneration") and claim_plan_claims_by_paper:
+                allocated_ids = _allocated_paper_ids_for_section(state, section.id)
+                section_paper_ids = (
+                    allocated_ids
+                    if allocated_ids
+                    else list(dict.fromkeys(section.supporting_paper_ids or []))
+                )
+                authorized_points = [
+                    (claim_text, str(paper_id))
+                    for paper_id in section_paper_ids
+                    for claim_text in [_first_safe_claim(str(paper_id))]
+                    if claim_text
+                    if claim_plan_claims_by_paper.get(str(paper_id))
+                ]
+                if authorized_points:
+                    parts.append(
+                        "\n".join(
+                            f"{claim_text}[{paper_id}]。"
+                            for claim_text, paper_id in authorized_points
+                        )
+                    )
+                    if section_idx == len(plan.sections) - 1 or (
+                        section_idx < len(plan.sections) - 1
+                        and not plan.sections[section_idx + 1].id.startswith("theme_")
+                    ):
+                        # 跨路线总结必须位于最后一个主题段落末尾；否则后置的
+                        # 证据边界句会成为校验器看到的“最后一段”，导致总结
+                        # 已生成却仍被判定缺失。
+                        if sum(len(text) for text, _paper_id in authorized_points) < 80:
+                            parts.append(
+                                f"本节围绕{_clean_route_title(section.title)}，仅依据已获授权论文明确报告的内容归纳，"
+                                "不对未报告的信息作外推。"
+                            )
+                        theme_titles = [
+                            _clean_route_title(s.title)
+                            for s in plan.sections if s.id.startswith("theme_")
+                        ]
+                        parts.append(_cross_route_summary(topic, theme_titles, synthesis_pool))
+                    # 短路线仍需说明证据边界，避免两篇授权证据被压缩成
+                    # 不可读的单行清单；最后一节已在跨路线总结前追加。
+                    elif sum(len(text) for text, _paper_id in authorized_points) < 80:
+                        parts.append(
+                            f"本节围绕{_clean_route_title(section.title)}，仅依据已获授权论文明确报告的内容归纳，"
+                            "不对未报告的信息作外推。"
+                        )
+                    continue
 
             sec_clean_title = re.sub(r"^[（(][一二三四五六七八九十0-9]+[）)]\s*", "", section.title).strip()
             synthesis = (

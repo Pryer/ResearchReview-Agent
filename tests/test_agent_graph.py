@@ -153,6 +153,44 @@ def test_build_output_deliverable_type_is_always_scalar():
     assert multi["core_deliverables"] == ["research_status", "related_work"]
 
 
+def test_build_output_marks_every_public_text_field_for_partial_draft():
+    from app.agent.graph import _build_output
+
+    answer = "> ⚠️ 质量门禁提示\n\n## 研究现状\n\n可用草稿[p1]。"
+    output = _build_output({
+        "answer": answer,
+        "body": "## 研究现状\n\n可用草稿[p1]。",
+        "related_work": "## 研究现状\n\n可用草稿[p1]。",
+        "quality_gate": {
+            "passed": False,
+            "draft_released": True,
+            "partial_success": True,
+            "draft_disposition": "released_best_effort",
+        },
+    })
+
+    assert output["status"] == "partial"
+    assert output["body"] == answer
+    assert output["related_work"] == answer
+
+
+def test_build_output_persists_final_best_effort_execution_record():
+    from app.agent.graph import _build_output
+
+    output = _build_output({
+        "best_effort_on_failure": True,
+        "best_effort_policy_source": "configuration",
+        "automatic_best_effort_attempted": True,
+        "automatic_best_effort_generation": True,
+    })
+
+    private = output["research_state"]
+    assert private["best_effort_on_failure"] is True
+    assert private["best_effort_policy_source"] == "configuration"
+    assert private["automatic_best_effort_attempted"] is True
+    assert private["automatic_best_effort_generation"] is True
+
+
 def test_plan_uses_current_time_tool_for_relative_year_range():
     state = {
         "user_query": "帮我调研近五年目标检测论文，引用不少于5篇",
@@ -1491,6 +1529,138 @@ def test_reset_generation_products_clears_stale_plans_and_authorization():
     assert state["paper_cards"] == [{"paper_id": "p1"}]
 
 
+def test_regeneration_clears_stale_readiness_and_section_diagnostics_before_write(monkeypatch):
+    """恢复轮必须先丢弃上一轮就绪/章节诊断，才能重新进入 Writer。"""
+    from app.agent.graph import regenerate_research_agent
+
+    observed = {}
+
+    def fake_generate(state, should_cancel=None):
+        observed["stale_readiness"] = state.get("generation_readiness")
+        observed["stale_sections"] = state.get("writer_section_diagnostics")
+        state["review"] = "## 研究现状\n\n重新生成的正文。"
+
+    monkeypatch.setattr("app.agent.graph._generate_deliverables_or_block", fake_generate)
+    monkeypatch.setattr("app.agent.graph._verify_generated_draft", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "app.agent.graph.final_answer_node",
+        lambda state: state.update({"answer": state.get("review", "")}),
+    )
+
+    state = {
+        "intent": "generate_review",
+        "topic": "课堂行为分析",
+        "core_deliverables": [],
+        "paper_details": [_paper(paper_id="p1")],
+        "paper_cards": [_paper(paper_id="p1")],
+        "research_request": {"max_papers_explicit": True, "required_reference_count": 3, "max_papers": 3},
+        "required_reference_count": 3,
+        "max_papers": 3,
+        "quality_gate": {
+            "passed": False,
+            "phase": "pre_generation",
+            "blocking_issues": [{"code": "recovery_readiness_conflict"}],
+        },
+        "generation_readiness": {"ready": True, "blocking_issues": []},
+        "writer_section_diagnostics": [{"sections": [{"status": "evidence_limited"}]}],
+        "evidence_gap_report": {"needs_recovery": True, "evidence_snapshot_version": 1},
+        "evidence_snapshot_version": 1,
+        "steps": [],
+        "errors": [],
+    }
+
+    result = regenerate_research_agent(state)
+
+    assert observed == {"stale_readiness": None, "stale_sections": None}
+    assert result["answer"] == "## 研究现状\n\n重新生成的正文。"
+    assert result["research_state"]["max_papers_explicit"] is True
+
+
+def test_regeneration_refreshes_existing_evidence_without_expanding_candidate_pool(monkeypatch):
+    """元数据恢复只重取当前论文，再重建写作；不会把原始候选池重新引入。"""
+    from app.agent.graph import regenerate_research_agent
+
+    observed = {}
+
+    def fake_fetch(state, should_cancel=None):
+        observed["fetch_ids"] = [item["paper_id"] for item in state["candidate_papers"]]
+
+    def fake_extract(state, llm=None, should_cancel=None):
+        observed["extract"] = True
+
+    monkeypatch.setattr("app.agent.graph.fetch_detail_node", fake_fetch)
+    monkeypatch.setattr("app.agent.graph.extract_card_node", fake_extract)
+    monkeypatch.setattr(
+        "app.agent.graph._generate_deliverables_or_block",
+        lambda state, should_cancel=None: state.update({"review": "## 研究背景\n\n刷新后的正文。"}),
+    )
+    monkeypatch.setattr("app.agent.graph._verify_generated_draft", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "app.agent.graph.final_answer_node",
+        lambda state: state.update({"answer": state.get("review", "")}),
+    )
+    state = {
+        "intent": "generate_review",
+        "topic": "测试主题",
+        "core_deliverables": [],
+        "paper_details": [_paper(paper_id="selected")],
+        "candidate_papers": [
+            _paper(paper_id="raw-1"),
+            _paper(paper_id="raw-2"),
+        ],
+        "paper_cards": [_paper(paper_id="selected")],
+        "refresh_existing_evidence": True,
+        "steps": [],
+        "errors": [],
+    }
+
+    result = regenerate_research_agent(state)
+
+    assert observed == {"fetch_ids": ["selected"], "extract": True}
+    assert result["answer"] == "## 研究背景\n\n刷新后的正文。"
+    assert "refresh_existing_evidence" not in result["research_state"]
+
+
+def test_verification_only_recovery_preserves_draft_and_skips_writer(monkeypatch):
+    from app.agent.graph import regenerate_research_agent
+
+    calls = []
+
+    def unexpected_generate(*args, **kwargs):
+        raise AssertionError("verification-only recovery must not regenerate text")
+
+    def fake_verify(state, **kwargs):
+        calls.append("verify")
+        state["claim_verification"] = {"unsupported": 0, "unverified": 0}
+        state["generation_quality"] = {"passed": True, "support_rate": 1.0}
+
+    def fake_final(state):
+        calls.append("final")
+        state["quality_gate"] = {"passed": True, "draft_released": True}
+        state["answer"] = state["review"]
+
+    monkeypatch.setattr(
+        "app.agent.graph._generate_deliverables_or_block", unexpected_generate
+    )
+    monkeypatch.setattr("app.agent.graph._verify_generated_draft", fake_verify)
+    monkeypatch.setattr("app.agent.graph.final_answer_node", fake_final)
+    state = {
+        "review": "## 研究现状\n\n保留的当前正文[p1]。",
+        "body": "## 研究现状\n\n保留的当前正文[p1]。",
+        "writing_plans": [{"sections": [{"id": "theme_a", "title": "研究现状"}]}],
+        "paper_cards": [_paper(paper_id="p1")],
+        "verification_only_recovery": True,
+        "steps": [],
+        "errors": [],
+    }
+
+    result = regenerate_research_agent(state)
+
+    assert calls == ["verify", "final"]
+    assert result["answer"] == state["review"]
+    assert result["research_state"].get("verification_only_recovery") is None
+
+
 def test_local_rewrite_targets_derive_from_repairs_ccc_and_section_diagnostics():
     """local_rewrite 同时派生 claim repair、CCC 与失败章节的目标句。"""
     from app.agent.graph import _build_regeneration_recovery_plan
@@ -1570,6 +1740,24 @@ def test_conservative_regeneration_reuses_routes_and_claim_plan(monkeypatch):
     )
     assert recovery_step["output_data"]["mode"] == "local_rewrite"
     assert result["research_state"]["claim_plans"] == state["claim_plans"]
+
+
+def test_legacy_section_failure_without_ccc_rebuilds_claim_authorization():
+    """旧会话缺少 CCC 审计时，章节失败不能继续复用过期授权计划。"""
+    from app.agent.graph import _build_regeneration_recovery_plan
+
+    plan = _build_regeneration_recovery_plan({
+        "conservative_regeneration": True,
+        "validated_routes": [{"route_id": "r1", "paper_ids": ["p1"]}],
+        "claim_plans": [{"route_id": "r1", "claims": []}],
+        "quality_gate": {
+            "blocking_issues": [{"code": "section_generation_failed"}],
+        },
+    })
+
+    assert plan["mode"] == "full_rebuild"
+    assert plan["reuse_routes"] is False
+    assert plan["reuse_claim_plans"] is False
 
 
 def _record_post_writing_chain(monkeypatch) -> list[str]:

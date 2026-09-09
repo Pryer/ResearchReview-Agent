@@ -158,6 +158,26 @@ def claim_evidence_gate_node(state: "ResearchAgentState", llm=None) -> "Research
             state.get("paper_cards") or [],
             llm=llm,
         )
+        if state.get("max_papers_explicit", False):
+            from app.agent.deliverable_router import unconfirmed_reference_ids
+            from app.agent.claim_plan import build_reference_coverage_plan
+
+            # 单篇主张上限可能在门禁中删除旧计划的若干论文；门禁之后再
+            # 补一次覆盖计划，确保引用分配不会看到“写作池有、授权池无”的
+            # 假数量。新增主张仍只来自卡片证据，并随本报告持久化。
+            coverage_plan = build_reference_coverage_plan(
+                state.get("paper_cards") or [],
+                state.get("research_semantic_frame") or {},
+                plans,
+                int(state.get("required_reference_count") or 0),
+                unconfirmed_ids=unconfirmed_reference_ids(state),
+            )
+            if coverage_plan:
+                plans.append(coverage_plan)
+                report["coverage_added"] = len(coverage_plan["claims"])
+                report["retained_claims"] = sum(
+                    len(item.get("claims") or []) for item in plans
+                )
         state["claim_plans"] = plans
         state["claim_evidence_gate"] = report
         append_step(
@@ -387,6 +407,7 @@ def verify_claims_node(
         from app.core.citation_syntax import normalize_citation_syntax
         from app.core.config import get_review_threshold_policy
         from app.tools.verify_claims import verify_review_claims
+        from app.tools.validate_deliverable import validate_final_review_integrity
 
         generated_text = (
             state.get("review")
@@ -408,6 +429,15 @@ def verify_claims_node(
                 state["related_work"] = normalized_text
             elif state.get("introduction"):
                 state["introduction"] = normalized_text
+
+        def _integrity_errors(text: str) -> set[str]:
+            if not state.get("writing_plans"):
+                return set()
+            return set(
+                validate_final_review_integrity(text, state).get("errors") or []
+            )
+
+        current_integrity_errors = _integrity_errors(generated_text)
         dynamic_aliases: dict[str, list[str]] = {}
         for group in state.get("required_concepts") or []:
             chinese = [
@@ -453,34 +483,58 @@ def verify_claims_node(
             match = re.match(r"^c(\d+)", str(claim_id or ""))
             if match:
                 target_sentence_set.add(int(match.group(1)))
-        report = verify_review_claims(
+
+        def _run_verification(
+            text: str,
+            *,
+            previous: dict[str, Any] | None,
+            sentence_targets: list[int] | None,
+            claim_targets: list[str] | None,
+            mode: str | None,
+            base_scope: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            """统一所有初验和修复后复核参数，防止验证契约漂移。"""
+            current_scope = dict(base_scope or {})
+            if mode:
+                current_scope["mode"] = mode
+            else:
+                current_scope.pop("mode", None)
+                current_scope.pop("scope", None)
+            if previous:
+                current_scope["previous_report"] = previous
+            return verify_review_claims(
+                text,
+                state.get("paper_cards") or [],
+                concept_aliases=dynamic_aliases,
+                llm=llm,
+                entailment_cache=entailment_cache,
+                target_sentence_indices=sentence_targets,
+                target_claim_ids=claim_targets,
+                verification_scope=current_scope or None,
+            )
+
+        report = _run_verification(
             generated_text,
-            state.get("paper_cards") or [],
-            concept_aliases=dynamic_aliases,
-            llm=llm,
-            entailment_cache=entailment_cache,
-            target_sentence_indices=target_sentence_indices,
-            target_claim_ids=target_claim_ids,
-            verification_scope=effective_scope or None,
+            previous=previous_report,
+            sentence_targets=effective_sentence_targets,
+            claim_targets=effective_claim_targets,
+            mode=scope_mode,
+            base_scope=scope,
         )
         state["claim_verification_cache"] = entailment_cache
         verification_scope_data = report.get("verification_scope") or {}
         local_verification = verification_scope_data.get("mode") == "local"
         reverify_kwargs = {
-            "target_sentence_indices": effective_sentence_targets,
-            "target_claim_ids": effective_claim_targets,
-            "verification_scope": (
-                {
-                    "mode": "local",
-                    "previous_report": report,
-                }
-                if local_verification else None
-            ),
+            "previous": report,
+            "sentence_targets": effective_sentence_targets,
+            "claim_targets": effective_claim_targets,
+            "mode": "local" if local_verification else None,
         }
         unsupported_before = [
             claim for claim in report.get("claims") or []
             if claim.get("factual")
             and claim.get("support_status") == "unsupported"
+            and claim.get("verification_status", "verified") != "not_completed"
             and (
                 not local_verification
                 or claim.get("claim_id") in set(effective_claim_targets or [])
@@ -503,27 +557,31 @@ def verify_claims_node(
                 generated_text, unsupported_before
             )
             if removed_claims and repaired_text != generated_text:
-                _update_state_review_text(state, repaired_text)
-                generated_text = repaired_text
-                state["claim_repairs"] = {
-                    "strategy": "remove_unsupported_sentences",
-                    "removed_count": len(removed_claims),
-                    "removed_claim_ids": [
-                        str(claim.get("claim_id") or "")
-                        for claim in removed_claims
-                    ],
-                    "removed_samples": [
-                        str(claim.get("sentence") or "")[:180]
-                        for claim in removed_claims[:5]
-                    ],
-                }
-                report = verify_review_claims(
-                    repaired_text,
-                    state.get("paper_cards") or [],
-                    concept_aliases=dynamic_aliases,
-                    entailment_cache=entailment_cache,
-                    **reverify_kwargs,
-                )
+                repaired_integrity_errors = _integrity_errors(repaired_text)
+                if repaired_integrity_errors - current_integrity_errors:
+                    state["claim_repairs"] = {
+                        "strategy": "section_rewrite_required",
+                        "removed_count": 0,
+                        "unsupported_count": len(unsupported_before),
+                        "reason": "删除候选新增正文完整性错误，已保留原稿",
+                    }
+                else:
+                    _update_state_review_text(state, repaired_text)
+                    generated_text = repaired_text
+                    current_integrity_errors = repaired_integrity_errors
+                    state["claim_repairs"] = {
+                        "strategy": "remove_unsupported_sentences",
+                        "removed_count": len(removed_claims),
+                        "removed_claim_ids": [
+                            str(claim.get("claim_id") or "")
+                            for claim in removed_claims
+                        ],
+                        "removed_samples": [
+                            str(claim.get("sentence") or "")[:180]
+                            for claim in removed_claims[:5]
+                        ],
+                    }
+                    report = _run_verification(repaired_text, **reverify_kwargs)
         elif unsupported_before and (state.get("review") or state.get("related_work") or state.get("introduction")):
             repaired_text, rewritten_records = _rewrite_and_weaken_unsupported_claims(
                 generated_text,
@@ -532,22 +590,24 @@ def verify_claims_node(
                 llm=llm,
             )
             if rewritten_records and repaired_text != generated_text:
-                new_report = verify_review_claims(
-                    repaired_text,
-                    state.get("paper_cards") or [],
-                    concept_aliases=dynamic_aliases,
-                    llm=None,
-                    entailment_cache=entailment_cache,
-                    **reverify_kwargs,
-                )
+                # WHY: 修复前后必须使用同一验证契约。中文主张与英文证据
+                # 只靠词面重合会产生系统性假阴性，不能在重写后退回该口径。
+                new_report = _run_verification(repaired_text, **reverify_kwargs)
                 # WHY: 旧条件是 OR，support_rate 只要不低于原值（哪怕零改善）
                 # 就把整批改写落盘；实测 rewritten_count=7 而未支持主张仍是 22，
                 # 支持率反而从 47.1% 掉到 36.1%。改写必须真正减少未支持主张，
                 # 否则不落盘，改由 section_rewrite_required 如实报告缺口。
-                if int(new_report.get("unsupported") or 0) < int(report.get("unsupported") or 0):
+                repaired_integrity_errors = _integrity_errors(repaired_text)
+                if (
+                    int(new_report.get("unsupported") or 0)
+                    < int(report.get("unsupported") or 0)
+                    and not (repaired_integrity_errors - current_integrity_errors)
+                ):
                     generated_text = repaired_text
                     _update_state_review_text(state, repaired_text)
                     report = new_report
+                    current_integrity_errors = repaired_integrity_errors
+                    reverify_kwargs["previous"] = report
 
                     remaining_unsupported = [
                         claim for claim in report.get("claims") or []
@@ -559,13 +619,12 @@ def verify_claims_node(
                             generated_text, remaining_unsupported
                         )
                         if removed_claims and final_text != generated_text:
-                            _update_state_review_text(state, final_text)
-                            generated_text = final_text
-                            report = verify_review_claims(
-                                final_text,
-                                state.get("paper_cards") or [],
-                                concept_aliases=dynamic_aliases,
-                            )
+                            final_integrity_errors = _integrity_errors(final_text)
+                            if not (final_integrity_errors - current_integrity_errors):
+                                _update_state_review_text(state, final_text)
+                                generated_text = final_text
+                                current_integrity_errors = final_integrity_errors
+                                report = _run_verification(final_text, **reverify_kwargs)
 
                     state["claim_repairs"] = {
                         "strategy": "rewrite_and_weaken_unsupported_claims",
@@ -587,7 +646,11 @@ def verify_claims_node(
                         "unsupported_count": len(unsupported_before),
                         "safe_removal_limit": safe_removal_limit,
                         "unsupported_after_rewrite": int(new_report.get("unsupported") or 0),
-                        "reason": "改写未减少未支持主张，且批量删除会破坏段落完整性和最低引用覆盖量",
+                        "reason": (
+                            "改写候选新增正文完整性错误，已保留原稿"
+                            if repaired_integrity_errors - current_integrity_errors
+                            else "改写未减少未支持主张，且批量删除会破坏段落完整性和最低引用覆盖量"
+                        ),
                     }
             else:
                 state["claim_repairs"] = {
@@ -604,6 +667,8 @@ def verify_claims_node(
         }
         support_rate = float(report.get("support_rate") or 0.0)
         unsupported = int(report.get("unsupported") or 0)
+        unverified = int(report.get("unverified") or 0)
+        verified_unsupported = max(0, unsupported - unverified)
 
         paper_cards = state.get("paper_cards") or []
         abstract_or_meta_count = sum(
@@ -617,15 +682,30 @@ def verify_claims_node(
                                     if is_abstract_dominant
                                     else policy.synthesis_fulltext_support_rate)
 
+        quality_passed = bool(
+            unverified == 0
+            and (
+                ((bool(report.get("valid")) or unsupported == 0)
+                 and support_rate >= quality_passed_threshold)
+                or support_rate >= policy.synthesis_fulltext_support_rate
+            )
+        )
         state["generation_quality"] = {
-            "passed": ((bool(report.get("valid")) or unsupported == 0) and support_rate >= quality_passed_threshold) or support_rate >= policy.synthesis_fulltext_support_rate,
+            "passed": quality_passed,
             "support_rate": support_rate,
             "unsupported_claims": unsupported,
+            "verified_unsupported_claims": verified_unsupported,
+            "unverified_claims": unverified,
+            "verification_coverage": float(report.get("verification_coverage") or 0.0),
             "threshold": quality_passed_threshold,
             "reason": (
                 "claim_evidence_check_passed"
-                if (((bool(report.get("valid")) or unsupported == 0) and support_rate >= quality_passed_threshold) or support_rate >= policy.synthesis_fulltext_support_rate)
-                else "unsupported_or_weakly_supported_claims"
+                if quality_passed
+                else (
+                    "claim_verification_incomplete"
+                    if unverified
+                    else "unsupported_or_weakly_supported_claims"
+                )
             ),
         }
         append_step(
@@ -648,6 +728,8 @@ def verify_claims_node(
                         "supported",
                         "partially_supported",
                         "unsupported",
+                        "unverified",
+                        "verification_coverage",
                         "support_rate",
                     )
                 },

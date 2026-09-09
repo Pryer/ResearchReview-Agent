@@ -14,12 +14,14 @@ from app.core.citation_syntax import (
 from app.deliverables.few_shot_blueprints import detect_blueprint_leakage
 from app.deliverables.registry import get_deliverable_spec
 from app.core.geography import has_reliable_geographic_comparison
+from app.core.config import get_review_threshold_policy
 from app.core.text_quality import (
     AGENT_PROCESS_LANGUAGE_RE,
     EDITORIAL_LEAKAGE_RE,
     content_sentences as _content_sentences,
     detect_english_sentences as _english_sentences,
     detect_incomplete_fragments as _incomplete_section_fragments,
+    detect_token_only_fragments,
 )
 from app.schemas.deliverable_schema import (
     CoreDeliverableType,
@@ -67,9 +69,6 @@ def _markdown_headings(text: str) -> list[tuple[int, str]]:
 # 正式研究路线小节（含跨路线比较与研究空白的兼容 ID）；只有这些章节需要
 # 章节级证据密度，概述与结构性章节不设下限。
 _ROUTE_SECTION_IDS = {"cross_route_comparison", "research_gaps"}
-
-# 章节级正文长度下限：低于该值的小节无法承载路线内综合，只能是罗列。
-_MIN_ROUTE_SECTION_PLAIN_CHARS = 80
 
 _EVIDENCE_LIMITED_BODY_RE = re.compile(
     r"当前可访问证据不足|本节仅保留证据边界|无法同时满足主题相关性"
@@ -165,6 +164,7 @@ def _section_evidence_floor_findings(
     }
     citation_map = state.get("citation_map") or {}
     findings: list[dict[str, Any]] = []
+    minimum_plain_chars = get_review_threshold_policy().route_section_min_plain_chars
     for section in sections:
         section_id = str(section.get("id") or "")
         title = str(section.get("title") or "")
@@ -193,7 +193,7 @@ def _section_evidence_floor_findings(
             status = "evidence_limited"
         elif len(effective) < minimum:
             status = "sparse_citations"
-        elif plain_chars < _MIN_ROUTE_SECTION_PLAIN_CHARS:
+        elif plain_chars < minimum_plain_chars:
             status = "short_body"
         else:
             status = "ok"
@@ -204,6 +204,7 @@ def _section_evidence_floor_findings(
             "authorized_paper_count": len(authorized),
             "actual_unique_references": len(effective),
             "plain_char_count": plain_chars,
+            "required_plain_chars": minimum_plain_chars,
             "identifier_space": identifier_space,
             "status": status,
         })
@@ -280,6 +281,21 @@ def validate_final_review_integrity(
     duplicate_sentences = _find_duplicate_sentences(rendered)
     if duplicate_sentences:
         errors.append("最终正文存在重复或高度相似句子")
+    duplicate_section_ids = list(dict.fromkeys(
+        str(section.get("id") or "")
+        for first, duplicate in duplicate_sentences
+        for section in expected_sections
+        for body in [
+            bodies.get(str(section.get("title") or ""))
+            or bodies_by_core.get(
+                _strip_section_ordinal(str(section.get("title") or "")), ""
+            )
+        ]
+        if section.get("id") and (first in body or duplicate in body)
+    ))
+    token_fragments = detect_token_only_fragments(rendered)
+    if token_fragments:
+        errors.append("最终正文包含缺少主体或谓词的词元碎片")
 
     large_review = int(state.get("required_reference_count") or 0) >= 20
     # 未完成章节的检测覆盖全部计划章节（含概述与结构性章节），不受章节级
@@ -324,6 +340,8 @@ def validate_final_review_integrity(
             "incomplete_fragment_count": len(incomplete),
             "abnormal_punctuation_count": len(abnormal),
             "duplicate_sentence_count": len(duplicate_sentences),
+            "duplicate_section_ids": duplicate_section_ids,
+            "token_only_fragment_count": len(token_fragments),
             "evidence_limited_section_count": len(set(evidence_limited)),
             "sparse_theme_section_count": len([
                 item for item in floor_findings
@@ -486,6 +504,24 @@ def validate_deliverable(
     duplicate_sentences = _find_duplicate_sentences(text)
     if duplicate_sentences:
         errors.append("正文存在重复或高度相似句子")
+    section_bodies_for_duplicates = _planned_section_bodies(text)
+    section_bodies_by_core = {
+        _strip_section_ordinal(title): body
+        for title, body in section_bodies_for_duplicates.items()
+    }
+    duplicate_section_ids = list(dict.fromkeys(
+        section.id
+        for first, duplicate in duplicate_sentences
+        for section in plan.sections
+        for body in [
+            section_bodies_for_duplicates.get(section.title)
+            or section_bodies_by_core.get(_strip_section_ordinal(section.title), "")
+        ]
+        if first in body or duplicate in body
+    ))
+    token_fragments = detect_token_only_fragments(text)
+    if token_fragments:
+        errors.append("正文包含缺少主体或谓词的词元碎片")
     blueprint_leakage = detect_blueprint_leakage(text)
     if blueprint_leakage:
         errors.append("正文泄漏了写作少样本的占位内容或示例引用")
@@ -759,6 +795,8 @@ def validate_deliverable(
             "section_count": len(plan.sections),
             "english_sentence_count": len(english_sentences),
             "duplicate_sentence_count": len(duplicate_sentences),
+            "duplicate_section_ids": duplicate_section_ids,
+            "token_only_fragment_count": len(token_fragments),
             "duplicate_claim_ratio": len(duplicate_sentences) / max(1, len(_content_sentences(text))),
             "blueprint_leakage_count": len(blueprint_leakage),
             "blueprint_leakage_samples": blueprint_leakage[:5],

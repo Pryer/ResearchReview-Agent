@@ -47,6 +47,35 @@ User-explicit requirements such as a minimum unique reference count or explicit 
 window are blocking when unmet. Implicit defaults may be non-blocking, but the
 result must remain visibly degraded or best-effort.
 
+Reference-count recovery has one configurable delivery fallback. The system first
+uses the shared recovery budget to try to satisfy the full explicit count. After
+that budget is exhausted, when the *only* remaining hard issue is
+`minimum_cited_references_not_met` and the final-valid/reference target ratio reaches
+`reference_coverage_best_effort_ratio` (default `0.85`), it may release the draft as
+`partial` / `released_best_effort`. The original requested count and blocking issue
+remain in the quality gate and the response includes the exact numerator,
+denominator, ratio, and threshold. Claim support, citation authorization, metadata,
+language, structure, and final-integrity failures are never softened by this ratio.
+Set `enable_reference_coverage_best_effort_release=false` to require the exact count
+for every release.
+
+When the bounded recovery controller exhausts all actions and usable evidence still
+exists, `enable_recovery_exhausted_best_effort_generation=true` permits one final
+generation pass over that evidence. This pass keeps the original constraints and all
+failed gate details, sets the result to `partial` / `released_best_effort`, and adds a
+visible limitation banner. It runs at most once. Runtime errors, stale state, missing
+required user material, authentication requirements, and a complete lack of usable
+evidence remain blocked because no trustworthy draft can be produced from them.
+The public request field `best_effort_on_failure=false` overrides the enabled
+default for callers that require strict blocking. A manual “生成可用草稿” action
+on an existing blocked session is still an explicit per-session authorization.
+
+Focus coverage also records requirement provenance. Only a requirement grounded
+to user-explicit source entities can block formal writing. An LLM-inferred focus is
+reported as `advisory_missing` and remains visible in diagnostics and draft
+limitations. Requirement aliases may help evidence matching, but cannot by
+themselves prove that the user explicitly requested the underlying focus.
+
 The global evidence gate is intentionally measurement/recommendation-only in the
 current version. It does not itself execute recovery; final quality, claim, and
 deliverable checks enforce delivery behavior. This distinction is covered by
@@ -65,10 +94,75 @@ with `generation_readiness.ready=true`, and source-health summaries agree with
 this round's source diagnostics. Blocking violations quarantine the draft before
 writing; source-health disagreements remain explicit warnings.
 
+Regeneration clears writing-derived readiness and section diagnostics before this
+boundary is evaluated, then recomputes them from the current evidence snapshot.
+This prevents an old `ready` value or an old failed section from blocking an
+otherwise valid retry. Internal state conflicts remain blocking even when the user
+has enabled best-effort generation; an empty result is reported as a
+pre-generation block. The best-effort strategy marker is excluded from recovery
+failure classification, so a later conservative rewrite can target the actual
+section or claim failure.
+
 Incremental regeneration also persists `recovery_statistics`, including reused
 and recomputed claim counts and observed LLM calls. These counters are
 observability data only: they do not weaken claim, citation, or final-integrity
 gates.
+
+Citation-gap repair uses an authorization-safe acceptance rule. It records the
+claim-citation mismatch count before and after repair and rejects a candidate that
+adds unauthorized mismatches, even when its raw cited-paper count is higher. The
+section writer maps evidence IDs found in either `evidence_spans` or structured
+`claims` to the owning paper ID before citation validation; unknown IDs remain
+invalid.
+
+Generation readiness records seven distinct reference counts: raw candidates,
+confirmed in-scope papers, evidence-backed papers, claim-authorized papers,
+writing-plan coverage, actual citations, and final valid citations. A paper-card
+count is never used as a substitute for claim authorization. If the evidence-backed pool can meet the
+request but the authorized union cannot, `minimum_planned_references_not_met`
+blocks the writer and triggers claim-plan rebuilding. The coverage builder computes
+the shortfall only from the current eligible set, so stale out-of-scope or
+unconfirmed claims cannot consume the target.
+
+All route and writing recovery actions consume `recovery_total_action_budget`.
+The deterministic controller classifies internal-state, structure, reference,
+claim/citation, section, metadata, and user-input failures; it then chooses state
+recomputation, structure or claim rebuilding, citation reallocation, local section
+rewriting, or in-scope targeted retrieval. An action that makes no component of the
+quality vector improve is not repeated for the same evidence/scope fingerprint.
+User input is requested only when access/material is missing or continuing requires
+changing a user constraint such as the existing-evidence-only policy.
+
+Candidate adoption compares every quality-vector component independently. A lower
+reference shortfall cannot compensate for more unsupported claims, citation
+mismatches, missing sections, metadata failures, or new hard issue codes. Failed
+candidates leave the prior text, plans, mappings, and verification report intact.
+Budget exhaustion returns a concrete remaining-issue report and preserves any real
+section checkpoints or quarantined draft; it does not show another generic retry
+menu.
+
+Claim support and verification completion are separate gate dimensions. Each claim
+records `support_status`, `verification_status`, and `verification_method`; reports
+also expose `unverified` and `verification_coverage`. A missing semantic result stays
+conservatively unsupported, but is blocked as `claim_verification_incomplete` rather
+than reported as proven evidence insufficiency. Recovery keeps the current draft and
+retries only the semantic verification chain once for the same input fingerprint;
+it does not search for papers or regenerate the document. The progress vector keeps
+unverified claims as an independent component, so relabelling an unsupported claim
+as unverified cannot count as improvement.
+
+Semantic cache keys cover claim text, cited paper identities, evidence text and
+location, evidence access level, verifier version, and threshold policy. Local
+revalidation reuses unchanged sentences by exact content including citations, so a
+sentence insertion or deletion cannot attach an old verdict to a different sentence
+number. Legacy reports without the verification contract are fully revalidated.
+
+Section candidates are promotable checkpoints only after their local writer checks,
+configured route density floor, and cross-sentence duplicate checks pass. The route
+body default is controlled by `route_section_min_plain_chars`; it is a compatibility
+default rather than evidence that every domain or deliverable is sufficiently
+covered. Metadata-only title entries, token-only metric fragments, and generic
+citation placeholders do not count as body evidence.
 
 ## Screening Confirmation Boundary
 
@@ -90,4 +184,5 @@ Focused behavior is covered by tests/test_unsupported_task_guard.py,
 tests/test_route_validator.py, tests/test_route_targets.py,
 tests/test_route_recovery_gold.py, tests/test_evidence_recovery.py,
 tests/test_global_evidence_gate.py, tests/test_generation_quality_gate.py,
-tests/test_verify_claims.py, and tests/test_deliverables.py.
+tests/test_verify_claims.py, tests/test_deliverables.py, and
+tests/test_generation_recovery.py.

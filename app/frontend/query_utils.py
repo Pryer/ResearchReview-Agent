@@ -27,6 +27,7 @@ def build_agent_request_payload(
     session_id: str | None = None,
     *,
     clarification_answer: str | None = None,
+    best_effort_on_failure: bool | None = None,
 ) -> dict:
     """构造异步 Agent 请求；澄清回答不得被包装成新的综述主题。"""
     is_clarification = bool(str(clarification_answer or "").strip())
@@ -40,4 +41,6 @@ def build_agent_request_payload(
     }
     if is_clarification:
         payload["clarification_answer"] = str(clarification_answer).strip()
+    if best_effort_on_failure is not None:
+        payload["best_effort_on_failure"] = best_effort_on_failure
     return payload

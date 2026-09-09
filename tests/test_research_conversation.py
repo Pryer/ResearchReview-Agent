@@ -676,6 +676,7 @@ def _quality_blocked_result(required: int = 3, available: int = 2) -> dict:
         "required_reference_count": required,
         "max_papers": required,
         "max_papers_explicit": True,
+        "allow_evidence_expansion": False,
         "generation_limit": required * 2,
         "paper_details": cards,
         "paper_cards": cards,
@@ -936,6 +937,52 @@ def test_force_generate_keeps_original_reference_requirement(monkeypatch):
     assert "minimum_cited_references_not_met" in codes
 
 
+def test_conservative_rewrite_clears_previous_best_effort_release(monkeypatch):
+    """从最佳草稿回到保守重写时，必须重新启用严格门禁。"""
+    db = _db_session()
+    regenerated = []
+    blocked = _post_generation_citation_shortfall(required=3, actual=2)
+    blocked["research_state"]["best_effort_generation"] = True
+    blocked["research_state"]["automatic_best_effort_generation"] = True
+    blocked["research_state"]["allow_unvalidated_taxonomy"] = True
+    blocked["research_state"]["forced_generation_issues"] = [{"code": "taxonomy_not_ready"}]
+    blocked["quality_gate"]["blocking_issues"].append({
+        "code": "user_accepted_best_effort_generation",
+    })
+
+    def fake_regenerate(editable, **kwargs):
+        regenerated.append(editable)
+        return {
+            "answer": "严格边界重写结果",
+            "intent": "generate_introduction",
+            "topic": "课堂行为分析",
+            "quality_gate": {"passed": True, "phase": "post_generation"},
+            "steps": [], "references": [], "paper_cards": editable["paper_cards"],
+            "clusters": [], "errors": [], "research_state": editable,
+        }
+
+    monkeypatch.setattr("app.agent.graph.regenerate_research_agent", fake_regenerate)
+    service = ResearchConversationService(
+        db, llm=ClearTopicLLM(), agent_runner=lambda *args, **kwargs: {}
+    )
+    service._persist_or_pause_result(
+        "strict-after-best-effort", "生成课堂行为分析研究背景，引用不少于3篇", {}, blocked
+    )
+    result = service.handle(AgentRequest(
+        user_query="保守重写",
+        session_id="strict-after-best-effort",
+        clarification_answer="保守重写",
+    ))
+
+    assert len(regenerated) == 1
+    assert regenerated[0]["conservative_regeneration"] is True
+    assert regenerated[0]["best_effort_generation"] is False
+    assert regenerated[0]["automatic_best_effort_generation"] is False
+    assert regenerated[0]["allow_unvalidated_taxonomy"] is False
+    assert "forced_generation_issues" not in regenerated[0]
+    assert result["status"] == "completed"
+
+
 def test_quality_decision_answers_map_to_intended_actions():
     """系统提供的每种答复都必须落到语义相符的分支。"""
     post_generation = {
@@ -1045,11 +1092,12 @@ def test_every_clarification_option_label_is_parsable():
             assert decision is not None, f"问句选项无法解析：{label}"
             assert decision["action"] == action, f"{label} → {decision}"
             checked += 1
-    # 五个问句分支共出现 19 次选项；数量骤降说明问句不再复用共享词表。
-    assert checked >= 15, checked
+    # 篇数与分类分支仍复用共享词表；缺少可编辑检查点的两个兜底分支只说明
+    # 恢复前提，不再向用户展示无法推动任务的重写/补检索选项。
+    assert checked >= 14, checked
 
 
-def test_direct_generation_bypasses_taxonomy_gate_without_restarting_search(monkeypatch):
+def test_taxonomy_failure_recovers_without_user_decision(monkeypatch):
     db = _db_session()
     runner_calls = []
     regenerated = []
@@ -1094,24 +1142,93 @@ def test_direct_generation_bypasses_taxonomy_gate_without_restarting_search(monk
 
     monkeypatch.setattr("app.agent.graph.regenerate_research_agent", fake_regenerate)
     service = ResearchConversationService(db, llm=ClearTopicLLM(), agent_runner=fake_runner)
-    service.handle(AgentRequest(
+    result = service.handle(AgentRequest(
         user_query="生成课堂行为分析研究背景和研究现状，引用不少于3篇",
         session_id="direct-generate",
-    ))
-    result = service.handle(AgentRequest(
-        user_query="直接生成",
-        session_id="direct-generate",
-        clarification_answer="直接生成",
     ))
 
     assert result["status"] == "partial"
     assert len(runner_calls) == 1
     assert len(regenerated) == 1
+    assert regenerated[0]["force_taxonomy_remediation"] is True
+    assert regenerated[0]["best_effort_generation"] is False
+
+
+def test_exhausted_shared_recovery_budget_runs_final_best_effort(monkeypatch):
+    from types import SimpleNamespace
+
+    db = _db_session()
+    regenerated = []
+
+    def fake_regenerate(editable, **kwargs):
+        regenerated.append(editable)
+        return {
+            "answer": "> 质量门禁提示\n\n## 研究现状\n\n最佳可用草稿",
+            "intent": "generate_review",
+            "topic": "课堂行为分析",
+            "quality_gate": {
+                "passed": False,
+                "draft_available": True,
+                "draft_released": True,
+                "draft_disposition": "released_best_effort",
+                "partial_success": True,
+                "phase": "post_generation",
+                "blocking_issues": [{
+                    "code": "recovery_exhausted_best_effort_generation",
+                    "message": "部分研究重点仍未完全达标",
+                }],
+            },
+            "steps": [], "references": [],
+            "paper_cards": editable["paper_cards"], "clusters": [], "errors": [],
+            "research_state": editable,
+        }
+
+    monkeypatch.setattr(
+        "app.core.config.get_settings",
+        lambda: SimpleNamespace(
+            recovery_total_action_budget=6,
+            enable_recovery_exhausted_best_effort_generation=True,
+        ),
+    )
+    monkeypatch.setattr("app.agent.graph.regenerate_research_agent", fake_regenerate)
+    service = ResearchConversationService(
+        db, llm=ClearTopicLLM(), agent_runner=lambda *args, **kwargs: {}
+    )
+    blocked = _quality_blocked_result(required=3, available=3)
+    blocked["quality_gate"] = {
+        "passed": False,
+        "phase": "pre_generation",
+        "blocking_issues": [{"code": "taxonomy_not_ready", "message": "分类仍未通过"}],
+        "recovery_options": ["继续检索"],
+    }
+    blocked["research_state"]["recovery_action_count"] = 6
+    for card in blocked["paper_cards"]:
+        card["abstract"] = "该研究基于课堂观察证据分析师生互动行为。"
+    blocked["research_state"]["paper_cards"] = blocked["paper_cards"]
+    blocked["research_state"]["paper_details"] = blocked["paper_cards"]
+
+    result = service._persist_or_pause_result(
+        "recovery-limit", "生成研究现状", {}, blocked
+    )
+
+    assert result["status"] == "partial"
+    assert len(regenerated) == 1
+    assert regenerated[0]["automatic_best_effort_attempted"] is True
+    assert regenerated[0]["automatic_best_effort_generation"] is True
     assert regenerated[0]["best_effort_generation"] is True
     assert regenerated[0]["allow_unvalidated_taxonomy"] is True
 
 
-def test_third_failed_recovery_offers_only_direct_generation_or_stop():
+def test_exhausted_best_effort_generation_can_be_disabled(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "app.core.config.get_settings",
+        lambda: SimpleNamespace(
+            recovery_total_action_budget=6,
+            enable_recovery_exhausted_best_effort_generation=False,
+        ),
+    )
     db = _db_session()
     service = ResearchConversationService(
         db, llm=ClearTopicLLM(), agent_runner=lambda *args, **kwargs: {}
@@ -1123,17 +1240,163 @@ def test_third_failed_recovery_offers_only_direct_generation_or_stop():
         "blocking_issues": [{"code": "taxonomy_not_ready", "message": "分类仍未通过"}],
         "recovery_options": ["继续检索"],
     }
-    blocked["research_state"]["quality_recovery_attempts"] = 3
+    blocked["research_state"]["recovery_action_count"] = 6
 
     result = service._persist_or_pause_result(
-        "recovery-limit", "生成研究现状", {}, blocked
+        "recovery-limit-disabled", "生成研究现状", {}, blocked
     )
 
-    assert result["status"] == "needs_clarification"
-    assert "连续尝试3次" in result["answer"]
-    assert result["clarification"]["recovery_options"] == [
-        "直接生成当前最佳可用草稿", "结束任务"
-    ]
+    assert result["status"] == "blocked"
+    assert "任务级预算上限" in result["answer"]
+
+
+def test_request_strict_policy_overrides_enabled_best_effort_default(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "app.core.config.get_settings",
+        lambda: SimpleNamespace(
+            recovery_total_action_budget=6,
+            enable_recovery_exhausted_best_effort_generation=True,
+        ),
+    )
+    db = _db_session()
+    service = ResearchConversationService(
+        db, llm=ClearTopicLLM(), agent_runner=lambda *args, **kwargs: {}
+    )
+    blocked = _quality_blocked_result(required=3, available=3)
+    blocked["quality_gate"] = {
+        "passed": False,
+        "phase": "pre_generation",
+        "blocking_issues": [{"code": "taxonomy_not_ready", "message": "分类仍未通过"}],
+        "recovery_options": [],
+    }
+    blocked["research_state"].update({
+        "recovery_action_count": 6,
+        "best_effort_on_failure": False,
+    })
+
+    result = service._persist_or_pause_result(
+        "recovery-limit-strict", "生成研究现状", {}, blocked
+    )
+
+    assert result["status"] == "blocked"
+    assert result["research_state"]["best_effort_on_failure"] is False
+
+
+def test_exhausted_best_effort_generation_runs_at_most_once(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "app.core.config.get_settings",
+        lambda: SimpleNamespace(
+            recovery_total_action_budget=6,
+            enable_recovery_exhausted_best_effort_generation=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.agent.graph.regenerate_research_agent",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("最终最佳草稿不得重复生成")
+        ),
+    )
+    db = _db_session()
+    service = ResearchConversationService(
+        db, llm=ClearTopicLLM(), agent_runner=lambda *args, **kwargs: {}
+    )
+    blocked = _quality_blocked_result(required=3, available=3)
+    blocked["research_state"].update({
+        "recovery_action_count": 6,
+        "automatic_best_effort_attempted": True,
+    })
+    blocked["quality_gate"] = {
+        "passed": False,
+        "phase": "pre_generation",
+        "blocking_issues": [{"code": "taxonomy_not_ready", "message": "分类仍未通过"}],
+        "recovery_options": [],
+    }
+
+    result = service._persist_or_pause_result(
+        "recovery-limit-once", "生成研究现状", {}, blocked
+    )
+
+    assert result["status"] == "blocked"
+    assert "任务级预算上限" in result["answer"]
+
+
+def test_generation_runtime_error_does_not_enter_quality_recovery():
+    result = {
+        "quality_gate": {
+            "passed": False,
+            "phase": "post_generation",
+            "draft_released": False,
+            "blocking_issues": [{
+                "code": "deliverable_generation_failed",
+                "message": "正文生成过程出现运行时错误",
+            }],
+        },
+    }
+
+    clarification = ResearchConversationService._quality_clarification(result)
+
+    assert clarification is None
+
+
+def test_blocked_session_can_generate_best_effort_draft_without_new_search(monkeypatch):
+    db = _db_session()
+    blocked = _quality_blocked_result(required=3, available=3)
+    for card in blocked["paper_cards"]:
+        card["abstract"] = "该研究分析课堂互动编码。"
+    saved_state = {
+        "editable_research_state": blocked["research_state"],
+        "result_snapshot": {
+            key: value for key, value in blocked.items()
+            if key not in {"research_state", "session_id"}
+        },
+        "conversation_history": [],
+    }
+    saved_state["editable_research_state"]["paper_cards"] = blocked["paper_cards"]
+    saved_state["editable_research_state"]["paper_details"] = blocked["paper_cards"]
+    repo = ResearchSessionRepository(db)
+    repo.save(
+        session_id="blocked-best-effort",
+        status="blocked",
+        original_query="生成课堂行为分析研究现状，引用不少于3篇",
+        state=saved_state,
+    )
+    db.commit()
+    regenerated = []
+
+    def fake_regenerate(editable, **kwargs):
+        regenerated.append(editable)
+        return {
+            "answer": "> 质量门禁提示\n\n## 研究现状\n\n可用草稿",
+            "intent": "generate_review", "topic": "课堂行为分析",
+            "quality_gate": {
+                "passed": False, "draft_available": True,
+                "draft_released": True, "draft_disposition": "released_best_effort",
+                "partial_success": True, "phase": "post_generation",
+                "blocking_issues": [{"code": "user_accepted_best_effort_generation"}],
+            },
+            "steps": [], "references": [], "paper_cards": editable["paper_cards"],
+            "clusters": [], "errors": [], "research_state": editable,
+        }
+
+    monkeypatch.setattr("app.agent.graph.regenerate_research_agent", fake_regenerate)
+    service = ResearchConversationService(
+        db, llm=ClearTopicLLM(), agent_runner=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("blocked 草稿动作不得重新开始检索")
+        ),
+    )
+
+    result = service.handle(AgentRequest(
+        user_query="生成可用草稿",
+        session_id="blocked-best-effort",
+    ))
+
+    assert result["status"] == "partial"
+    assert len(regenerated) == 1
+    assert regenerated[0]["best_effort_generation"] is True
 
 
 def test_quality_resume_migrates_old_strict_frame_for_open_method_alternatives():
@@ -1192,7 +1455,7 @@ def test_quality_resume_migrates_old_strict_frame_for_open_method_alternatives()
     assert analytical[0]["selection_mode"] == "open_any"
 
 
-def test_post_generation_retry_uses_existing_evidence_pool_before_research(monkeypatch):
+def test_post_generation_failure_uses_existing_evidence_before_search(monkeypatch):
     db = _db_session()
     regenerated = []
 
@@ -1221,17 +1484,175 @@ def test_post_generation_retry_uses_existing_evidence_pool_before_research(monke
         }],
         "recovery_options": ["基于现有证据重写"],
     }
-    service._persist_or_pause_result("reuse-evidence", "原始请求", {}, blocked)
-
-    result = service.handle(AgentRequest(
-        user_query="保持条件继续检索",
-        session_id="reuse-evidence",
-        clarification_answer="保持条件继续检索",
-    ))
+    result = service._persist_or_pause_result(
+        "reuse-evidence", "原始请求", {}, blocked
+    )
 
     assert result["status"] == "completed"
     assert len(regenerated) == 1
     assert regenerated[0]["conservative_regeneration"] is True
+    assert regenerated[0]["force_claim_plan_rebuild"] is True
+
+
+def test_post_generation_citation_gap_auto_recovers_when_pool_is_sufficient(monkeypatch):
+    """证据池已满足显式篇数时，首次失败应自动保守重写而非追问用户。"""
+    db = _db_session()
+    regenerated = []
+
+    def fake_regenerate(editable, **kwargs):
+        regenerated.append(editable)
+        return {
+            "answer": "## 研究背景\n\n已按授权证据完成重写",
+            "intent": "generate_review",
+            "topic": "课堂行为分析",
+            "body": "## 研究背景\n\n已按授权证据完成重写",
+            "quality_gate": {"passed": True, "phase": "post_generation"},
+            "steps": [], "references": [], "paper_cards": editable["paper_cards"],
+            "clusters": [], "errors": [], "research_state": editable,
+        }
+
+    monkeypatch.setattr("app.agent.graph.regenerate_research_agent", fake_regenerate)
+    service = ResearchConversationService(
+        db, llm=ClearTopicLLM(), agent_runner=lambda *args, **kwargs: {}
+    )
+    blocked = _quality_blocked_result(required=3, available=4)
+    # 隔离态响应会隐藏正文；draft_available 和章节验证仍证明写作已发生。
+    blocked["draft_available"] = True
+    blocked["deliverable_validation"] = [{"valid": True}]
+    blocked["quality_gate"] = {
+        "passed": False,
+        "phase": "post_generation",
+        "blocking_issues": [{
+            "code": "minimum_cited_references_not_met",
+            "message": "正文只引用2篇",
+            "requested": 3,
+            "actual": 2,
+        }],
+    }
+
+    result = service._persist_or_pause_result(
+        "auto-recover-citation-gap", "原始请求", {}, blocked
+    )
+
+    assert result["status"] == "completed"
+    assert len(regenerated) == 1
+    assert regenerated[0]["conservative_regeneration"] is True
+    assert regenerated[0]["quality_recovery_attempts"] == 1
+    saved = ResearchSessionRepository(db).get("auto-recover-citation-gap")
+    assert saved["state"]["editable_research_state"]["quality_recovery_attempts"] == 1
+    progress = [
+        item for item in saved["state"]["conversation_history"]
+        if item.get("type") == "quality_recovery_progress"
+    ]
+    assert len(progress) == 1
+
+
+def test_quality_recovery_migrates_public_generation_products_into_legacy_private_state(monkeypatch):
+    db = _db_session()
+    regenerated = []
+
+    def fake_regenerate(editable, **kwargs):
+        regenerated.append(editable)
+        return {
+            "answer": "恢复完成", "body": "恢复完成",
+            "intent": "generate_review", "topic": "课堂行为分析",
+            "quality_gate": {"passed": True, "phase": "post_generation"},
+            "steps": [], "references": editable["references"],
+            "paper_cards": editable["paper_cards"], "clusters": [], "errors": [],
+            "research_state": editable,
+        }
+
+    monkeypatch.setattr("app.agent.graph.regenerate_research_agent", fake_regenerate)
+    service = ResearchConversationService(
+        db, llm=ClearTopicLLM(), agent_runner=lambda *args, **kwargs: {}
+    )
+    blocked = _quality_blocked_result(required=3, available=4)
+    blocked["references"] = ["旧引用一", "旧引用二"]
+    blocked["citation_map"] = {"p1": 1, "p2": 2}
+    blocked["claim_verification"] = {"unsupported": 2}
+    blocked["unique_valid_cited_paper_count"] = 2
+    blocked["reference_coverage_stats"] = {
+        "actual_cited": 2, "final_valid": 2, "claim_authorized": 4,
+    }
+    blocked["research_state"].pop("references", None)
+    blocked["research_state"].pop("claim_verification", None)
+
+    result = service._persist_or_pause_result(
+        "migrate-public-products", "原始请求", {}, blocked
+    )
+
+    assert result["status"] == "completed"
+    assert regenerated[0]["references"] == ["旧引用一", "旧引用二"]
+    assert regenerated[0]["citation_map"] == {"p1": 1, "p2": 2}
+    assert regenerated[0]["claim_verification"] == {"unsupported": 2}
+    assert regenerated[0]["unique_valid_cited_paper_count"] == 2
+
+
+def test_quality_recovery_derives_legacy_counts_from_coverage_stats(monkeypatch):
+    db = _db_session()
+    regenerated = []
+
+    def fake_regenerate(editable, **kwargs):
+        regenerated.append(editable)
+        return {
+            "answer": "恢复完成", "body": "恢复完成",
+            "intent": "generate_review", "topic": "课堂行为分析",
+            "quality_gate": {"passed": True, "phase": "post_generation"},
+            "steps": [], "references": [], "paper_cards": editable["paper_cards"],
+            "clusters": [], "errors": [], "research_state": editable,
+        }
+
+    monkeypatch.setattr("app.agent.graph.regenerate_research_agent", fake_regenerate)
+    service = ResearchConversationService(
+        db, llm=ClearTopicLLM(), agent_runner=lambda *args, **kwargs: {}
+    )
+    blocked = _quality_blocked_result(required=3, available=4)
+    blocked["reference_coverage_stats"] = {
+        "actual_cited": 3, "final_valid": 2, "claim_authorized": 4,
+    }
+    blocked.pop("unique_cited_paper_count", None)
+    blocked.pop("unique_valid_cited_paper_count", None)
+
+    service._persist_or_pause_result("derive-legacy-counts", "原始请求", {}, blocked)
+
+    assert regenerated[0]["unique_cited_paper_count"] == 3
+    assert regenerated[0]["unique_valid_cited_paper_count"] == 2
+
+
+def test_claim_failure_sets_force_section_rewrite(monkeypatch):
+    db = _db_session()
+    regenerated = []
+
+    def fake_regenerate(editable, **kwargs):
+        regenerated.append(editable)
+        return {
+            "answer": "恢复完成", "body": "恢复完成",
+            "intent": "generate_review", "topic": "课堂行为分析",
+            "quality_gate": {"passed": True, "phase": "post_generation"},
+            "steps": [], "references": [], "paper_cards": editable["paper_cards"],
+            "clusters": [], "errors": [], "research_state": editable,
+        }
+
+    monkeypatch.setattr("app.agent.graph.regenerate_research_agent", fake_regenerate)
+    service = ResearchConversationService(
+        db, llm=ClearTopicLLM(), agent_runner=lambda *args, **kwargs: {}
+    )
+    blocked = _quality_blocked_result(required=0, available=3)
+    blocked["quality_gate"] = {
+        "passed": False,
+        "phase": "post_generation",
+        "blocking_issues": [{
+            "code": "claim_evidence_quality_not_met",
+            "message": "仍有未支持主张",
+        }],
+    }
+
+    result = service._persist_or_pause_result(
+        "force-section-rewrite", "原始请求", {}, blocked
+    )
+
+    assert result["status"] == "completed"
+    assert regenerated[0]["force_section_rewrite"] is True
 
 
 def test_released_best_effort_draft_is_persisted_with_partial_status():
@@ -1268,8 +1689,8 @@ def test_released_best_effort_draft_is_persisted_with_partial_status():
     assert ResearchSessionRepository(db).get("partial-result")["status"] == "partial"
 
 
-def test_unauthorized_failed_draft_enters_quality_decision_instead_of_partial():
-    """未获授权的失败草稿必须进入质量决策，不能作为 partial 终态直接返回。"""
+def test_unauthorized_failed_draft_is_blocked_instead_of_partial_when_budget_exhausted():
+    """未获授权草稿在无法继续恢复时必须隔离，不能作为 partial 正文返回。"""
     db = _db_session()
     service = ResearchConversationService(
         db,
@@ -1277,6 +1698,7 @@ def test_unauthorized_failed_draft_enters_quality_decision_instead_of_partial():
         agent_runner=lambda *args, **kwargs: {},
     )
     result = _quality_blocked_result(required=3, available=3)
+    result["research_state"]["recovery_action_count"] = 6
     result["answer"] = "## 研究背景\n\nQUARANTINE_SENTINEL 未经验证的正文"
     result["quality_gate"] = {
         "passed": False,
@@ -1299,6 +1721,6 @@ def test_unauthorized_failed_draft_enters_quality_decision_instead_of_partial():
         result,
     )
 
-    assert persisted["status"] == "needs_clarification"
+    assert persisted["status"] == "blocked"
     assert "QUARANTINE_SENTINEL" not in persisted["answer"]
-    assert ResearchSessionRepository(db).get("quarantined-result")["status"] == "needs_clarification"
+    assert ResearchSessionRepository(db).get("quarantined-result")["status"] == "blocked"

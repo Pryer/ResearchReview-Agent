@@ -90,6 +90,30 @@ def test_recognition_output_does_not_count_as_structured_behavior_coding():
     assert "recognition" not in coverage["matched_paper_ids"][coding_id]
 
 
+def test_inferred_evidence_requirement_is_diagnostic_not_a_hard_gate():
+    frame = {
+        "evidence_requirements": [{
+            "requirement_id": "interpretation:recommended",
+            "label": "系统建议的解释维度",
+            "evidence_role": "interpretation",
+            "aliases": ["不存在的证据别名"],
+            "source_ids": ["recommended_target"],
+            "explicit": False,
+            "inferred": True,
+            "source": "llm_inference",
+        }],
+    }
+
+    coverage = evidence_coverage(frame, [_card("p1", "其他可靠研究")])
+
+    assert coverage["ready"] is True
+    assert coverage["missing_focuses"] == []
+    assert coverage["advisory_missing_focuses"] == ["系统建议的解释维度"]
+    diagnostic = coverage["requirement_diagnostics"][0]
+    assert diagnostic["required_for_gate"] is False
+    assert diagnostic["status"] == "advisory_missing"
+
+
 def test_perception_stage_uses_explicit_research_object_as_dynamic_alias():
     frame = _frame()
     paper = _card(
@@ -341,6 +365,31 @@ def test_temporal_requirement_reports_missing_when_window_uncovered():
 
     assert coverage["ready"] is False
     assert coverage["missing_focuses"] == ["近五年文献证据"]
+
+
+def test_evidence_coverage_reports_requirement_provenance_and_counts():
+    frame = {"evidence_requirements": [{
+        "requirement_id": "interaction:coding",
+        "label": "教学互动编码",
+        "evidence_role": "analytical_method",
+        "aliases": ["教学互动编码"],
+        "minimum_direct_sources": 2,
+        "explicit": True,
+        "inferred": False,
+        "source": "user_explicit",
+    }]}
+
+    coverage = evidence_coverage(
+        frame,
+        [{"paper_id": "p1", "title": "教学互动编码研究"}],
+    )
+
+    diagnostic = coverage["requirement_diagnostics"][0]
+    assert diagnostic["source"] == "user_explicit"
+    assert diagnostic["explicit"] is True
+    assert diagnostic["actual_direct_sources"] == 1
+    assert diagnostic["minimum_direct_sources"] == 2
+    assert diagnostic["status"] == "missing"
 
 
 def _paper(paper_id: str, text: str, year: int = 2025) -> dict:

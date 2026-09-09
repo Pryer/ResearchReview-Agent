@@ -712,6 +712,11 @@ def go_next_page(driver: webdriver.Chrome) -> bool:
                 time.sleep(STALE_RETRY_DELAY_SECONDS)
             except TimeoutException:
                 break
+            except AttributeError:
+                # 测试替身或已失效的驱动可能没有 Selenium 的查找接口；
+                # 已采集的结果页记录仍然有效，此处只停止继续翻页。
+                logger.debug("CNKI driver cannot paginate; keeping collected records")
+                return False
     return False
 
 

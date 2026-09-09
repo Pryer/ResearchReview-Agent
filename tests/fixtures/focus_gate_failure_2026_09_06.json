@@ -1,0 +1,31 @@
+{
+  "captured_at": "2026-09-06T23:46:36+08:00",
+  "request_summary": "近三年课堂行为分析；教育技术视角的教学互动行为编码与分析；研究背景和研究现状；不少于40篇",
+  "coverage": {
+    "paper_cards": 97,
+    "usable_references": 82,
+    "claim_authorized": 40,
+    "planned": 40,
+    "counts": {
+      "object:classroom_behavior": 27,
+      "object:teaching_interaction": 2,
+      "object:teacher_student_interaction": 16,
+      "object:teacher_student_behavior": 1,
+      "object:teaching_strategy_effectiveness": 0,
+      "method:observation_scales": 0,
+      "method:coding_systems": 0,
+      "method:qualitative_analysis": 1,
+      "target:teaching_improvement": 3,
+      "target:theoretical_framework": 0
+    },
+    "minimum_direct_sources": 1
+  },
+  "missing_requirement_ids": [
+    "object:teaching_strategy_effectiveness",
+    "method:observation_scales",
+    "method:coding_systems",
+    "target:theoretical_framework"
+  ],
+  "root_cause": "The legacy frame omitted requirement provenance and model-generated generic aliases could incorrectly ground invented entities as user-explicit.",
+  "expected_behavior": "Only source entities grounded by their own surface or label may create a hard focus requirement; inferred focuses remain advisory."
+}

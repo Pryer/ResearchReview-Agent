@@ -96,7 +96,12 @@ def _ground_items(
         surface_grounded, matched_text = _item_grounding_match(
             item,
             user_query,
-            evidence_aliases.get(item.id, []),
+            # WHY: evidence requirement aliases also originate from the model.
+            # They may contain a generic query word such as“教学”or“分析”，
+            # and therefore cannot independently prove that the user explicitly
+            # requested an entity. Explicit items must match their own surface/label;
+            # dynamic aliases remain available for already-declared inferred items.
+            [] if explicit else evidence_aliases.get(item.id, []),
         )
 
         if explicit and not surface_grounded:

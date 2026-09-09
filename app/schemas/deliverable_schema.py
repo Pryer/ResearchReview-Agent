@@ -110,6 +110,9 @@ class GenerationReadinessResult(BaseModel):
     ready: bool = True
     requested_minimum_references: int = 0
     usable_reference_count: int = 0
+    authorized_reference_count: int = 0
+    planned_reference_count: int = 0
+    reference_coverage_stats: dict[str, int] = Field(default_factory=dict)
     blocking_issues: list[dict[str, Any]] = Field(default_factory=list)
     recovery_options: list[str] = Field(default_factory=list)
 

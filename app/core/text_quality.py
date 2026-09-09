@@ -128,6 +128,28 @@ def detect_incomplete_fragments(text: str) -> list[str]:
     return fragments
 
 
+def detect_token_only_fragments(text: str) -> list[str]:
+    """检测被错误拼成正文句的指标、模型或字段词元。"""
+    fragments: list[str] = []
+    for sentence in content_sentences(text):
+        without_citations = re.sub(
+            r"\[[^\]\n]+\]|〔[^〕\n]+〕|【[^】\n]+】", "", sentence
+        )
+        latin_words = re.findall(r"[A-Za-z]+(?:[-'][A-Za-z]+)?", without_citations)
+        cleaned = re.sub(r"[。！？.!?；;，,：:\s]+", "", without_citations).strip()
+        cjk_count = len(re.findall(r"[\u4e00-\u9fff]", cleaned))
+        # 完整中文句中允许出现 F1、mAP、模型名；仅由短拉丁/数字/符号串
+        # 构成的独立内容没有主体和谓词，不能作为学术主张。
+        if (
+            cjk_count == 0
+            and len(latin_words) <= 4
+            and 4 <= len(cleaned) <= 80
+            and re.fullmatch(r"[A-Za-z0-9_+/%-]+", cleaned)
+        ):
+            fragments.append(sentence)
+    return fragments
+
+
 def strip_evidence_meta_language(review: str) -> str:
     """最多保留一次证据边界元评价，删除后续重复套话。"""
     if not review:
@@ -164,6 +186,7 @@ __all__ = (
     "content_sentences",
     "detect_english_sentences",
     "detect_incomplete_fragments",
+    "detect_token_only_fragments",
     "strip_evidence_meta_language",
     "_AGENT_PROCESS_LANGUAGE_RE",
     "_EDITORIAL_LEAKAGE_RE",

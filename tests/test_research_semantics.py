@@ -47,6 +47,42 @@ def _target() -> SemanticItem:
     )
 
 
+def test_requirement_provenance_is_derived_from_grounded_source_entities():
+    frame = ResearchSemanticFrame(
+        canonical_topic="研究主题",
+        methods=[ResearchMethod(
+            id="explicit_method", label="编码方法", surface_text="编码方法",
+            explicit=True, source="user_explicit", confidence=0.9,
+            category="technical",
+        )],
+        analysis_targets=[SemanticItem(
+            id="suggested_target", label="理论解释", explicit=False,
+            inferred=True, source="llm_inference", inference_basis="领域常见维度",
+            confidence=0.8,
+        )],
+        evidence_requirements=[
+            EvidenceRequirement(
+                requirement_id="method:explicit", label="编码方法证据",
+                evidence_role="structured_coding", source_ids=["explicit_method"],
+            ),
+            EvidenceRequirement(
+                requirement_id="target:inferred", label="理论解释证据",
+                evidence_role="interpretation", source_ids=["suggested_target"],
+            ),
+        ],
+    )
+
+    derived = derive_research_semantics(frame)
+    by_id = {item.requirement_id: item for item in derived.evidence_requirements}
+
+    assert by_id["method:explicit"].explicit is True
+    assert by_id["method:explicit"].source == "user_explicit"
+    assert by_id["target:inferred"].explicit is False
+    assert by_id["target:inferred"].inferred is True
+    assert by_id["target:inferred"].source == "llm_inference"
+    assert by_id["target:inferred"].inference_basis == "领域常见维度"
+
+
 @pytest.mark.parametrize(
     ("domains", "methods", "targets", "expected_mode"),
     [
@@ -163,6 +199,43 @@ def test_llm_cannot_turn_broad_topic_into_explicit_method():
     assert frame.methods == []
     assert frame.clarification_needed is True
     assert "removed_ungrounded_method:classroom_behavior_analysis" in frame.validation_issues
+
+
+def test_requirement_alias_cannot_promote_an_invented_focus_to_user_explicit():
+    class InventedFocusLLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            return json.dumps({
+                "canonical_topic": "AI教学编码和分析",
+                "application_domains": [],
+                "research_objects": [{
+                    "id": "teaching_strategy_effectiveness",
+                    "label": "teaching strategy effectiveness",
+                    "surface_text": "教学策略效果",
+                    "explicit": True,
+                    "confidence": 0.95,
+                }],
+                "methods": [], "research_actions": [], "analysis_targets": [],
+                "evidence_requirements": [{
+                    "requirement_id": "object:teaching_strategy_effectiveness",
+                    "label": "教学策略效果相关文献",
+                    "evidence_role": "interpretation",
+                    "aliases": ["教学", "分析"],
+                    "source_ids": ["teaching_strategy_effectiveness"],
+                }],
+            }, ensure_ascii=False)
+
+    frame = parse_research_semantics(
+        "基于AI教学编码和分析（教育技术方向）",
+        "AI教学编码和分析",
+        llm=InventedFocusLLM(),
+    )
+
+    assert frame.research_objects == []
+    assert frame.evidence_requirements == []
+    assert (
+        "removed_ungrounded_research_object:teaching_strategy_effectiveness"
+        in frame.validation_issues
+    )
 
 
 def test_technology_only_queries_do_not_inherit_an_application_domain():

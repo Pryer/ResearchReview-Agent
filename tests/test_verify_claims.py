@@ -10,6 +10,23 @@ from app.tools.training_data import (
 from app.tools.verify_claims import verify_review_claims
 
 
+def test_failure_baselines_keep_log_and_persisted_snapshots_separate():
+    import json
+    from pathlib import Path
+
+    fixture = Path(__file__).parent / "fixtures" / "claim_quality_failure_scenarios.json"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    scenarios = {item["id"]: item for item in data["scenarios"]}
+
+    log_replay = scenarios["log_replay_2026_09_06_1902"]
+    persisted = scenarios["persisted_state_2026_09_06_1711"]
+    assert log_replay["evidence_card_count"] == 153
+    assert log_replay["has_sentence_level_snapshot"] is False
+    assert persisted["evidence_card_count"] == 72
+    assert persisted["has_sentence_level_snapshot"] is True
+    assert log_replay["id"] != persisted["id"]
+
+
 def _card() -> dict:
     paper = {
         "paper_id": "p1",
@@ -199,6 +216,26 @@ def test_llm_entailment_rejects_opposite_claim_despite_lexical_overlap():
     assert "claim_contradicted_by_evidence" in claim["issues"]
 
 
+def test_cross_language_paraphrase_uses_semantic_entailment_after_hard_checks():
+    class EntailedLLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            return (
+                '{"results":[{"claim_id":"c001u01","label":"entailed",'
+                '"confidence":0.96,"reason":"中文主张与英文证据语义一致"}]}'
+            )
+
+    report = verify_review_claims(
+        "该研究提出了一种用于检索增强生成的证据核验方法[p1]。",
+        [_card()],
+        llm=EntailedLLM(),
+    )
+
+    claim = report["claims"][0]
+    assert claim["support_status"] == "supported"
+    assert claim["verification_status"] == "verified"
+    assert claim["verification_method"] == "semantic"
+
+
 def test_string_confidence_from_llm_does_not_crash_verification():
     class StringConfidenceLLM:
         def complete(self, prompt: str, **kwargs) -> str:
@@ -217,6 +254,53 @@ def test_string_confidence_from_llm_does_not_crash_verification():
     # 非数字置信度按低置信度降级，报告照常产出
     assert claim["support_status"] == "partially_supported"
     assert "low_entailment_confidence" in claim["issues"]
+
+
+def test_missing_semantic_result_is_reported_as_unverified_not_proven_unsupported():
+    class EmptyResultLLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            return '{"results": []}'
+
+    report = verify_review_claims(
+        "该方法在 FEVER 数据集上达到 80% accuracy [p1]。",
+        [_card()],
+        llm=EmptyResultLLM(),
+    )
+
+    claim = report["claims"][0]
+    assert claim["support_status"] == "unsupported"
+    assert claim["verification_status"] == "not_completed"
+    assert claim["verification_method"] == "semantic"
+    assert report["unverified"] == 1
+    assert report["verification_coverage"] == 0.0
+    assert "entailment_not_verified" in claim["issues"]
+
+
+def test_semantic_cache_fingerprint_includes_access_and_source_provenance():
+    calls = 0
+
+    class EchoLLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            nonlocal calls
+            import json
+            import re
+
+            calls += 1
+            payload = json.loads(re.search(r"待验证项目：(\[.*?\])\n", prompt, re.S).group(1))
+            return json.dumps({"results": [
+                {"claim_id": item["claim_id"], "label": "entailed", "confidence": 0.95}
+                for item in payload
+            ]})
+
+    cache = {}
+    card = _card()
+    text = "该方法在 FEVER 数据集上达到 80% accuracy [p1]。"
+    verify_review_claims(text, [card], llm=EchoLLM(), entailment_cache=cache)
+    changed = _card()
+    changed["evidence_state"]["access_level"] = "partial_full_text"
+    verify_review_claims(text, [changed], llm=EchoLLM(), entailment_cache=cache)
+
+    assert calls == 2
 
 
 def test_model_names_do_not_trigger_numeric_mismatch():
@@ -529,6 +613,67 @@ def test_zero_improvement_rewrite_batch_is_not_persisted(monkeypatch):
     assert "其余研究仍在持续推进之中" not in state["review"]
 
 
+def test_post_rewrite_verification_keeps_semantic_verifier(monkeypatch):
+    """重写后的候选必须沿用初次验证的 LLM 语义核验契约。"""
+    from app.agent.nodes import verification
+
+    seen_llms = []
+    calls = 0
+
+    def fake_verify(text, cards, **kwargs):
+        nonlocal calls
+        calls += 1
+        seen_llms.append(kwargs.get("llm"))
+        unsupported = 6 if calls == 1 else 5
+        claims = [
+            {
+                "claim_id": f"c{index:03d}",
+                "sentence": f"事实主张{index}[p1]。",
+                "citations": ["p1"],
+                "factual": True,
+                "support_status": "unsupported",
+                "verification_status": "verified",
+            }
+            for index in range(1, unsupported + 1)
+        ]
+        return {
+            "valid": False,
+            "total_sentences": unsupported,
+            "factual_claims": unsupported,
+            "supported": 0,
+            "partially_supported": 0,
+            "unsupported": unsupported,
+            "unverified": 0,
+            "verification_coverage": 1.0,
+            "support_rate": 0.0,
+            "claims": claims,
+        }
+
+    monkeypatch.setattr("app.tools.verify_claims.verify_review_claims", fake_verify)
+    monkeypatch.setattr(
+        verification,
+        "_rewrite_and_weaken_unsupported_claims",
+        lambda text, claims, cards, llm=None: (
+            text.replace("原始内容", "修复内容"),
+            [{"claim_id": "c001", "original": "原始内容", "revised": "修复内容", "method": "llm_rewrite"}],
+        ),
+    )
+    semantic_llm = object()
+    state = {
+        "review": "## 研究现状\n\n原始内容。",
+        "body": "## 研究现状\n\n原始内容。",
+        "paper_cards": [_card()],
+        "writing_plans": [{"sections": [{"title": "研究现状"}]}],
+        "steps": [],
+        "errors": [],
+    }
+
+    verification.verify_claims_node(state, llm=semantic_llm)
+
+    assert calls >= 2
+    assert all(item is semantic_llm for item in seen_llms)
+
+
 
 def test_local_verification_reuses_untargeted_claims_and_reports_stats():
     """局部模式只重算目标句，保留上一轮未受影响句及其证据结果。"""
@@ -589,6 +734,47 @@ def test_local_verification_accepts_target_claim_id():
     assert second["verification_scope"]["target_claim_ids"] == ["c002u01"]
     assert second["verification_scope"]["recomputed_sentences"] == 1
     assert second["verification_scope"]["reused_sentences"] == 1
+
+
+def test_local_verification_reuses_unchanged_content_after_sentence_deletion():
+    """句序移动后按完整句子与引用复用，不能把旧序号的结论套给新句。"""
+    text = (
+        "该方法在 FEVER 数据集上达到 80% accuracy [p1]。"
+        "另一流程在 SciFact 数据集上达到 95% accuracy [p2]。"
+    )
+    first = verify_review_claims(text, [_card(), _second_card()])
+    second = verify_review_claims(
+        "另一流程在 SciFact 数据集上达到 95% accuracy [p2]。",
+        [_card(), _second_card()],
+        target_sentence_indices=[2],
+        verification_scope={"mode": "local", "previous_report": first},
+    )
+
+    assert second["verification_scope"]["mode"] == "local"
+    assert second["verification_scope"]["reused_sentences"] == 1
+    assert second["verification_scope"]["recomputed_sentences"] == 0
+    assert second["claims"][0]["claim_id"] == "c001"
+    assert "SciFact" in second["claims"][0]["sentence"]
+
+
+def test_legacy_report_without_verification_contract_forces_full_revalidation():
+    first = verify_review_claims(
+        "该方法在 FEVER 数据集上达到 80% accuracy [p1]。",
+        [_card()],
+    )
+    for claim in first["claims"]:
+        claim.pop("verification_status", None)
+        claim.pop("verification_method", None)
+
+    second = verify_review_claims(
+        "该方法在 FEVER 数据集上达到 80% accuracy [p1]。",
+        [_card()],
+        target_sentence_indices=[1],
+        verification_scope={"mode": "local", "previous_report": first},
+    )
+
+    assert second["verification_scope"]["mode"] == "full"
+    assert second["verification_scope"]["recomputed_sentences"] == 1
 
 
 def test_number_tokens_do_not_truncate_unit_suffixes():

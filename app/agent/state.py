@@ -95,7 +95,18 @@ class ResearchAgentState(TypedDict, total=False):
     incremental_new_paper_ids: List[str]
     incremental_required_new_evidence: int
     quality_recovery_attempts: int
+    recovery_action_count: int
+    quality_recovery_history: List[Dict[str, Any]]
+    active_quality_recovery: Dict[str, Any]
+    quality_recovery_decision: Dict[str, Any]
+    recovery_candidate_rejections: List[Dict[str, Any]]
+    allow_evidence_expansion: bool
+    refresh_existing_evidence: bool
     best_effort_generation: bool
+    best_effort_on_failure: bool
+    best_effort_policy_source: str
+    automatic_best_effort_attempted: bool
+    automatic_best_effort_generation: bool
     allow_unvalidated_taxonomy: bool
     forced_generation_issues: List[Dict[str, Any]]
     state_schema_version: str
@@ -128,6 +139,9 @@ class ResearchAgentState(TypedDict, total=False):
     # WHY: 小节名额溢出与单篇路线此前被静默丢弃，证据消失且无处可查；
     # 生命周期与 writing_plans 相同，由 _merge_and_select_themes 写入。
     route_merge_diagnostics: List[Dict[str, Any]]
+    # 当前正在写作的交付物分配快照；跨交付物列表用于最终汇总，单数版本供
+    # renderer 读取章节级授权，恢复时必须与本轮写作一起失效/持久化。
+    citation_allocation_plan: Dict[str, Any]
     citation_allocation_plans: List[Dict[str, Any]]
     deliverable_validation: List[Dict[str, Any]]
     writer_diagnostics: List[Dict[str, Any]]
@@ -138,6 +152,12 @@ class ResearchAgentState(TypedDict, total=False):
     quarantined_draft: str
     generation_blocked: bool
     citation_eligible_paper_ids: List[str]
+    reference_coverage_stats: Dict[str, int]
+    writing_version: int
+    target_section_ids: List[str]
+    target_claim_ids: List[str]
+    section_checkpoints: Dict[str, Dict[str, Any]]
+    section_candidate_checkpoints: Dict[str, Dict[str, Any]]
     unsupported_task_guard: Dict[str, Any]
     provisional_framework: Dict[str, Any]
     validated_routes: List[Dict[str, Any]]
