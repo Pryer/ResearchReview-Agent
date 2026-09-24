@@ -1,5 +1,9 @@
 # ResearchReview-Agent 架构与函数设计文档
 
+> 历史设计稿，保留早期领域定位和顺序流程设想，不代表当前实现。
+> 当前架构见 [架构总览](../ARCHITECTURE.md)、
+> [五字段上下文](agent-context-architecture.md)及[执行与恢复边界](agent-runtime-and-cache.md)。
+
 > 面向 Coding Agent 的实现说明  
 > 目标：生成一个「根据用户指令检索开放论文，并基于论文生成文献综述」的科研 Agent。  
 > 核心关键词：Intent Recognition、Slot Filling、Paper Search、Agentic RAG、PaperCard、Literature Review、Citation Validation。

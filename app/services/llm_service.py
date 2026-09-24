@@ -12,12 +12,13 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, BadRequestError
 
 from app.core.config import get_settings
-from app.core.exceptions import LLMInvocationError
+from app.core.exceptions import LLMInvocationError, NativeToolsUnsupportedError
+from app.agent.execution_budget import budgeted_create, AgentBudgetExceeded, AgentExecutionCancelled
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -52,6 +53,7 @@ class LLMService:
         self.temperature = settings.llm_temperature
         self.max_tokens = settings.llm_max_tokens
         self.control_plane_max_tokens = settings.llm_control_plane_max_tokens
+        self.native_tools_enabled = settings.llm_native_tools_enabled
         self.request_timeout = settings.llm_request_timeout
         self.failover_total_timeout = settings.llm_failover_total_timeout
         self._client = None
@@ -106,6 +108,7 @@ class LLMService:
         operation: str = "completion",
         thinking_enabled: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
+        messages: Optional[list[dict[str, str]]] = None,
     ) -> str:
         """调用 LLM 获取单次回复。
 
@@ -168,9 +171,14 @@ class LLMService:
 
         # 构造一次调用的基础参数；每个 provider 各取一份副本，避免相互污染
         # （例如 response_format 降级会 pop 掉该字段）。
+        normalized_messages = (
+            self._validate_messages(messages)
+            if messages is not None
+            else [{"role": "user", "content": prompt}]
+        )
         base_kwargs: dict = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": normalized_messages,
             "temperature": temperature if temperature is not None else self.temperature,
             "max_tokens": effective_max_tokens,
         }
@@ -294,6 +302,8 @@ class LLMService:
             # 两个提供商都失败：让最后一次异常冒泡到外层 except，统一包成 LLMInvocationError。
             raise last_exc  # type: ignore[misc]
 
+        except (AgentBudgetExceeded, AgentExecutionCancelled):
+            raise
         except Exception as e:
             logger.error(
                 "LLM_CALL_FAILED operation=%s duration_ms=%d error=%s",
@@ -302,6 +312,168 @@ class LLMService:
                 e,
             )
             raise LLMInvocationError(f"LLM 调用失败: {e}")
+
+    def complete_messages(
+        self,
+        messages: list[dict[str, str]],
+        **kwargs: Any,
+    ) -> str:
+        """结构化消息入口，复用 ``complete`` 的超时、回退与指标边界。"""
+        return self.complete("", messages=messages, **kwargs)
+
+    def complete_tool_call(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tools: list[dict[str, Any]],
+        operation: str = "tool_decision",
+    ) -> dict[str, Any]:
+        """请求且只接受一个原生工具调用；自然语言 content 不视为动作。"""
+        if not self.native_tools_enabled:
+            raise LLMInvocationError("native tool calling is disabled for this deployment")
+        if not tools:
+            raise ValueError("tools must not be empty")
+        if not self.api_key and not self.backup_enabled:
+            raise LLMInvocationError("no LLM provider configured for tool decision")
+        normalized = self._validate_messages(messages)
+        providers: list[tuple[str, object, str, str]] = []
+        if self.api_key:
+            providers.append(("primary", self.client, self.model, self.provider))
+        if self.backup_enabled:
+            providers.append(("backup", self.backup_client, self.backup_model, self.backup_provider))
+        last_exc: Exception | None = None
+        unsupported = False
+        deadline = time.monotonic() + self.failover_total_timeout
+        for provider_name, client, model, provider in providers:
+            unsupported = False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LLMInvocationError("tool decision failover deadline exhausted")
+            kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": normalized,
+                "tools": tools,
+                "tool_choice": "required",
+                "temperature": 0,
+                "max_tokens": self.control_plane_max_tokens,
+                "timeout": min(self.request_timeout, remaining),
+            }
+            if provider.strip().lower() == "deepseek":
+                kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            started = time.monotonic()
+            usage = {}
+            def record_tool_response(response):
+                usage.update(self._record_usage(
+                    getattr(response, "usage", None), model=model,
+                    operation=operation, provider=provider, started=started,
+                ))
+            try:
+                response = budgeted_create(client, on_response=record_tool_response, **kwargs)
+                choices = getattr(response, "choices", None) or []
+                calls = (
+                    getattr(choices[0].message, "tool_calls", None) or []
+                    if choices else []
+                )
+                if len(calls) != 1:
+                    raise ValueError("provider must return exactly one tool call")
+                call = calls[0]
+                arguments = json.loads(call.function.arguments or "{}")
+                if not isinstance(arguments, dict):
+                    raise ValueError("tool arguments must be a JSON object")
+                return {
+                    "name": str(call.function.name or ""),
+                    "arguments": arguments,
+                    "tool_call_id": str(getattr(call, "id", "") or ""),
+                    "usage": usage,
+                    "transport": "native_tool",
+                }
+            except BadRequestError as exc:
+                last_exc = exc
+                message = str(exc).lower()
+                unsupported = any(word in message for word in ("tool", "function")) and any(
+                    word in message for word in ("unsupported", "not support", "unknown parameter", "not allowed")
+                )
+                if provider_name == "primary" and self.backup_enabled:
+                    continue
+                break
+            except (APITimeoutError, APIConnectionError) as exc:
+                unsupported = False
+                last_exc = exc
+                if provider_name == "primary" and self.backup_enabled:
+                    continue
+                break
+            except APIStatusError as exc:
+                last_exc = exc
+                if (
+                    exc.status_code in _RETRYABLE_STATUS_CODES
+                    and provider_name == "primary"
+                    and self.backup_enabled
+                ):
+                    continue
+                break
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                last_exc = exc
+                if provider_name == "primary" and self.backup_enabled:
+                    continue
+                break
+        if unsupported:
+            raise NativeToolsUnsupportedError("provider does not support native tool calls") from last_exc
+        raise LLMInvocationError(f"LLM tool decision failed: {last_exc}")
+
+    def for_agent(self, role: str):
+        """返回带稳定系统前缀和固定工具目录的轻量角色视图。"""
+        return _RoleBoundLLM(self, role)
+
+    @staticmethod
+    def _validate_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        if not messages:
+            raise ValueError("messages must not be empty")
+        allowed_roles = {"system", "user", "assistant", "tool"}
+        normalized: list[dict[str, str]] = []
+        for index, message in enumerate(messages):
+            role = str(message.get("role") or "").strip()
+            content = message.get("content")
+            if role not in allowed_roles:
+                raise ValueError(f"invalid message role at index {index}: {role!r}")
+            if not isinstance(content, str):
+                raise ValueError(f"message content at index {index} must be a string")
+            normalized.append({"role": role, "content": content})
+        return normalized
+
+    def _record_usage(
+        self,
+        usage: Any,
+        *,
+        model: str,
+        operation: str,
+        provider: str,
+        started: float,
+    ) -> dict[str, int]:
+        """把一次真实响应的用量记入指标，并返回可随结果传递的用量字典。
+
+        普通补全与原生工具决策共用本方法，避免主 Agent 决策轮次不进指标。
+        """
+        tokens = {
+            "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+            "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+            "prompt_cache_hit_tokens": int(
+                getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+            ),
+            "prompt_cache_miss_tokens": int(
+                getattr(usage, "prompt_cache_miss_tokens", 0) or 0
+            ),
+        }
+        if usage:
+            from app.core.metrics import get_metrics_collector
+            get_metrics_collector().record_llm_call(
+                model=str(model or self.model),
+                duration_ms=int((time.monotonic() - started) * 1000),
+                operation=operation,
+                provider=provider,
+                **tokens,
+            )
+        return tokens
+
 
     def _attempt_once(
         self,
@@ -323,17 +495,12 @@ class LLMService:
         started = time.monotonic()
 
         def _record(resp) -> None:
-            usage = getattr(resp, "usage", None)
-            if not usage:
-                return
-            from app.core.metrics import get_metrics_collector
-            get_metrics_collector().record_llm_call(
+            self._record_usage(
+                getattr(resp, "usage", None),
                 model=str(kwargs.get("model") or self.model),
-                prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-                completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
-                duration_ms=int((time.monotonic() - started) * 1000),
                 operation=operation,
                 provider=provider,
+                started=started,
             )
 
         def _content_of(resp) -> str:
@@ -345,10 +512,9 @@ class LLMService:
                 return ""
             return choices[0].message.content or ""
 
-        resp = self._call_with_possible_fallback(kwargs, response_format, client=client)
+        resp = self._call_with_possible_fallback(kwargs, response_format, client=client, record=_record)
         if retry_empty:
-            resp = self._retry_if_content_empty(kwargs, resp, client=client)
-        _record(resp)
+            resp = self._retry_if_content_empty(kwargs, resp, client=client, record=_record)
         content = _content_of(resp)
 
         if (
@@ -359,13 +525,12 @@ class LLMService:
         ):
             logger.warning("LLM returned empty JSON response, retrying without response_format")
             kwargs.pop("response_format", None)
-            resp = client.chat.completions.create(**kwargs)
-            resp = self._retry_if_content_empty(kwargs, resp, client=client)
-            _record(resp)
+            resp = budgeted_create(client, on_response=_record, **kwargs)
+            resp = self._retry_if_content_empty(kwargs, resp, client=client, record=_record)
             content = _content_of(resp)
         return content
 
-    def _call_with_possible_fallback(self, kwargs: dict, response_format: str, client=None):
+    def _call_with_possible_fallback(self, kwargs: dict, response_format: str, client=None, record=None):
         """发起单次 LLM 调用，在 ``response_format`` 不被模型支持时降级重试一次。
 
         超时（APITimeoutError）、连接错误（APIConnectionError）和 API 状态错误
@@ -375,16 +540,16 @@ class LLMService:
         if client is None:
             client = self.client
         try:
-            return client.chat.completions.create(**kwargs)
+            return budgeted_create(client, on_response=record, **kwargs)
         except BadRequestError:
             # 模型不支持 response_format=json_object —— 移除参数重试一次。
             if "response_format" not in kwargs:
                 raise
             logger.info("Model does not support response_format, retrying without it")
             kwargs.pop("response_format", None)
-            return client.chat.completions.create(**kwargs)
+            return budgeted_create(client, on_response=record, **kwargs)
 
-    def _retry_if_content_empty(self, kwargs: dict, resp, client=None):
+    def _retry_if_content_empty(self, kwargs: dict, resp, client=None, record=None):
         """LongCat 等 reasoning 模型可能先消耗 token 到 reasoning_content。
 
         当正文 content 为空且 finish_reason=length 时，自动提高 max_tokens 重试一次，
@@ -428,8 +593,59 @@ class LLMService:
             "LLM returned empty content after reasoning tokens; retrying with max_tokens=%d",
             retry_max,
         )
-        return client.chat.completions.create(**retry_kwargs)
+        return budgeted_create(client, on_response=record, **retry_kwargs)
 
     def is_available(self) -> bool:
         """检查 LLM 是否配置可用（主用或备用任一可用即视为可用）。"""
         return bool(self.api_key) or self.backup_enabled
+
+
+class _RoleBoundLLM:
+    """不复制客户端状态，只在消息边界注入稳定角色前缀。"""
+
+    def __init__(self, service: LLMService, role: str) -> None:
+        from app.agent.tool_registry import tools_for_role
+        from app.prompt.agent_system import SYSTEM_PROMPTS
+
+        if role not in SYSTEM_PROMPTS:
+            raise ValueError(f"unknown agent role: {role}")
+        self._service = service
+        tools = json.dumps(tools_for_role(role), ensure_ascii=False, sort_keys=True)
+        self._role_prompt = SYSTEM_PROMPTS[role].strip()
+        self._system_prompt = f"{self._role_prompt}\n核心工具目录：{tools}"
+
+    def complete(self, prompt: str, **kwargs: Any) -> str:
+        messages = kwargs.pop("messages", None)
+        if messages is None:
+            messages = [{"role": "user", "content": prompt}]
+        return self._service.complete_messages(
+            [{"role": "system", "content": self._system_prompt}, *messages],
+            **kwargs,
+        )
+
+    def complete_messages(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
+        return self._service.complete_messages(
+            [{"role": "system", "content": self._system_prompt}, *messages],
+            **kwargs,
+        )
+
+    @property
+    def native_tools_enabled(self) -> bool:
+        return bool(self._service.native_tools_enabled)
+
+    def complete_tool_call(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tools: list[dict[str, Any]],
+        operation: str = "tool_decision",
+    ) -> dict[str, Any]:
+        return self._service.complete_tool_call(
+            # WHY: 原生 tools 已携带完整契约；JSON 通道仍保留文本目录。
+            [{"role": "system", "content": self._role_prompt}, *messages],
+            tools=tools,
+            operation=operation,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._service, name)

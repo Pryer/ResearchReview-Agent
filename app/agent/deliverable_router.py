@@ -268,8 +268,10 @@ def check_generation_readiness(state: dict[str, Any]) -> GenerationReadinessResu
         authorized_ids & allocated_ids
         if allocated_ids else authorized_ids
     )
+    # WHY: 漏斗不从原始候选数起算。本函数只在 generate_deliverables_node 内调用，
+    # 而该动作的输入白名单刻意排除 SEARCH 字段（含 candidate_papers），
+    # 因此原始候选数在这里恒为 0，不应作为真实证据漏斗指标。
     coverage_stats = {
-        "raw_candidates": len(state.get("candidate_papers") or []),
         "confirmed_in_scope": len(confirmed_in_scope_ids),
         "evidence_backed": len(evidence_backed_ids),
         "claim_authorized": len(authorized_ids),
@@ -289,7 +291,7 @@ def check_generation_readiness(state: dict[str, Any]) -> GenerationReadinessResu
         recovery.extend([
             "扩大检索年份范围",
             "在保持主题边界的前提下补充同义词和数据库",
-            "明确允许纳入更多会议论文或预印本",
+            "提供符合原范围的补充论文或可访问证据",
             f"确认接受少于 {requested} 篇后重新提交",
         ])
     elif (

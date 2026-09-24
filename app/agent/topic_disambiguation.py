@@ -32,7 +32,8 @@ def analyze_topic_ambiguity(
     current_year: int | None = None,
 ) -> dict[str, Any]:
     """构建研究请求并判断是否需要在检索前向用户澄清主题范围。"""
-    intent = recognize_intent(user_query, llm=llm).intent
+    intent_result = recognize_intent(user_query, llm=llm)
+    intent = intent_result.intent
     year = current_year or get_current_year()
     slots = extract_slots(user_query, intent, llm=llm, current_year=year)
     research_request = {
@@ -62,12 +63,12 @@ def analyze_topic_ambiguity(
     fallback = _semantic_fallback_ambiguity(semantic_frame, slots.topic or user_query)
 
     if intent not in _RESEARCH_INTENTS or not slots.topic or llm is None:
-        return _build_analysis_response(research_request, fallback)
+        return _build_analysis_response(research_request, fallback, intent_result)
 
     # 明确给出技术方法且不存在语义歧义时，不再额外调用一次消歧模型。
     # 这既避免把清晰任务改写成宽泛问题，也缩短检索前等待时间。
     if scope_is_complete:
-        return _build_analysis_response(research_request, fallback)
+        return _build_analysis_response(research_request, fallback, intent_result)
 
     try:
         from app.prompt.topic_disambiguation import TOPIC_DISAMBIGUATION_PROMPT
@@ -114,7 +115,7 @@ def analyze_topic_ambiguity(
             reason="研究对象、方法角色和终点目标已经明确",
             recommended_strategy="single_scope",
         )
-    return _build_analysis_response(research_request, ambiguity)
+    return _build_analysis_response(research_request, ambiguity, intent_result)
 
 
 def _has_complete_explicit_scope(semantic_frame) -> bool:
@@ -187,6 +188,7 @@ def _normalize_ambiguity(result: TopicAmbiguityResult) -> TopicAmbiguityResult:
 def _build_analysis_response(
     research_request: dict[str, Any],
     ambiguity: TopicAmbiguityResult,
+    intent_result=None,
 ) -> dict[str, Any]:
     needs_clarification = bool(
         ambiguity.ambiguous
@@ -196,6 +198,7 @@ def _build_analysis_response(
     )
     return {
         "research_request": research_request,
+        "intent_result": intent_result.model_dump(mode="json") if intent_result is not None else None,
         "ambiguity": ambiguity.model_dump(),
         "needs_clarification": needs_clarification,
     }

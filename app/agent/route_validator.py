@@ -23,9 +23,6 @@ logger = get_logger(__name__)
 from app.core.config import get_review_threshold_policy
 
 _ANCHOR_TYPES = {"semantic", "method", "task"}
-_MIN_SPLITTABLE_CORE = 6
-_OVERSIZED_CORE_SHARE_FACTOR = 1.2
-_MAX_SUB_ROUTES = 3
 
 
 def _unique(values: Iterable[Any], *, limit: int = 24) -> list[str]:
@@ -590,8 +587,9 @@ def _split_oversized_routes(
     即 STRONG_ROUTE），因此一条独占半数文献的路线也被判健康，写作层随之
     坍缩成巨型小节。
 
-    子路线数按超额倍数推算并夹在 [2, ``_MAX_SUB_ROUTES``]，避免把一条
+    子路线数按超额倍数推算并夹在 [2, ``route_max_sub_routes``]，避免把一条
     路线打碎成远超写作层小节预算的碎片；拆不出足够子簇时保持原状。
+    篇数与份额阈值一律取自 policy，可由配置覆盖。
     """
     if policy is None:
         policy = get_review_threshold_policy()
@@ -632,6 +630,18 @@ def _split_oversized_routes(
         parent_supporting = [
             str(item) for item in route.get("supporting_paper_ids") or []
         ]
+        child_sufficiency = [
+            assess_evidence_sufficiency(
+                cluster, parent_supporting, card_map,
+                minimum_core_evidence=policy.route_min_core_evidence,
+            )
+            for cluster in clusters
+        ]
+        if not all(item.sufficient for item in child_sufficiency):
+            # WHY: 拆分后的 core 是独占归属，不能沿用父路线的充分性报告；
+            # 任一子路线不足时保留父路线，避免把薄证据小节伪装成 KEEP。
+            logger.info("Route %r split abandoned: child evidence is insufficient", parent_id)
+            continue
         sub_routes: list[dict[str, Any]] = []
         # 全局名称去重的预留清单：拆分子路线时，正文还会同时出现其余全部
         # 存活路线。候选名与其中任何一条共享概念（如"跨模态"对既有
@@ -672,6 +682,7 @@ def _split_oversized_routes(
                 "core_paper_ids": list(cluster),
                 "supporting_paper_ids": list(parent_supporting),
                 "paper_ids": _unique([*cluster, *parent_supporting], limit=10000),
+                "evidence_sufficiency": child_sufficiency[index - 1].model_dump(mode="json"),
             })
         position = validated_routes.index(route)
         validated_routes[position:position + 1] = sub_routes
@@ -688,7 +699,10 @@ def _split_oversized_routes(
             "sub_route_ids": [item["route_id"] for item in sub_routes],
             "reason": (
                 f"独占成员 {len(members)} 篇超过路线均分份额 {even_share:.1f} 的 "
-                f"{_OVERSIZED_CORE_SHARE_FACTOR} 倍，按证据子聚类拆为 "
+                # WHY: 文案必须引用实际生效的 policy 值。阈值可由
+                # ROUTE_VALIDATOR_OVERSIZED_SHARE_FACTOR 配置，写死常量会让审计
+                # 记录谎报判据，运维改配置后 reason 与真实行为不一致。
+                f"{policy.route_oversized_share_factor} 倍，按证据子聚类拆为 "
                 f"{len(sub_routes)} 条子路线"
             ),
         })
@@ -1248,15 +1262,28 @@ def validate_route_evidence(
         policy=policy,
     )
 
+    # WHY: 写作归属不得指向已不存在的路线。两类残留 ID 会漏进 assignment_map：
+    # SPLIT 后被子路线取代的父路线（论文同时 core 命中父路线与另一条存活路线时，
+    # 父路线会进入 secondary_routes），以及仅被 supporting 命中的 DROP 路线（会成为
+    # ambiguous_uncertain 的 best_route）。下游 synthesize_themes 按 primary/归属
+    # 聚合，拿到死路线 ID 会把证据挂到不存在的小节上。
+    # 注：DROP 路线不可能持有 core 论文——DROP 要求 best_signal_count < 2，而 core
+    # 要求 signal_count >= 2，两者同源，故本过滤不改变 evidence_understood_rate。
+    # 必须在 _split_oversized_routes 之后取，才能同时排除父路线。
+    final_route_ids = {
+        str(route.get("route_id") or "") for route in validated_routes
+    }
     assignment_map: dict[str, dict[str, Any]] = {}
     for paper_id in card_map:
         core_routes = [
             route_id for route_id, features in per_route_features.items()
             if features[paper_id].match_level == "core"
+            and route_id in final_route_ids
         ]
         supporting_routes = [
             route_id for route_id, features in per_route_features.items()
             if features[paper_id].match_level == "supporting"
+            and route_id in final_route_ids
         ]
         sub_route_id = reassigned_routes.get(paper_id)
         if sub_route_id:

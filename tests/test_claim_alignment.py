@@ -44,6 +44,24 @@ def test_single_source_claim_budget_drops_excess_claims() -> None:
     assert report["single_source_claim_limit"] == 2
 
 
+def test_multiple_spans_from_one_paper_do_not_meet_comparison_minimum() -> None:
+    cards = [{"paper_id": "p1", "evidence_spans": [
+        {"evidence_id": "p1:e1", "text": "方法甲的实验结果。"},
+        {"evidence_id": "p1:e2", "text": "方法乙的实验结果。"},
+    ]}]
+    plans, report = enforce_claim_evidence_gate(
+        [{"route_id": "r1", "claims": [{
+            "claim_id": "compare", "claim_text": "两条方法路线的整体效果不同",
+            "claim_type": "comparison", "evidence_ids": ["p1:e1", "p1:e2"],
+            "support_level": "moderate",
+        }]}], cards,
+    )
+
+    assert plans[0]["claims"] == []
+    assert report["dropped_claims"] == 1
+    assert "有效论文 1 篇" in report["gaps"][0]["reason"]
+
+
 def test_pre_generation_entailment_rejects_claim_not_entailed() -> None:
     cards = [{
         "paper_id": "p1",
@@ -60,6 +78,29 @@ def test_pre_generation_entailment_rejects_claim_not_entailed() -> None:
     )
     assert plans[0]["claims"] == []
     assert report["entailment_checked_claims"] == 1
+    assert report["entailment_failed_claims"] == 1
+
+
+def test_pre_generation_entailment_drops_claim_without_readable_evidence() -> None:
+    cards = [{"paper_id": "p1", "field_claims": {
+        "results": [{"evidence_id": "p1:result", "text": ""}],
+    }}]
+
+    class LLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            raise AssertionError("没有证据片段时不应请求模型判定")
+
+    plans, report = enforce_claim_evidence_gate(
+        [{"route_id": "r1", "claims": [{
+            "claim_id": "c1", "claim_text": "模型显著提升准确率",
+            "claim_type": "finding", "evidence_ids": ["p1:result"],
+            "support_level": "single",
+        }]}], cards, llm=LLM(),
+    )
+
+    assert plans[0]["claims"] == []
+    assert report["passed"] is False
+    assert report["entailment_checked_claims"] == 0
     assert report["entailment_failed_claims"] == 1
 
 

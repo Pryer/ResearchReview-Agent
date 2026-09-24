@@ -26,7 +26,7 @@ def submit_task():
     #   user_query: 用户自然语言请求（首次提交不带 clarification_answer）
     #   state: 可选初始状态（写作所需的本文工作信息等）
     # 注意：clarification_answer 只用于已有 session_id 的第二轮交互，
-    #       首次提交时将其写入 user_query 末尾或放在 state 中。
+    #       首次范围说明写入 user_query；state 只接受 AgentRequest 公开字段。
     payload = {
         "user_query": (
             "调研近三年课堂行为分析论文，并生成研究背景和研究现状，引用论文不少于40篇。"
@@ -34,10 +34,6 @@ def submit_task():
             "然后基于教育学来进行分析。"
         ),
         "state": {
-            "our_work_description": (
-                "先基于人工智能技术进行老师或学生行为的自动识别和自动行为编码，"
-                "然后基于教育学来进行分析"
-            ),
             "max_papers": 50,
             "required_reference_count": 40,
             "language": "zh",
@@ -242,7 +238,8 @@ def monitor_job(job_id, check_interval=4):
                     seen_errors.add(err)
 
             # ── 终止 ─────────────────────────────────────────────────────
-            if status in ("completed", "failed", "cancelled"):
+            # WHY: partial/blocked/needs_clarification 已结束本次后台任务，继续需新请求。
+            if status in ("completed", "partial", "blocked", "needs_clarification", "failed", "cancelled"):
                 print(f"\n{'=' * 80}")
                 elapsed_min = elapsed // 60
                 elapsed_sec = elapsed % 60
@@ -270,6 +267,10 @@ def monitor_job(job_id, check_interval=4):
 
                     save_result(job_id, job_data, elapsed)
 
+                elif status in ("partial", "blocked", "needs_clarification"):
+                    result = job_data.get("result") or {}
+                    print(f"\n研究状态: {status}（未达到完整交付）")
+                    print(result.get("answer") or (result.get("clarification") or {}).get("question") or "请查看任务结果")
                 elif status == "failed":
                     print(f"\n❌ 任务失败")
                     errors = job_data.get("errors") or []

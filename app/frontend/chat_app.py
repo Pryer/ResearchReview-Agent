@@ -303,7 +303,8 @@ def render_message_metadata(metadata: dict, *, allow_actions: bool = False) -> N
     render_source_diagnostics(metadata.get("source_diagnostics") or [])
     if recovery.get("action"):
         with st.expander("♻️ 自动恢复", expanded=False):
-            st.caption(f"当前动作：{recovery['action']}")
+            label = "最近恢复动作" if recovery.get("outcome") not in {"", "started"} else "当前动作"
+            st.caption(f"{label}：{recovery['action']}")
             st.caption(str(recovery["verification"]))
             col1, col2, col3 = st.columns(3)
             col1.metric("主张授权", recovery["claim_authorized"])

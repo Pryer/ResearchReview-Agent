@@ -1,0 +1,28 @@
+{
+  "name": "explicit_checkpoint_resume",
+  "request": {
+    "session_id": "example-interrupted-001",
+    "user_query": "继续上次研究，保留原来的年份、篇数和研究范围",
+    "resume_from_checkpoint": true
+  },
+  "expected": {
+    "preconditions": [
+      "existing session status is running, failed, cancelled or blocked",
+      "a committed execution checkpoint exists",
+      "no other active job or unexpired execution lease owns the session"
+    ],
+    "behavior": [
+      "restore committed evidence and original explicit constraints",
+      "retain cumulative budget consumption",
+      "start a new operation and decide unfinished work",
+      "apply the same quality gates before delivery"
+    ],
+    "must_not": [
+      "replay an uncertain provider request automatically",
+      "reset or raise the budget merely because execution resumes",
+      "lower the reference requirement or expand explicit years",
+      "use checkpoint resume to answer clarification or revise a completed result"
+    ],
+    "external_calls": "mock_in_tests"
+  }
+}

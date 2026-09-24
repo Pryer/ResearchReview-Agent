@@ -24,6 +24,60 @@ from app.schemas.recovery_schema import (
 
 logger = get_logger(__name__)
 
+# 由验证阶段执行或提出的路线结构修订；这些路线的缺口属于结构问题而非检索问题。
+_STRUCTURAL_ROUTE_ACTIONS = {
+    "MERGE", "MERGED_INTO", "SPLIT", "SPLIT_INTO", "REDEFINE_BOUNDARY",
+    "OUTLIER_CHECK", "ADD_NEW_ROUTE", "ADD_NEW_ROUTE_CANDIDATE",
+}
+# 结构修订已落地，父路线证据已转移到子路线，无需再补检索。
+_RESOLVED_STRUCTURAL_ACTIONS = {
+    "MERGED_INTO", "SPLIT_INTO", "REDEFINE_BOUNDARY", "OUTLIER_CHECK",
+    "ADD_NEW_ROUTE",
+}
+
+
+def route_recovery_stop_reason(state: dict[str, Any]) -> str:
+    """调度与执行共用的恢复边界；耗尽后不再调用模型重复诊断。"""
+    from app.core.config import get_settings
+    from app.agent.generation_recovery import recovery_action_count
+
+    settings = get_settings()
+    if not settings.enable_evidence_recovery or state.get("allow_evidence_expansion") is False:
+        return "当前任务未允许继续补充证据"
+    if int(state.get("recovery_round") or 0) >= settings.evidence_recovery_max_rounds:
+        return f"已达到证据恢复检索上限 {settings.evidence_recovery_max_rounds} 轮"
+    if recovery_action_count(state) >= settings.recovery_total_action_budget:
+        return "已达到任务恢复动作上限"
+    if state.get("evidence_recovery_status") == RecoveryStatus.EXHAUSTED.value:
+        return "路线证据恢复已因边际收益或查询预算不足停止"
+    return ""
+
+
+def should_repair_citation_gap(state: dict[str, Any]) -> bool:
+    """引用补检索的真实执行条件；阻断说明不视为可修复正文。"""
+    if state.get("generation_blocked") or state.get("citation_gap_repair_attempted"):
+        return False
+    if not state.get("max_papers_explicit", False):
+        return False
+    required = int(state.get("required_reference_count") or 0)
+    cited = int(state.get("unique_cited_paper_count") or 0)
+    return bool(0 < cited < required and (state.get("candidate_papers") or state.get("paper_details")))
+
+
+def targeted_search_kind(state: dict[str, Any]) -> str:
+    if state.get("allow_evidence_expansion") is False:
+        return ""
+    # WHY: 成文引用修复与路线补搜使用不同边界；路线耗尽不能误禁尚未尝试的引用修复。
+    if should_repair_citation_gap(state):
+        return "citation"
+    if route_recovery_stop_reason(state):
+        return ""
+    if (state.get("evidence_gap_report") or {}).get("needs_recovery"):
+        return "route"
+    if state.get("generation_blocked") and state.get("paper_cards"):
+        return "route"
+    return ""
+
 
 def _query_tokens(text: str) -> set[str]:
     normalized = str(text or "").strip().casefold()
@@ -182,43 +236,55 @@ def _deterministic_route_gaps(state: dict[str, Any]) -> list[RouteEvidenceGap]:
         scores = dict(decision.get("scores") or {})
         core_count = int(scores.get("core_paper_count") or 0)
         paper_count = int(scores.get("paper_count") or 0)
-        mean_fit = float(scores.get("mean_route_fit") or 0.0)
         target = int(targets.get(route_id) or 0)
         deficit = max(0, target - core_count)
+        sufficiency = decision.get("evidence_sufficiency") or {}
+        # WHY: mean_route_fit 与 supporting_threshold 不是 scores 的固定字段。
+        # 缺失时按 0.0 互比恒成立，每条路线都会被标成精度缺口，使 decide_recovery
+        # 误选 QUERY_FILTER_REVISION（收窄过滤），真实的核心证据缺口反而补不上。
+        precision_gap = (
+            paper_count > core_count
+            and "mean_route_fit" in scores
+            and "supporting_threshold" in scores
+            and float(scores.get("mean_route_fit") or 0.0)
+            <= float(scores.get("supporting_threshold") or 0.0)
+        )
 
-        if (
+        # WHY: 结构动作必须先于 deficit 判定。SPLIT_INTO/MERGED_INTO 的父路线证据
+        # 已转移到子路线，其 scores 为空，按 0 篇核心证据算出的 deficit 是幻影，
+        # 会把已完成的结构修订报成永远无法闭合的检索缺口，钉死 needs_recovery。
+        if action in _STRUCTURAL_ROUTE_ACTIONS:
+            gap_type = RouteGapType.ROUTE_STRUCTURE_GAP
+            reason = f"路线结构已由验证阶段执行或提出 {action}。"
+            resolved = action in _RESOLVED_STRUCTURAL_ACTIONS
+        elif (
             action in {"DROP", "TARGETED_SEARCH"}
-            or status == "WEAK"
             or diagnosis == "INSUFFICIENT_EVIDENCE"
             or deficit > 0
+            # WHY: WEAK 但核心证据已达目标且验证器判定充分的路线不再触发补检索，
+            # 否则充分性 1.00、缺口 0 的路线会让恢复循环无法收敛。
+            or (status == "WEAK" and sufficiency.get("sufficient") is False)
         ):
             gap_type = (
                 RouteGapType.SEARCH_PRECISION_GAP
-                if (
-                    paper_count > core_count
-                    and mean_fit <= float(scores.get("supporting_threshold") or 0.0)
-                )
+                if precision_gap
                 else RouteGapType.SEARCH_COVERAGE_GAP
             )
             validity = decision.get("route_validity") or {}
-            sufficiency = decision.get("evidence_sufficiency") or {}
+            # WHY: evidence_sufficiency.score 的分母是固定低阈值
+            # route_min_core_evidence，分子含半权支撑证据，任何正常规模的路线都被
+            # min(1.0, ...) 削平到 1.00（global_evidence_gate 已注明并只当兜底）。
+            # 把它印在“缺口 N 篇”旁边会得到自相矛盾的诊断，而这段文案会进入主
+            # Agent 的 open_questions 和诊断提示词，故改用真正参与判定的信号。
+            sufficient = bool(sufficiency.get("sufficient"))
             reason = (
                 f"路线有效性 {float(validity.get('score') or 0.0):.2f}，"
-                f"证据充分性 {float(sufficiency.get('score') or 0.0):.2f}；"
+                f"证据充分性判定{'通过' if sufficient else '未通过'}"
+                f"（证据质量率 {float(sufficiency.get('evidence_quality_rate') or 0.0):.2f}）；"
                 f"当前 {core_count} 篇核心证据，目标 {target} 篇，缺口 {deficit} 篇，"
                 f"状态为 {status or action or diagnosis}。"
             )
             resolved = False
-        elif action in {
-            "MERGE", "MERGED_INTO", "SPLIT", "SPLIT_INTO", "REDEFINE_BOUNDARY",
-            "OUTLIER_CHECK", "ADD_NEW_ROUTE", "ADD_NEW_ROUTE_CANDIDATE",
-        }:
-            gap_type = RouteGapType.ROUTE_STRUCTURE_GAP
-            reason = f"路线结构已由验证阶段执行或提出 {action}。"
-            resolved = action in {
-                "MERGED_INTO", "SPLIT_INTO", "REDEFINE_BOUNDARY", "OUTLIER_CHECK",
-                "ADD_NEW_ROUTE",
-            }
         else:
             continue
 
@@ -507,6 +573,13 @@ def decide_recovery(
         if not progressed:
             break
         cursor += 1
+
+    # WHY: 名额用尽后内层循环可能尚未遍历后面的路线；共享查询只派发
+    # 一次，但所有提出该查询的缺口路线都应保留审计归属。
+    for route_id, candidates in per_route_candidates.items():
+        for query, _ in candidates:
+            if query in novelty_by_query and query not in allocation[route_id]:
+                allocation[route_id].append(query)
 
     if not selected_queries:
         return RecoveryDecision(

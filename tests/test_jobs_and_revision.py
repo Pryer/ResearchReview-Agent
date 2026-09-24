@@ -25,6 +25,35 @@ def test_agent_honors_cancel_before_first_node():
         run_research_agent("任意研究主题", should_cancel=lambda: True)
 
 
+@pytest.mark.parametrize('boundary_error', [True, False])
+def test_background_failure_exposes_safe_reason_and_logs_original(monkeypatch, caplog, boundary_error):
+    from app.agent.subagents.base import AgentBoundaryViolation
+
+    engine = create_engine('sqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    maker = sessionmaker(bind=engine)
+    with maker() as db:
+        ResearchJobRepository(db).create('failure-job', 'failure-session', {'user_query': '测试研究'})
+        db.commit()
+    diagnostic = 'unauthorized action output: _dynamic_background_outline, claim_alignment'
+    error = AgentBoundaryViolation(diagnostic) if boundary_error else RuntimeError(diagnostic)
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr('app.services.research_job_service.SessionLocal', maker)
+    monkeypatch.setattr(ResearchConversationService, 'handle', fail)
+    ResearchJobService._run_job('failure-job')
+    with maker() as db:
+        job = ResearchJobRepository(db).get('failure-job')
+        assert job['status'] == 'failed'
+        assert 'unauthorized' not in job['error']
+        assert 'claim_alignment' not in job['error']
+        assert '字段校验' in job['error'] if boundary_error else '内部错误' in job['error']
+    assert diagnostic in caplog.text
+    engine.dispose()
+
+
 def test_research_job_repository_tracks_cancel_request():
     db = _db_session()
     repo = ResearchJobRepository(db)

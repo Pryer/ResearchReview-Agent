@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from app.agent.provisional_routes import _build_provisional_route_prompt
 from app.agent.nodes.synthesis import _plan_citation_allocation
-from app.agent.prompts import RESEARCH_SEMANTIC_PARSER_PROMPT
+from app.prompt_catalog import RESEARCH_SEMANTIC_PARSER_PROMPT
 
 
 _DOMAIN_SPECIFIC_TOKENS = (

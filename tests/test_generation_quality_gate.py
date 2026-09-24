@@ -65,6 +65,20 @@ def _card(index: int) -> dict:
     }
 
 
+def test_search_answer_does_not_expose_internal_paper_id():
+    answer = _assemble_answer({
+        "intent": "search_papers", "topic": "课堂行为分析",
+        "ranked_papers": [{
+            "paper_id": "openalex:internal-123",
+            "title": "Classroom Interaction Review", "year": 2024,
+            "venue": "Journal of Education",
+        }],
+    })
+
+    assert "Classroom Interaction Review" in answer
+    assert "openalex:internal-123" not in answer
+
+
 def test_global_citation_backfill_normalizes_evidence_ids(monkeypatch):
     """回填分支必须能调用引用归一化，并把 evidence_id 还原为 paper_id。"""
     plan = WritingPlan(
@@ -79,9 +93,10 @@ def test_global_citation_backfill_normalizes_evidence_ids(monkeypatch):
         )],
         citation_policy={"minimum_unique_references": 2},
     )
-    cards = [_card(1), _card(2)]
+    cards = [_card(1), _card(2), {**_card(3), "quality_status": "invalid"}, _card(4)]
     cards[1]["evidence_spans"] = [{"evidence_id": "p2:e001"}]
-    original = "## 研究背景\n\n已有研究分析课堂互动编码及其教育应用[p1]。"
+    # 未知引用看似凑足两篇，但不应阻止对已分配论文 p2 的回填。
+    original = "## 研究背景\n\n已有研究分析课堂互动编码及其教育应用[p1][unknown][p3][p4]。"
 
     class BackfillLLM:
         def complete(self, prompt: str, **kwargs) -> str:
@@ -99,6 +114,7 @@ def test_global_citation_backfill_normalizes_evidence_ids(monkeypatch):
         {
             "required_reference_count": 2,
             "paper_cards": cards,
+            "unconfirmed_reference_ids": ["p4"],
         },
         BackfillLLM(),
         [original],

@@ -38,6 +38,29 @@ def _diagnostic_source_health(state: dict[str, Any]) -> str:
     return "healthy" if any(status == "success" for status in statuses) else "unknown"
 
 
+def is_stale_evidence_snapshot(report: dict[str, Any], state: dict[str, Any]) -> bool:
+    """派生报告是否落后于当前证据快照。
+
+    报告或状态任一侧未带版本号时返回 False：历史会话没有该字段，不能因为
+    缺少版本就把它判成陈旧并丢弃。
+    """
+    if not report:
+        return False
+    current_version = state.get("evidence_snapshot_version")
+    report_version = report.get("evidence_snapshot_version")
+    if current_version is None or report_version is None:
+        return False
+    if int(report_version or 0) != int(current_version or 0):
+        return True
+    current_fingerprint = str(state.get("evidence_snapshot_fingerprint") or "")
+    report_fingerprint = str(report.get("evidence_snapshot_fingerprint") or "")
+    return bool(
+        current_fingerprint
+        and report_fingerprint
+        and current_fingerprint != report_fingerprint
+    )
+
+
 def validate_research_state_invariants(state: dict[str, Any]) -> dict[str, Any]:
     """Return deterministic blocking violations and non-blocking warnings.
 
@@ -73,23 +96,34 @@ def validate_research_state_invariants(state: dict[str, Any]) -> dict[str, Any]:
 
     gap = state.get("evidence_gap_report") or {}
     current_version = state.get("evidence_snapshot_version")
-    gap_version = gap.get("evidence_snapshot_version")
     current_fingerprint = str(state.get("evidence_snapshot_fingerprint") or "")
-    gap_fingerprint = str(gap.get("evidence_snapshot_fingerprint") or "")
-    if gap and current_version is not None and gap_version is not None:
-        if int(gap_version or 0) != int(current_version or 0) or (
-            current_fingerprint and gap_fingerprint and current_fingerprint != gap_fingerprint
-        ):
-            blocking.append({
-                "code": "stale_evidence_snapshot",
-                "message": "证据缺口诊断不是当前证据快照，旧诊断不能驱动写作",
-                "details": {
-                    "state_version": current_version,
-                    "gap_version": gap_version,
-                    "state_fingerprint": current_fingerprint,
-                    "gap_fingerprint": gap_fingerprint,
-                },
-            })
+    if is_stale_evidence_snapshot(gap, state):
+        blocking.append({
+            "code": "stale_evidence_snapshot",
+            "message": "证据缺口诊断不是当前证据快照，旧诊断不能驱动写作",
+            "details": {
+                "state_version": current_version,
+                "gap_version": gap.get("evidence_snapshot_version"),
+                "state_fingerprint": current_fingerprint,
+                "gap_fingerprint": str(gap.get("evidence_snapshot_fingerprint") or ""),
+            },
+        })
+
+    # WHY: 门禁与缺口报告消费同一份证据，但过去只有缺口报告带快照版本。证据恢复
+    # 轮会 SPLIT 路线并改写 validated_routes，陈旧门禁的 route_stats 于是继续描述
+    # 拆分前的路线论域，而 derive_result_status 仍按它判定 success/partial。
+    gate = state.get("global_evidence_gate") or {}
+    if gate.get("status") == "EVALUATED" and is_stale_evidence_snapshot(gate, state):
+        blocking.append({
+            "code": "stale_global_evidence_gate",
+            "message": "全局证据门禁不是当前证据快照，旧门禁不能决定结果状态",
+            "details": {
+                "state_version": current_version,
+                "gate_version": gate.get("evidence_snapshot_version"),
+                "state_fingerprint": current_fingerprint,
+                "gate_fingerprint": str(gate.get("evidence_snapshot_fingerprint") or ""),
+            },
+        })
 
     if gap.get("needs_recovery") is True and current_version is not None:
         readiness = state.get("generation_readiness") or {}
@@ -105,6 +139,33 @@ def validate_research_state_invariants(state: dict[str, Any]) -> dict[str, Any]:
                 "message": "证据缺口仍需恢复，但生成状态无结构化解释地标记为 ready",
                 "details": {"needs_recovery": True, "readiness": readiness},
             })
+
+    # WHY: 门禁的 route_stats 必须描述当前 validated_routes 里的路线。恢复轮 SPLIT
+    # 路线后若门禁未重算，它会继续引用已不存在的父路线 ID，此时 route_balance_ratio
+    # 等指标与当前路线论域无关。历史会话的门禁没有快照版本，故只告警不阻断。
+    gate_route_ids = {
+        str(stat.get("route_id") or "")
+        for stat in ((gate.get("metrics") or {}).get("route_stats") or [])
+        if isinstance(stat, dict)
+    }
+    gate_route_ids.discard("")
+    current_route_ids = {
+        str(route.get("route_id") or "")
+        for route in state.get("validated_routes") or []
+        if isinstance(route, dict)
+    }
+    current_route_ids.discard("")
+    orphan_gate_routes = sorted(gate_route_ids - current_route_ids)
+    if gate_route_ids and current_route_ids and orphan_gate_routes:
+        warnings.append({
+            "code": "gate_route_universe_mismatch",
+            "message": "全局证据门禁统计了当前路线中不存在的路线，指标与本轮路线论域不一致",
+            "details": {
+                "gate_only_routes": orphan_gate_routes,
+                "gate_routes": sorted(gate_route_ids),
+                "current_routes": sorted(current_route_ids),
+            },
+        })
 
     reported_health = str(gap.get("source_health") or "").strip().lower()
     actual_health = _diagnostic_source_health(state)

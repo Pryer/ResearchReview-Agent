@@ -1,6 +1,11 @@
-# ReAct 检索流程完整示例
+# ReAct 检索流程示例（历史版本）
 
-本文档用一个模拟请求说明当前 ResearchReview-Agent 的完整运行过程。
+本文保留早期顺序检索流程的模拟说明，数字和日志不是实测结果。
+其中槽位、节点名、重试次数及 fallback 描述不应当作当前接口契约。
+当前默认入口由五字段主 Agent 决策、Controller 校验并委派，见
+[研究工作流](research-workflow.md)和[执行与恢复边界](agent-runtime-and-cache.md)。
+当前“引用不少于 N 篇”对应 `required_reference_count`（最终唯一有效引用），
+候选检索数由 `retrieval_target` 等另行约束；显式年份不足时不得静默扩年。
 
 示例请求：
 

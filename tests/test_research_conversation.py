@@ -742,6 +742,88 @@ def test_quality_gate_failure_enters_multi_turn_decision():
     assert len(saved["state"]["editable_research_state"]["paper_cards"]) == 2
 
 
+def test_new_count_gap_prompt_omits_dead_publication_type_option_and_old_answer_recovers(monkeypatch):
+    blocked = _quality_blocked_result()
+    clarification = ResearchConversationService._quality_clarification(blocked)
+    assert clarification is not None
+    assert "纳入更多文献类型" not in clarification["question"]
+
+    db = _db_session()
+    continued = []
+
+    def fake_continue(editable, **kwargs):
+        continued.append(editable)
+        return {
+            "answer": "检索已继续", "intent": "generate_introduction", "topic": "课堂行为分析",
+            "quality_gate": {"passed": True}, "steps": [], "references": [],
+            "paper_cards": editable["paper_cards"], "clusters": [], "errors": [],
+            "research_state": editable,
+        }
+
+    monkeypatch.setattr("app.agent.graph.continue_research_agent", fake_continue)
+    service = ResearchConversationService(db, llm=ClearTopicLLM(), agent_runner=lambda *a, **kw: {})
+    result = service._resume_after_quality_decision(
+        "old-type-option", {"original_query": "原研究请求"},
+        {"editable_research_state": blocked["research_state"]},
+        {**clarification, "question": "纳入更多文献类型"},
+        "纳入更多文献类型",
+    )
+
+    assert result["status"] == "completed"
+    assert len(continued) == 1
+    assert continued[0]["incremental_retrieval"] is True
+    assert continued[0]["allow_evidence_expansion"] is True
+    assert "include_preprints" not in continued[0]["research_request"]
+
+
+def test_focus_gap_clarification_and_authorized_retry_keep_targeted_search(monkeypatch):
+    db = _db_session()
+    blocked = _quality_blocked_result(required=3, available=3)
+    blocked["intent"] = "generate_review"
+    blocked["research_state"]["intent"] = "generate_review"
+    blocked["research_state"]["core_deliverables"] = ["research_status"]
+    blocked["quality_gate"] = {
+        "passed": False,
+        "phase": "pre_generation",
+        "blocking_issues": [{
+            "code": "required_focus_evidence_not_met",
+            "message": "用户明确研究重点缺少直接证据：重点甲",
+            "missing_focuses": ["重点甲"],
+        }],
+    }
+    captured = []
+    service = ResearchConversationService(
+        db, llm=ClearTopicLLM(), agent_runner=lambda *args, **kwargs: blocked
+    )
+
+    def continue_retrieval(session_id, original_query, state, editable):
+        captured.append(editable)
+        return {"status": "running", "session_id": session_id}
+
+    monkeypatch.setattr(service, "_continue_retrieval_and_persist", continue_retrieval)
+    first = service.handle(AgentRequest(
+        user_query="生成研究现状并覆盖重点甲", session_id="focus-quality-retry",
+    ))
+
+    assert first["status"] == "needs_clarification"
+    assert "重点甲" in first["clarification"]["question"]
+    assert first["clarification"]["recovery_kind"] == "focus_coverage"
+    for option in first["clarification"]["recovery_options"]:
+        assert service._parse_quality_decision(option, first["clarification"]) is not None
+
+    second = service.handle(AgentRequest(
+        user_query="补充检索", session_id="focus-quality-retry",
+        clarification_answer="补充检索",
+    ))
+
+    assert second["status"] == "running"
+    assert len(captured) == 1
+    assert captured[0]["allow_evidence_expansion"] is True
+    assert captured[0]["required_reference_count"] == 3
+    assert captured[0]["active_quality_recovery"]["action"] == "TARGETED_SEARCH"
+    assert captured[0]["active_quality_recovery"]["issues"][0]["details"]["missing_focuses"] == ["重点甲"]
+
+
 def test_quality_decision_accepts_available_and_regenerates_without_search(monkeypatch):
     db = _db_session()
     runner_calls = []
@@ -1047,7 +1129,7 @@ def test_every_clarification_option_label_is_parsable():
                 "code": "minimum_cited_references_not_met", "requested": 3, "actual": 2
             }],
         },
-        # 生成前可用篇数不足 → 接受当前篇数/扩大时间范围/纳入更多文献类型/放宽主题范围/继续检索
+        # 生成前可用篇数不足 → 接受当前篇数/扩大时间范围/放宽主题范围/继续检索
         {
             "passed": False,
             "phase": "pre_generation",
@@ -1094,7 +1176,7 @@ def test_every_clarification_option_label_is_parsable():
             checked += 1
     # 篇数与分类分支仍复用共享词表；缺少可编辑检查点的两个兜底分支只说明
     # 恢复前提，不再向用户展示无法推动任务的重写/补检索选项。
-    assert checked >= 14, checked
+    assert checked >= 13, checked
 
 
 def test_taxonomy_failure_recovers_without_user_decision(monkeypatch):

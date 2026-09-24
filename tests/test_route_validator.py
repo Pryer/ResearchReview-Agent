@@ -1,6 +1,79 @@
 """Focused tests for Route Validator v2 integration details."""
 
+from types import SimpleNamespace
+
 from app.agent.route_validator import merge_weak_routes_for_writing, prepare_route_anchors
+
+
+def test_split_requires_each_child_to_have_sufficient_core_evidence(monkeypatch):
+    from app.agent.route_validator import _split_oversized_routes
+
+    policy = SimpleNamespace(route_min_splittable_core=6,
+        route_oversized_share_factor=1.2, route_max_sub_routes=3,
+        route_min_core_evidence=3)
+    monkeypatch.setattr("app.agent.route_validator._distinctive_cluster_labels",
+        lambda clusters, *args, **kwargs: [f"子方向{index}" for index in range(len(clusters))])
+    routes = [{"route_id": "parent", "name": "父路线", "status": "KEEP",
+               "core_paper_ids": [f"p{index}" for index in range(6)]},
+              {"route_id": "other1", "name": "其他路线甲", "status": "KEEP"},
+              {"route_id": "other2", "name": "其他路线乙", "status": "KEEP"}]
+    cards = {f"p{index}": {"paper_id": f"p{index}", "title": f"Evidence {index}"}
+             for index in range(9)}
+
+    reassigned = _split_oversized_routes(routes, [], cards,
+        {f"p{index}": "parent" for index in range(6)}, policy=policy)
+
+    assert reassigned == {}
+    assert [route["route_id"] for route in routes] == ["parent", "other1", "other2"]
+
+    routes[0]["core_paper_ids"] = [f"p{index}" for index in range(9)]
+    reassigned = _split_oversized_routes(routes, [], cards,
+        {f"p{index}": "parent" for index in range(9)}, policy=policy)
+
+    assert len(reassigned) == 9
+    children = [route for route in routes if route.get("parent_route_id") == "parent"]
+    assert len(children) == 3
+    for child in children:
+        sufficiency = child["evidence_sufficiency"]
+        assert sufficiency["sufficient"]
+        assert sufficiency["core_paper_ids"] == child["core_paper_ids"]
+        assert sufficiency["core_evidence_count"] == len(child["core_paper_ids"])
+
+
+def test_full_route_validation_split_removes_parent_from_assignments():
+    from app.agent.provisional_routes import validate_routes_against_evidence
+
+    common = "课堂行为分析 行为编码 课堂观察"
+    cards = [
+        *[_behavior_card(f"a{index}", f"{common} 时间窗划分 时长统计 行为转移 {index}")
+          for index in range(6)],
+        *[_behavior_card(f"b{index}", f"{common} 师生互动 序列分析 滞后关系 {index}")
+          for index in range(6)],
+        *[_behavior_card(f"c{index}", "学习投入度 问卷量表 心理测量")
+          for index in range(2)],
+    ]
+    routes = [
+        _route_with("R1", "课堂行为分析方法", "如何分析课堂行为？",
+                    ["课堂行为分析", "行为编码", "课堂观察"]),
+        _route_with("R2", "学习投入度测量", "如何测量学习投入度？",
+                    ["学习投入度", "问卷量表", "心理测量"]),
+    ]
+
+    result = validate_routes_against_evidence(routes, cards, llm=None, topic="课堂行为分析")
+    live_ids = {route["route_id"] for route in result["validated_routes"]}
+    children = [route for route in result["validated_routes"]
+                if route.get("parent_route_id") == "R1"]
+
+    assert len(children) >= 2
+    assert "R1" not in live_ids
+    assert set(result["assignment_map"]) == {card["paper_id"] for card in cards}
+    for paper_id, assignment in result["assignment_map"].items():
+        for route_id in [assignment.get("primary_route"), assignment.get("best_route"),
+                         *(assignment.get("secondary_routes") or [])]:
+            assert not route_id or route_id in live_ids, (paper_id, route_id)
+    for child in children:
+        assert child["evidence_sufficiency"]["core_paper_ids"] == child["core_paper_ids"]
+        assert child["evidence_sufficiency"]["sufficient"]
 
 
 class AnchorExpansionLLM:

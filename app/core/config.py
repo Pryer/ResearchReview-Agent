@@ -119,6 +119,7 @@ class Settings(BaseSettings):
     # 最终成文预算；控制面结构化任务使用独立的较小预算。
     llm_max_tokens: int = 8192
     llm_control_plane_max_tokens: int = 4096
+    llm_native_tools_enabled: bool = True
     llm_request_timeout: int = 120
     # 意图、语义、消歧和检索规划属于可降级控制面。复杂的结构化检索规划
     # 实测可能超过 30 秒，因此给足一次完整生成时间（默认 120s）。主用调用
@@ -127,7 +128,22 @@ class Settings(BaseSettings):
     llm_control_plane_timeout: int = 120
     # 单个逻辑请求跨主/备用提供商的总 deadline，避免两边各等待完整 120 秒。
     llm_failover_total_timeout: int = 180
-
+    # 主 Agent 只消费 goal/state/key_evidence/decisions/open_questions。
+    # 这些限制约束可重建视图，不会裁剪权威研究状态或原始证据。
+    main_context_max_chars: int = 24000
+    main_context_max_evidence: int = 24
+    main_context_max_decisions: int = 16
+    main_context_max_open_questions: int = 16
+    # Provider 未统一暴露 tokenizer，运行时以字符数做保守硬限制，并为稳定
+    # system/tool 前缀与结构化决策输出分别预留预算。
+    main_context_system_reserve_chars: int = 6000
+    main_context_output_reserve_chars: int = 4000
+    agent_execution_action_budget: int = 64
+    agent_main_max_rounds: int = 24
+    agent_main_no_progress_limit: int = 3
+    agent_main_token_budget: int = 1000000
+    agent_retrieval_budget: int = 64
+    agent_execution_deadline_seconds: int = 1800
     # 备用 LLM 提供商：主用失败后自动切换，各 120s。
     # 留空则不启用备用，行为退化为「只用主用」。
     llm_backup_provider: str = ""

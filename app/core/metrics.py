@@ -34,11 +34,19 @@ class MetricsCollector:
         self._llm_calls_total = 0
         self._prompt_tokens_total = 0
         self._completion_tokens_total = 0
+        self._cache_hit_tokens_total = 0
+        self._cache_miss_tokens_total = 0
         self._llm_usage_by_model: Dict[str, Dict[str, int]] = defaultdict(
-            lambda: {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
+            lambda: {
+                "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                "cache_hit_tokens": 0, "cache_miss_tokens": 0, "calls": 0,
+            }
         )
         self._llm_usage_by_operation: Dict[str, Dict[str, int]] = defaultdict(
-            lambda: {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
+            lambda: {
+                "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                "cache_hit_tokens": 0, "cache_miss_tokens": 0, "calls": 0,
+            }
         )
         self._llm_durations: Deque[int] = deque(maxlen=self._max_samples)
 
@@ -77,16 +85,26 @@ class MetricsCollector:
         duration_ms: int = 0,
         operation: str = "completion",
         provider: str = "",
+        prompt_cache_hit_tokens: int = 0,
+        prompt_cache_miss_tokens: int = 0,
     ) -> None:
-        """记录一次 LLM 调用的 Token 使用情况与耗时。"""
+        """记录一次 LLM 调用的 Token 使用情况与耗时。
+
+        缓存命中/未命中单独累计：命中输入按服务商折扣计费，只看
+        ``prompt_tokens`` 无法算出真实费用，也无法判断前缀是否稳定。
+        """
         prompt_tokens = max(0, int(prompt_tokens or 0))
         completion_tokens = max(0, int(completion_tokens or 0))
+        cache_hit_tokens = max(0, int(prompt_cache_hit_tokens or 0))
+        cache_miss_tokens = max(0, int(prompt_cache_miss_tokens or 0))
         total_tokens = prompt_tokens + completion_tokens
 
         with self._lock:
             self._llm_calls_total += 1
             self._prompt_tokens_total += prompt_tokens
             self._completion_tokens_total += completion_tokens
+            self._cache_hit_tokens_total += cache_hit_tokens
+            self._cache_miss_tokens_total += cache_miss_tokens
             if duration_ms > 0:
                 self._llm_durations.append(int(duration_ms))
 
@@ -95,6 +113,8 @@ class MetricsCollector:
             m_stat["prompt_tokens"] += prompt_tokens
             m_stat["completion_tokens"] += completion_tokens
             m_stat["total_tokens"] += total_tokens
+            m_stat["cache_hit_tokens"] += cache_hit_tokens
+            m_stat["cache_miss_tokens"] += cache_miss_tokens
             m_stat["calls"] += 1
 
             op_key = operation or "completion"
@@ -102,17 +122,28 @@ class MetricsCollector:
             o_stat["prompt_tokens"] += prompt_tokens
             o_stat["completion_tokens"] += completion_tokens
             o_stat["total_tokens"] += total_tokens
+            o_stat["cache_hit_tokens"] += cache_hit_tokens
+            o_stat["cache_miss_tokens"] += cache_miss_tokens
             o_stat["calls"] += 1
 
     def get_token_report(self) -> Dict[str, Any]:
         """获取 Token 消耗明细快照。"""
         with self._lock:
             durations = list(self._llm_durations)
+            cache_total = self._cache_hit_tokens_total + self._cache_miss_tokens_total
             return {
                 "total_calls": self._llm_calls_total,
                 "total_prompt_tokens": self._prompt_tokens_total,
                 "total_completion_tokens": self._completion_tokens_total,
                 "total_tokens": self._prompt_tokens_total + self._completion_tokens_total,
+                "total_cache_hit_tokens": self._cache_hit_tokens_total,
+                "total_cache_miss_tokens": self._cache_miss_tokens_total,
+                # 以命中/(命中+未命中) 计算，不依赖各服务商对 prompt_tokens
+                # 是否含命中部分的口径；未上报缓存字段时为 None 而非 0。
+                "cache_hit_rate": (
+                    round(self._cache_hit_tokens_total / cache_total, 4)
+                    if cache_total > 0 else None
+                ),
                 "avg_llm_duration_ms": round(statistics.mean(durations), 1) if durations else None,
                 "by_model": {k: dict(v) for k, v in self._llm_usage_by_model.items()},
                 "by_operation": {k: dict(v) for k, v in self._llm_usage_by_operation.items()},
@@ -185,6 +216,8 @@ class MetricsCollector:
             self._llm_calls_total = 0
             self._prompt_tokens_total = 0
             self._completion_tokens_total = 0
+            self._cache_hit_tokens_total = 0
+            self._cache_miss_tokens_total = 0
             self._llm_usage_by_model.clear()
             self._llm_usage_by_operation.clear()
             self._llm_durations.clear()

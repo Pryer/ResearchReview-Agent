@@ -27,6 +27,7 @@ data/
 pytest_temp/
 pytest_tmp*/
 .pytest-tmp*/
+.pytest_*/
 \.pytest_cache/
 data/pdfs/*.pdf
 data/parsed/*.json

@@ -113,6 +113,9 @@ class AgentRequest(BaseModel):
 
     user_query: str = Field(..., description="用户自然语言请求", min_length=1, max_length=20_000)
     session_id: Optional[str] = Field(default=None, max_length=128, description="会话 ID（可选）")
+    resume_from_checkpoint: bool = Field(
+        default=False, description="显式从中断会话最后提交的检查点继续；保留原约束和累计预算"
+    )
     clarification_answer: Optional[str] = Field(
         default=None,
         max_length=10_000,

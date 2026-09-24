@@ -3,6 +3,78 @@
 This file is an append-only record of completed Agent changes. Each entry records
 what changed and how it was validated; it is not a replacement for Git history.
 
+## 2026-09-22 21:26:43 +08:00
+
+- **Modified files:** `.env.example`, `README.md`, `scripts/monitor_job.py`,
+  `tests/test_script_job_contracts.py`, `docs/change-log.md`
+- **Root cause/reason:** 对上一条三项修复做核查时发现三处收尾缺口：
+  (1) 代码默认 token 预算已改为 1,000,000，但 `.env.example` 与 README 配置表
+  仍写 100000，复制示例配置的部署会被环境变量静默覆盖回旧值；
+  (2) `scripts/monitor_job.py` 在 partial/blocked 且 answer 为空时仍回退到
+  "请查看任务结果中的质量缺口"静态话术，与 graph 层"展示真实阻断原因"的修复不一致；
+  (3) 上一条记录称"新增 6 个测试用例"，实际列出 8 个。
+- **Behavior change:**
+  - `.env.example` 的 `AGENT_MAIN_TOKEN_BUDGET` 与 README 配置表默认值同步为
+    `1000000`，与 `app/core/config.py` 默认值一致。
+  - monitor 脚本在 answer 为空时改为读取 `result.errors`（WHY: 任务载荷顶层无
+    errors，真实错误只在 result 内），逐条展示 message/code，均缺失时才输出
+    中性提示；不再出现"质量缺口"误导文案。
+  - 更正上一条记录的测试计数为 8。
+- **Tests/validation:**
+  - 新增根因回归 `test_monitor_blocked_without_answer_shows_real_error_reason`
+    （blocked + 空 answer + result.errors 含预算错误 → 输出真实原因且无
+    "质量缺口"）。
+  - 定向：`tests/test_script_job_contracts.py` 8 passed、`tests/test_agent_graph.py`
+    60 passed；`python -m py_compile scripts/monitor_job.py` 通过。
+  - 全量：1210 passed, 30 errors（均为既存 Windows `pytest-of-lenovo`
+    临时目录 PermissionError，隔离单跑同样必现，与本次改动无关），0 failed。
+- **Known limitations:**
+  - `scripts/submit_research.py` 的终态兜底是中性话术"请查看任务结果"，
+    不构成质量缺口误导，本次未改。
+  - monitor 脚本轮询段读取顶层 `d["errors"]`（当前任务载荷该字段恒为空）
+    属于既存死代码，未在本次范围内改动。
+  - 未跑真实 CNKI/LLM 端到端。
+
+## 2026-09-22 20:23:00 +08:00
+
+- **Modified files:** `app/agent/main_loop.py`, `app/agent/execution_budget.py`,
+  `app/core/config.py`, `app/agent/graph.py`,
+  `tests/test_main_agent_loop.py`, `tests/test_agent_completion_regressions.py`,
+  `tests/test_agent_graph.py`
+- **Root cause/reason:** 19:43:50 任务在写作前被 token 预算拦住，暴露三个问题：
+  (1) `read_summary` 是 no-op 控制动作，每次消耗 ~3,100 决策 token 但不推进研究，
+  连续两次后预算不足以继续；(2) 预留算法用 UTF-8 字节数 1:1 当 token 数 +
+  满额 max_tokens，对中文高估 1.5-3 倍，导致额度未耗尽即拦截；
+  (3) blocked 状态统一使用"请查看证据与质量缺口"的静态话术，但 quality_gate
+  实际为空，误导用户。
+- **Behavior change:**
+  - `read_summary` 现在直接递增 no_progress 计数并 `continue`，不再执行额外
+    的 handler 分支或指纹检查，到达 no_progress_limit 时立即 blocked。
+  - 预算预留改用字节/3.0 估算 token 数 + max_tokens × 0.6 利用率折扣 +
+    基于历史 prompt_cache_hit_tokens 的 EMA 缓存折扣。
+  - `agent_main_token_budget` 默认值从 100,000 调高到 1,000,000。
+  - blocked/failed/cancelled 公开回复现在引用 errors 列表中的真实 error code
+    并映射为用户友好的中文原因，不再使用静态话术。
+- **Tests/validation:**
+  - 新增 8 个测试用例：`test_read_summary_blocks_at_exactly_no_progress_limit`、
+    `test_read_summary_followed_by_real_action_resets_progress`、
+    `test_read_summary_does_not_invoke_handler`、
+    `test_reservation_uses_byte_to_token_ratio`、
+    `test_cache_hit_ratio_updates_on_settlement`、
+    `test_build_output_blocked_shows_budget_error`、
+    `test_build_output_blocked_without_errors_uses_fallback`、
+    `test_build_output_failed_shows_error_detail`。
+  - 调整 `test_token_budget_reserves_before_request_and_estimates_missing_usage`
+    的 token_limit 从 300 降到 100 以适配新预留公式。
+  - 全量测试 1209 passed, 30 errors（均为 Windows tmp_path PermissionError，
+    与本次改动无关）。
+- **Known limitations:**
+  - `_BYTES_PER_TOKEN=3.0` 和 `_MAX_TOKENS_UTILIZATION=0.6` 是经验值，
+    不同 tokenizer 可能偏差；若 provider 不返回 `prompt_cache_hit_tokens`，
+    缓存折扣不生效。
+  - `_ERROR_LABELS` 字典需随新 error code 的引入手动维护。
+  - 未验证端到端 CNKI/LLM 真实执行（需本地运行）。
+
 ## 2026-08-30 18:47:19 +08:00
 
 - **Modified files:** AGENTS.md, README.md, docs/architecture.md,
@@ -1110,3 +1182,461 @@ what changed and how it was validated; it is not a replacement for Git history.
   Streamlit page returned HTTP 200.
 - **Known limitations:** The external CNKI/LLM end-to-end scenario remains unrun.
   The prior entry's process-restart limitation is resolved. No Git commit was made.
+
+## 2026-09-21 16:41:34 +08:00
+
+- **Modified files:** `.env.example`, `ARCHITECTURE.md`, `app/agent/graph.py`,
+  `app/agent/state.py`, `app/agent/context_builder.py`,
+  `app/agent/context_compaction.py`, `app/agent/controller.py`,
+  `app/agent/tool_registry.py`, `app/agent/subagents/*`, `app/core/config.py`,
+  `app/database/models.py`, `app/database/repositories.py`,
+  `app/prompt/agent_system.py`, `app/schemas/context_schema.py`,
+  `app/schemas/agent_task_schema.py`, `app/services/llm_service.py`,
+  `app/services/research_artifact_service.py`,
+  `app/services/research_conversation_service.py`,
+  `docs/agent-context-architecture.md`, `docs/architecture.md`,
+  `docs/research-workflow.md`, `tests/test_agent_context.py`,
+  `tests/test_subagent_controller.py`, `tests/test_research_artifacts.py`, and
+  `tests/test_llm_service.py`.
+- **Root cause / reason:** The workflow had complete research state and evidence
+  provenance but passed task-specific prompt strings without a stable role prefix,
+  a bounded main-Agent context contract, or versioned specialist-task boundaries.
+  Long-lived sessions therefore had no single definition of which goal, state,
+  evidence, decisions, and unresolved questions belong in a control-plane context.
+- **Behavior change:** Added an exact five-field `MainAgentContext`, deterministic
+  compaction that preserves user hard constraints and blocking questions, stable
+  role/tool system prefixes, session-scoped context artifacts, and versioned
+  Search/Analysis/Writing Agent task contracts. Initial, incremental, and regenerated
+  retrieval, metadata, evidence extraction, route validation, clustering, claim
+  planning, and writing now pass through the controller. Stale task fingerprints are
+  rejected; specialist Agents cannot mutate the user goal or explicit constraints,
+  and the Writing Agent cannot change the evidence pool or claim authorization.
+  Existing retrieval/recovery loops, renderer pipeline, cancellation checks, and
+  evidence/quality gates remain authoritative.
+- **Tests and validation:** New context, compaction, task-boundary, artifact-isolation,
+  and stable-prefix tests passed. Targeted suites passed (`138 passed`, then `32
+  passed`, then `63 passed`). The final full suite passed (`1122 passed in 20.49s`).
+  `python -m compileall -q app` and `git diff --check` passed. Ruff was not available
+  in the configured environment (`No module named ruff`).
+- **Convergence review:** Confirmed that the controller delegates to the established
+  retrieval, evidence, and renderer implementations instead of duplicating those
+  pipelines; main-context snapshots are rebuildable views rather than a second
+  source of truth; scope/evidence/version changes invalidate old tasks; user count
+  and time constraints remain protected; and temporary migration branches were
+  removed. Regression tests cover the contracts and stale/protected-state behavior.
+- **Known limitations:** No live CNKI or external-LLM end-to-end run was performed,
+  so local tests do not measure real provider prompt-cache savings, model quality, or
+  production retrieval latency. Existing deployments must restart to create the new
+  `research_artifacts` table and load the new controller code. No Git commit was made.
+
+
+## 2026-09-21 17:50:30 +08:00 — 五字段主 Agent 剩余架构实施计划
+
+- **修改文件：** `plan.md`、`docs/change-log.md`。
+- **原因：** 当前实现已有五字段投影、快照及专业任务封装，但尚未接通主 Agent 决策循环、最小输入隔离、提交时版本校验和统一执行预算；需要可逐阶段执行及验收的计划。
+- **行为变化：** 仅更新文档。在根目录计划顶部加入 P0–P6：基线、可信上下文、资料与历史外置、隔离执行、主决策协议、全入口迁移、回归与发布验收；列明文件、依赖、68 个待办项、测试场景和完成标准。历史计划逐字节保留，本轮未改变应用行为或既有暂存代码。
+- **验证：** 历史计划后缀 SHA-256 与修改前一致；七阶段、代码围栏配对、未勾选状态及现有测试路径检查通过；文档 `git diff --check` 通过。
+- **已知限制：** 这是待实施计划，不代表功能已经完成。未运行应用测试或真实 CNKI/LLM 端到端；实施阶段须重新建立代码与测试基线，按实际节点读写字段落实权限和适配器。
+
+## 2026-09-21 18:17:02 +08:00 — 五字段主 Agent 决策闭环与隔离执行
+
+- **修改文件：** `.env.example`、`plan.md`、`ARCHITECTURE.md`、`app/agent/context_builder.py`、`app/agent/context_compaction.py`、`app/agent/controller.py`、`app/agent/graph.py`、`app/agent/state.py`、`app/agent/subagents/*`、`app/agent/tool_registry.py`、新增 `app/agent/action_registry.py`、`execution_budget.py`、`main_loop.py`、`main_policy.py`、`result_merger.py`、`task_context.py`，`app/core/config.py`、`app/database/repositories.py`、`app/schemas/agent_task_schema.py`、新增 `app/schemas/agent_decision_schema.py`、`app/schemas/context_schema.py`、`app/services/llm_service.py`、`research_artifact_service.py`、`research_conversation_service.py`、新增 `research_memory_service.py`、相关架构文档及测试。
+- **原因：** 五字段此前只是可重建摘要，下一步仍由固定 graph 决定；专业 handler 直接修改共享状态，只有执行前指纹检查，资料快照也可覆盖旧版本。该实现不能形成“五字段决策、受控委派、提交后再决策”的完整闭环。
+- **行为变化：** 增加严格单动作 `AgentDecision`、统一动作注册表以及原生工具/严格 JSON 决策通道；`autonomous` 模式在首轮、增量、重生成和仅验证入口执行 `build → decide → validate → execute → commit → rebuild`。五字段补充独立执行/研究状态、允许动作、近期轨迹、失败原因和资料摘要，阻断问题优先保留，不可压缩的硬约束明确失败。专业任务改在隔离深拷贝上执行并生成内部 patch，提交前同时复核内容指纹与状态版本；增加动作、轮次、token、截止时间、取消、无进展和幂等边界。artifact 改为不可变版本，损坏 JSON 显式报错，并增加追加式研究事件、结构化摘要和旧会话幂等导入。现有 renderer、证据门禁、主张/引用验证和发布状态继续作为最终裁决者。
+- **测试与验证：** 修改前定向基线 `304 passed`、全量基线 `1122 passed`；实施后定向回归 `324 passed, 2 failed` 暴露共享预算账本初始化缺陷，修复根因后对应回归 `9 passed`；最终全量 `1144 passed in 20.09s`。`python -m compileall -q app` 与工作树 `git diff --check` 通过。暂存区 `git diff --cached --check` 仍报告实施前已经暂存的若干新增文件 EOF 空行；工作树版本已清理，未改写用户的暂存区。
+- **收敛审查：** 工具说明、参数 schema、角色和权限统一由一个注册表生成；移除重复工具目录和未使用的受保护字段回滚分支；任务失败不再污染权威状态，执行完成与研究门禁结果分离；正文变化后仍运行同一验证链，模型的 `request_finish` 不能跳过门禁。新增回归覆盖五字段真实请求边界、后置阻断项、证据/约束失效、不可变资料、损坏资料、会话隔离、旧历史导入、任务异常隔离、执行中陈旧结果、零预算、幂等、提前交付拒绝、无进展终止及自主 graph 入口。
+- **已知限制：** 真实 CNKI/LLM 端到端本轮未执行，无法证明生产 provider 的原生工具兼容性、真实检索质量、成本和延迟；因此 `AGENT_ORCHESTRATION_MODE` 默认保持 `legacy`，需在外部验收后显式切换。远程请求在进程崩溃时只标记中断，不承诺 exactly-once；旧会话已经被历史窗口删除的内容无法恢复并会明确标记。未重启现有服务，未创建 Git commit。
+
+## 2026-09-21 22:11:53 +08:00 — 修复自主编排审计发现的八类缺口，纠正完成状态
+
+- **原因：** 上一条记录及计划顶部把“代码存在、测试通过”过度等同于完整接通。默认仍走旧图、引用修复漏传实参、澄清终态未持久化、长目标与用户决策可丢失、资料解析权限未进入生产调用、预算只覆盖主决策局部，以及会话模式/修复回退缺失均需修复。本条更正旧完成结论，不改写历史记录。
+- **修改文件：** `.env.example`、`plan.md`、`ARCHITECTURE.md`；`app/agent/{graph,context_builder,context_compaction,controller,execution_budget,main_loop,main_policy,action_registry,orchestration,task_context,state,tool_registry,generation_recovery,recovery_loop}.py`、`app/agent/nodes/retrieval.py`、`app/agent/subagents/base.py`；`app/core/{config,exceptions}.py`、`app/database/repositories.py`、`app/prompt/agent_system.py`、`app/schemas/{context_schema,artifact_schema}.py`；`app/services/{llm_service,research_artifact_service,research_execution_service,research_memory_service,research_conversation_service,research_job_service}.py`；`app/tools/{extract_paper_card,search_papers,fetch_metadata,download_pdf}.py`；`tests/test_agent_completion_regressions.py`、`tests/test_agent_context.py`、`tests/test_research_artifacts.py`、`tests/test_research_memory.py`、`tests/test_agent_graph.py`、`tests/test_global_evidence_gate.py`；相关架构/流程文档及本日志。
+- **行为变化：** 新会话默认自主编排，模式持久化；无模式字段的旧会话继续 legacy。引用缺口修复补齐参数。等待用户状态映射为 `needs_clarification`，保存问题/私有状态，恢复时保留证据池、吸收最新显式年份/篇数和完整澄清；等待、失败、取消不公开正文。写作与引用修复统一验证后比较候选质量，退化则恢复原生成产品并重验。完整原始请求、实际语义帧显式要求、用户决策和阻断问题不会被静默截断。
+- **资料与预算：** 增加 artifact 类型/版本/角色注册表、内容校验、来源引用、分片定位及受控 PDF 文件引用；会话私有重载字段保存为 manifest，恢复时强制检查会话/类型/角色/版本。缺失、损坏、越权、版本不匹配分别报错；单个载荷/来源信息限制 256 KiB，会话 JSON 限制 8 MiB，禁止嵌入 PDF。会话解析、主循环、专业任务和自动恢复共享账本/截止时间；真实模型请求前预留，usage 核销，无 usage 或失败请求保守估算并标记；检索轮次、恢复子额度、嵌套动作计费与线程上下文一并接入。
+- **决策边界：** 原始需求解析归属检索规划适配器，主决策仅发送五字段动态 JSON；工具定义固定，允许动作/拒绝原因放在 state 内。明确不支持原生工具协议时，可在有界次数内转严格 JSON，连接失败不伪装协议不支持。只查论文和仅验证入口限制动作集合；finish 核对当前证据/正文/授权的验证指纹。
+- **测试与验证：** 复跑原测试得到 `1144 passed`；切换默认模式后发现 8 个固定旧图的 mock 用例不支持新决策接口，明确将旧图兼容性测试固定 legacy，另增默认自主入口验证，未在生产路径回退掩盖失败。新增审计回归共 25 项；最后定向 `74 passed in 3.12s`，最终全量 `1169 passed in 22.71s`（`D:\Anaconda\envs\rragent\python.exe -m pytest -q --basetemp .pytest_tmp_repair_final`）。编译检查和工作树 diff 检查通过；暂存区仍有上一轮已存在的 EOF 空行，未改写 index。
+- **收敛审查：** 核对生产入口及 downstream 状态；去掉主循环事后重复 token 累加，实际 provider 请求统一预留/核销；账本不进入可回滚研究 patch；写作与引用修复共用退化回退；取消和截止后拒绝迟到提交；清除修复快照临时字段。回归覆盖实际故障路径和 provider 消息边界，继续保留显式引用要求、证据溯源与确定性质量门禁。
+- **已知限制：** 真实 CNKI/LLM 端到端未运行，未重启现有服务、未 git add 或 commit。新默认值需要重启服务后对新会话生效；旧会话模式不随全局配置改变。本轮八类修复不等于原计划所有要求完成：操作级完整输入 allowlist、任务/预算/状态的数据库原子 CAS、所有旧会话分支的增量长期归档仍有待办，已在 plan.md 明示；不承诺远程请求 exactly-once。原 plan.md 被 Git 忽略，本日志同步保存验收证据，新增模块和测试仍需在提交时纳入。
+
+## 2026-09-21 23:30:14 +08:00 — 修复章节改写线程绕过共享预算与取消边界
+
+- **修改文件：** `app/deliverables/renderers/base_renderer.py`、
+  `tests/test_agent_completion_regressions.py`、`docs/change-log.md`。
+- **根因：** `_write_sections_in_chinese` 用裸 `executor.submit(rewrite, section)`
+  派发章节改写，而预算账本、取消回调和截止时间都存放在 ContextVar 中，不会跨
+  线程传播。工作线程内 `_ACTIVE.get()` 为 `None`，`budgeted_create` 因此在
+  `execution_budget.py:95-96` 静默走裸 provider 调用：不预留、不核销、不检查
+  取消与截止，且无任何日志。章节改写每节最多 3 次尝试并可能追加英文残留局部
+  修复，是大篇数综述中最重的 LLM 消耗路径，等于该路径整体在账本与取消边界之外。
+  同批工具（`search_papers`、`fetch_metadata`、`download_pdf`、`extract_paper_card`）
+  与 `nodes/retrieval.py` 已改用 `submit_with_context`，渲染器是遗漏点。
+- **行为变化：** 章节改写改用 `submit_with_context` 派发，继承当前预算作用域，
+  因此每次模型调用都在请求前预留 token、返回后按真实 usage 核销（无 usage 时
+  保守估算并标记），并受取消与截止时间约束。同时补齐三处异常边界：改写重试循环、
+  英文残留局部修复和 `future.result()` 收集处，均在通用 `except Exception` 之前
+  重抛 `AgentBudgetExceeded` 与 `AgentCancelledError`。修复前取消会被记为
+  「模型调用失败」继续重试至 3 次，或被收集为 `fallback` 诊断后照常合成正文；
+  修复后取消与预算耗尽立即终止改写并向上传播。同步改写救援路径
+  `_merge_failed_or_missing_sections` 因复用同一 `rewrite` 闭包而一并受保护。
+  真实模型失败仍包装为 `LLMInvocationError` 并保持原有章节级重试与降级语义，
+  证据门禁、引用校验和渲染管线未改动。
+- **测试与验证：** 新增回归
+  `test_section_rewrite_threads_share_budget_and_propagate_cancel`，断言取消在
+  第二次尝试生效、不产生第三次调用、也不留下 `writer_section_diagnostics`。
+  双向鉴别力已实测：把 `submit_with_context` 打回裸 `submit` 时该用例失败
+  （`DID NOT RAISE`，日志为 `attempts: 3`、`status: evidence_limited`）；保留
+  上下文传播但使重抛子句失配时同样失败（日志为
+  `模型调用失败：research execution cancelled`、`attempts: 1`），证明两类改动
+  均为必要而非冗余。定向套件 `146 passed`、`26 passed`；全量
+  `1170 passed in 30.48s`（`python -m pytest -q --basetemp=<可写目录>`，
+  使用 `--basetemp` 是为规避本机共享临时目录 `pytest-of-lenovo` 的
+  `PermissionError` 假失败）。`python -m compileall -q app tests` 与
+  `git diff --check` 通过。临时鉴别脚本与临时测试目录均已删除。
+- **收敛审查：** 修复落在唯一的章节派发点，未新增并行派发路径或回退分支；
+  `submit_with_context` 与 `except (AgentBudgetExceeded, AgentCancelledError): raise`
+  均沿用仓库既有模式（`llm_service.py:305`、`graph.py:796`、`controller.py:169`），
+  未自造取消语义；三处非显然约束各附简短中文 WHY 注释；回归覆盖根因（上下文
+  传播与异常穿透）而非仅覆盖可见症状。
+- **已知限制：** 未运行真实 CNKI/LLM 端到端，因此本次只证明记账与取消边界在
+  本地生效，未测量真实 provider 下的 token 预估偏差；`budgeted_create` 以 UTF-8
+  字节数作为缺失 usage 时的保守上界，对中文约有 3—5 倍高估，且与真实 usage
+  计入同一 `llm_tokens` 计数器，可能使预算提前耗尽，该问题本轮未处理。
+  `usage_estimated` / `estimated_tokens` 标记仍无消费方，未进入五字段上下文、
+  公开输出或任何门禁。`retrieval_limit` 仍按节点调用次数而非外部请求数计量，
+  `download_pdf` 与 `fetch_metadata` 仍不计入检索额度。未重启现有服务，
+  未 `git add` 或 commit；`base_renderer.py` 与新增测试文件目前仍为未跟踪状态，
+  提交时需一并纳入。工作区中 `pytest_tmp_*` 目录为上一轮遗留且已被
+  `.gitignore:28` 忽略，本轮未删除。
+
+## 2026-09-22 00:03:43 +08:00 — 收窄章节检查点失效范围并接入缓存命中埋点
+
+- **修改文件：** `app/tools/write_deliverable.py`、
+  `app/deliverables/renderers/base_renderer.py`、
+  `app/deliverables/renderers/__init__.py`、`app/core/metrics.py`、
+  `app/services/llm_service.py`、`tests/test_section_checkpoint_fingerprint.py`（新增）、
+  `tests/test_metrics_observability.py`、`tests/test_llm_service.py`、
+  `docs/change-log.md`。
+- **根因：** 两处都阻碍成本可观测与复用。（1）`_section_input_fingerprint` 把全局
+  `evidence_snapshot_fingerprint` 整体纳入指纹，而该快照覆盖全部论文与路线，
+  因此新增一篇与本章无关的论文就会废掉所有章节检查点；同时它又不覆盖真正进入
+  章节提示词的输入——claim 约束、主题、研究范围、必读重点、证据角色和引用政策
+  都不在其中，属于既过宽又覆盖不足。（2）`metrics.record_llm_call` 只记录
+  `prompt_tokens` / `completion_tokens`，全项目没有任何位置读取服务商返回的
+  `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`，且
+  `complete_tool_call`（主 Agent 原生工具决策路径）完全不上报指标，因此既看不到
+  命中率也算不出真实费用。
+- **行为变化：** 章节指纹改为逐项列出本节真实输入：交付物类型、`citation_policy`、
+  章节定义、本节引用分配、本节论文卡片证据与筛选决定、**与本章相交的路线**、
+  主题、研究范围描述、必读重点、证据角色标签，以及本节匹配到的 claim 约束文本；
+  另保留 `survey_papers` 作为唯一合法的全局输入，因为综述清单注入每一节提示词。
+  claim 约束匹配逻辑从 `_write_sections_in_chinese` 内的闭包提升为模块级
+  `_claim_constraints_for_title`，由渲染器与指纹共用同一实现，避免失效判定与
+  实际提示词输入漂移；闭包与 `_claim_plan_by_route` 已删除，未保留并行分支。
+  指标侧新增 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 入参，
+  按总量、模型和操作分别累计，`get_token_report` 输出
+  `total_cache_hit_tokens`、`total_cache_miss_tokens` 和 `cache_hit_rate`；
+  命中率以 命中/(命中+未命中) 计算，不依赖各服务商对 `prompt_tokens` 是否含
+  命中部分的口径，未上报缓存字段时为 `None` 而非 0。普通补全与原生工具决策
+  统一经新增的 `LLMService._record_usage` 上报，工具决策结果中的 `usage` 同时
+  携带缓存明细。`MetricsCollector.reset()` 一并清空新增累计字段。
+- **测试与验证：** 新增 `tests/test_section_checkpoint_fingerprint.py` 6 项：
+  无关论文/路线变化且全局快照显式改变时指纹保持不变；claim 约束、主题、研究
+  范围、必读重点变化时指纹必须改变；本节证据、筛选决定与路线归属变化仍失效；
+  综述论文变化失效而非综述论文不失效；引用政策变化失效。指标侧新增 3 项
+  （缓存分模型/分操作累计、未上报时命中率为 `None`、`reset` 清空缓存累计），
+  并新增 1 项验证原生工具决策进入指标且携带缓存明细。既有
+  `test_role_bound_native_tool_call_injects_prefix_and_returns_one_call`
+  因 `usage` 契约扩展而更新断言，未放宽其他检查。全量
+  `1180 passed in 34.09s`（`python -m pytest -q --basetemp=<可写目录>`）；
+  首次全量曾暴露 `reset()` 未清缓存累计导致单例串味，已修根因并补专项回归。
+  `python -m compileall -q app tests` 与 `git diff --check` 通过，临时目录已清理。
+- **收敛审查：** 指纹在复用判定与检查点保存两处调用同一函数、同一入参，
+  且新增字段均非渲染过程会改写的状态，两侧对称；claim 匹配只有单一实现；
+  用量上报只有单一入口。收窄的同时补齐了此前未覆盖的真实输入，未以降低
+  失效强度换取复用率。两处非显然约束均附简短中文 WHY 注释。
+- **已知限制：** 章节指纹仍未覆盖改写前的证据草稿原文，因为草稿在
+  `renderer.render` 内部才生成，而复用判定必须先于渲染；本轮通过保留本节
+  证据卡片摘要与路线归属来间接覆盖，未改动渲染管线顺序。`citation_policy`
+  变化会使指纹失效，但授权集合（`allowed_claim_ids` 等）变化仍不由指纹直接
+  覆盖，这与改动前的全局快照一致，未新增缺口也未修复。缓存埋点只提供可见性，
+  尚未据此调整任何提示词顺序；真实命中率与分步费用需要一次真实 CNKI/LLM
+  运行才能得到，本轮未执行。未重启服务，未 `git add` 或 commit；
+  `tests/test_section_checkpoint_fingerprint.py` 为未跟踪新文件，提交时需纳入。
+
+## 2026-09-22 18:36:38 +08:00 — 动作契约、持久化提交/恢复与缓存边界修复
+
+- **修改文件：** `app/tools/write_deliverable.py`、
+  `app/deliverables/renderers/base_renderer.py`、`app/prompt/paper_card.py`、
+  `app/prompt/writing/{section,deliverable}.py`、`app/services/llm_service.py`；
+  `app/agent/{action_contracts,task_context,result_merger,controller,execution_budget,main_loop,graph,state}.py`、
+  `app/agent/subagents/base.py`；`app/database/{models,repositories,runtime_repository}.py`；
+  `app/services/{durable_execution_service,research_execution_service,research_memory_service,research_artifact_service,research_conversation_service,research_job_service}.py`；
+  `app/schemas/agent_schema.py`、`app/api/routes_review.py`、`scripts/migrate_agent_runtime.py`；
+  `tests/test_{section_checkpoint_fingerprint,cache_usage_boundaries,action_contracts,durable_runtime,research_memory,llm_service,agent_completion_regressions}.py`；
+  `docs/{agent-context-architecture,agent-runtime-and-cache}.md`、
+  `docs/validation/2026-09-22-runtime-cache.md` 及本日志。
+- **原因：** 章节指纹未覆盖实际授权投影、确定性原稿及末路线义务；工具响应解析失败、
+  空内容重试和取消后返回的真实响应存在漏计路径。专业输入使用排除式复制，输出缺少
+  完整动作契约；任务版本/预算主要在内存中，历史摘要重复回放，崩溃后缺少明确恢复入口。
+- **行为变化：** 指纹与渲染共用授权输入和 claim 约束实现，复用前构建确定性草稿，
+  仅保留真实共享综述输入；无关论文不扩大失效范围。固定规则与输出结构前置，动态
+  材料后置；原生工具请求不再重复发送文本工具目录，JSON 回退保留目录。每次真实
+  响应先记账再解析/取消检查，重试和备用分别计量，展示指标与共享预算职责保持区分。
+- **动作边界：** 十个专业动作具有显式输入投影、输出/删除白名单和类型校验；提交端
+  再验身份、输入指纹和版本。补齐实际路线 `coverage`、写作核验 `required_concepts`
+  等依赖，不删除证据或放宽质量门禁来换取通过。
+- **数据库与恢复：** 新增六张执行/事件表，提供租约、CAS、幂等任务和持久化请求账本；
+  动作状态/资料/结果/事件原子提交。取消先落库时拒绝迟到研究提交，但已付费用量仍保留。
+  崩溃未决请求按预留保守标为 uncertain，不自动重放；旧所有者不能回写新账本。
+  后台领取使用 queued→running CAS。历史在截断前归档，数据库标记确保旧历史只迁一次，
+  摘要按游标增量处理；恢复优先最新已提交检查点，支持 `resume_from_checkpoint=true`，
+  保留原目标、篇数/年份和累计消耗。大型任务结果分片保存，内部归档键不进入历史 API。
+- **验证：** 最终全量 **1224 passed in 38.08s**；`compileall` 与常规 `git diff --check`
+  通过。新增真实 SQLite 并发、事务故障回滚、崩溃未决、取消、迟到、重复回调/投递、
+  迁移、历史恢复和结构化诊断回归。额外关闭 Git 换行转换的检查会报告既有 CRLF 文件，
+  未为清除此类报告而批量重写原有工作区文件。
+- **真实验收：** 主密钥未配置，使用现有备用 LLM；真实 CNKI 已返回元数据。
+  40 篇场景首轮暴露结构化诊断序列化问题，已修根因并回归；恢复后累计 81,037 tokens，
+  下一请求预留超过 100,000 总预算的剩余额度，明确 blocked，约束仍为 40 篇与
+  2024–2026，未交付正文。该恢复轮实际缓存命中率 20.51%，不是节费提升比例。
+  另一次有界烟测完成真实原生 LLM→CNKI 3 篇→动作提交→数据库重开恢复；首次浏览器
+  启动失败保留失败记录，重试成功，未清账。完整证据和限制见本轮验收文档。
+- **收敛审查：** 授权投影、指纹和提示约束各有单一实现；用量在真实响应边界统一上报；
+  无试验性并行实现或新增降质回退。保留的复合动作、未决费用、租约时序和分片语义
+  均附中文 WHY 注释；回归验证根因。仅本轮烟测遗留的 headless 浏览器已关闭。
+  对明确列出的本轮临时脚本/测试目录发起清理时，自动审批返回 blocked by policy，
+  未给出更具体理由；该命令未执行，临时文件仍保留，未尝试绕过。
+- **限制：** 40 篇完整交付未验收通过；没有扩大预算或降低篇数。尚未对相同质量的
+  完成综述做改动前后费用比较，不能承诺节费比例。持久化保证适用于会话服务入口，
+  graph-only 仍为内存模式；崩溃租约需到期才可接管，远端调用仍依赖超时/协作取消。
+  旧版本已截断历史无法恢复。本轮未修改部署密钥、未重启服务、未 git add/commit，
+  保留所有原有未提交改动；新增文件需在后续提交时一并纳入。
+
+## 2026-09-22 19:07:08 +08:00
+
+- **Modified files:** ARCHITECTURE.md, docs/change-log.md
+- **原因：** 对照代码审计发现 ARCHITECTURE.md 目录树存在 6 处遗漏：
+  `app/agent/` 下 48 个文件只列了 12 个关键入口，缺少 `state.py`、`planner.py`、
+  `writing_plan.py` 等核心模块；`app/core/` 未提及 `logger`、`exceptions`、
+  `source_capabilities`、`citation_density`；`app/frontend/` 遗漏 `progress_labels.py`；
+  `app/utils/` 遗漏 `title_cleaner.py`；`app/prompt/` 未说明 `writing/` 子目录；
+  `scripts/` 遗漏 `inspect_eval_bundle.py`；根目录缺 `examples/`。
+- **行为变化：** 纯文档修正，无代码或行为变化。
+- **验证：** 修改后文件内每个列出的模块和目录均已在工作区确认存在。无需运行测试。
+- **限制：** `app/agent/` 目录实际有 48 个文件，补齐后列出约 35 个关键模块；
+  `decorators.py`、`geography.py`、`example_retriever.py`、`prompts.py`、
+  `regression_cases.jsonl`、`router.py` 等辅助文件仍未逐一列出。
+
+
+## 2026-09-22 18:56:01 +08:00 — README 与架构入口同步当前控制及持久化机制
+
+- **修改文件：** `README.md`、`ARCHITECTURE.md`、`docs/architecture.md`、
+  `docs/research-workflow.md` 及本日志。
+- **原因：** 上轮已更新上下文、运行机制和验收专项文档，但 README 未同步，
+  根目录架构仍残留顺序 MVP、旧目录和重启自动恢复队列等不完整表述。
+- **文档变化：** 补充默认 autonomous 五字段单动作循环、专业动作输入投影及输出
+  校验、数据库 CAS/租约、持久化预算、取消提交保护、增量历史与显式检查点恢复。
+  README 增加恢复请求示例、迁移/重启说明、七项代码配置默认值和专项文档链接；
+  区分 legacy 研究阶段图与自主控制循环，并明确会话服务与 graph-only 的持久化边界。
+  对齐章节指纹的实际依赖，保留完整验证与真实验收未完成项。
+- **验证：** 四份文档的 25 个本地链接有效；七项配置默认值与 `Settings` 声明一致；
+  恢复 JSON 示例通过 `AgentRequest` 校验；指定过期架构表述已清除；
+  `git diff --check` 通过。仅改文档，未重复运行 pytest、CNKI 或 LLM。
+  文档中的 1224 项测试及真实烟测结论引用上轮 2026-09-22 验收记录。
+- **限制：** 40 篇完整交付仍是预算阻断，未改写为验收通过；未承诺固定缓存节费比例。
+  本轮未修改应用、配置、数据库或历史架构设计稿，未提交 Git、未重启服务。
+  原有未提交改动保持不动；历史日志按字节保留，仅追加本条。
+
+
+## 2026-09-22 19:20:34 +08:00 — 周边文档、恢复示例与操作脚本契约同步
+
+### 修改文件
+
+- `.env.example`、`README.md`、`ARCHITECTURE.md`。
+- `docs/multi_turn_research.md`、`docs/CHAT_FRONTEND_GUIDE.md`、`docs/ResearchReview-Agent-architecture.md`、`docs/react_workflow_example.md`。
+- `scripts/README.md`、`scripts/submit_research.py`、`scripts/monitor_job.py`。
+- `examples/README.md`、`examples/checkpoint_resume_request.json`、`tests/test_script_job_contracts.py`。
+- 本地被 Git 忽略的 `plan.md` 增加当前进展说明；正式记录保留在本文和版本管理内的架构文档。
+
+### 原因与行为
+
+- 主架构入口已同步，但会话指南仍描述澄清 MVP，前端指南混淆浏览器会话和后端持久化，还引用不存在的旧前端入口。
+- 更新真实异步 API、各终态、取消、修订与显式检查点恢复；明确当前前端没有恢复按钮或数据库会话列表重建功能，展示窗口不等于完整事件档案。
+- 补充运行时迁移、服务入口与 graph-only 验证区别、进程内指标与持久化账本区别、缓存缺测及预算预留语义。配置仅加注释，不修改配置值或本地 `.env`。
+- 旧架构稿和早期 ReAct 示例标记为历史版本；计划保留旧日记录并增加当前状态。README/ARCHITECTURE 的 1224 项数字明确归属上轮验收，后续结果查变更日志。
+- 提交脚本移除公开请求白名单不接受的 `our_work_description`（同一研究范围已完整保留在 user_query）；两个监控脚本收到 partial/blocked/needs_clarification 时按终态结束并展示缺口，不再无期限轮询或暗示完整成功。
+
+### 验证与收敛
+
+- 新增 7 项模拟回归：实际提交 payload 经 AgentRequest 校验，两个监控入口分别在 partial/blocked/needs_clarification 响应后只查询一次、不会继续 sleep，不显示质量通过。
+- 定向回归 22 passed；最终全量 1231 passed in 37.10s。
+- 最初全量因系统临时目录权限错误出现 30 项 fixture 错误；首次工作区替代目录又因父目录尚未创建失败。创建工作区内父目录后，使用新的隔离 basetemp 完整重跑通过；未放宽断言或改生产实现。
+- 18 个本次文档本地链接（plan 仅检查新增当前说明）、4 个标准请求示例、3 个会话指南 JSON 请求通过；3 个改动 Python 文件语法检查及 git diff --check 通过。
+- 最小行为复核：应用 app/ 本轮未改；脚本仅修公开入参和终态处理，既有完整成功导出行为保持；历史设计正文和旧日志未重写，新增约束附中文 WHY 注释。
+
+### 限制
+
+- 未重跑真实 CNKI/LLM，40 篇完整交付仍以既有验收记录中的预算阻断结论为准，不能据离线通过宣称外部交付成功。
+- 独立 monitor_job 工具仍未传 API-key header，部署鉴权时使用主前端或带鉴权的 API 客户端；该边界已写入脚本说明。
+- 未重启服务、未创建 Git 提交；保留此前工作区改动。测试产物保留在 Git 忽略的 data/test_runs 下。
+
+
+## 2026-09-22 21:37:30 +08:00 — 预算边界、摘要空转与公开停止原因根因修复
+
+- **修改文件：** `app/agent/execution_budget.py`、`app/agent/action_registry.py`、`app/agent/main_loop.py`、`app/agent/public_errors.py`、`app/agent/graph.py`、`app/prompt/agent_system.py`、`app/database/runtime_repository.py`、`app/database/repositories.py`、`scripts/update_session_budget.py`；`tests/test_budget_and_stop_boundaries.py`、`tests/test_main_agent_loop.py`、`tests/test_agent_completion_regressions.py`、`tests/test_agent_graph.py`、`tests/test_durable_runtime.py`；`docs/agent-runtime-and-cache.md`、`docs/multi_turn_research.md`、`scripts/README.md` 及本日志。
+- **根因：** read_summary 的 continue 仍重新调用模型；缓存/平均输出折扣与总 token 扣账口径不一致，超支检查发生在本次结算之前；公开错误处理假定所有 errors 都是字典并透传技术错误，且混淆超时与额度。新默认额度不应静默覆盖旧账本；显式额度调整后，研究版本未变也需要刷新账本。
+- **行为变化：** 删除无实际读取行为的 read_summary 工具和循环分支；主 Agent 每轮已自动获得摘要，实际动作及门禁拒绝仍保留无进展上限。移除字节除三、输出六成及缓存 EMA 预留折扣；当前无已验证 provider tokenizer，使用字节上界余量与完整输出上限。响应先上报并结算实际用量，再检查超支/取消/时限，越界响应不得交给后续解析/提交；缺测和崩溃未决仍按完整预留估算。
+- **行为变化：** 统一公开停止原因映射，兼容字符串错误，区分 token、次数、截止和无进展；保留经过限制的自然语言阻断说明，不把技术异常原文拼入公开回复。新增空闲会话额度调整 CLI，数据库按原额度/版本/账本 CAS，拒绝执行占用、排队任务与未决请求，保留累计用量并写审计事件；不自动恢复研究。会话读取独立获取最新预算，不依赖研究快照版本改变。
+- **验证：** 首轮定向 134 passed / 1 failed；失败来自新测试以相同无变化输入期待重复 handler 执行，实际被既有幂等复用正确阻止。改为两次被拒绝交付后发生真实进展的场景验证计数重置，未改生产幂等行为。最终关键定向 39 passed；全量 **1253 passed in 39.24s，0 failed，0 errors**，使用工作区隔离 basetemp。compileall、文档本地链接、CLI --help、1M 默认值/示例/README 一致性及 git diff --check 通过。
+- **回归覆盖：** 预算不足不得发请求、缓存不改变总量预留/缺测估算、实际异常超支先计费再拒绝响应/后续请求、混合类型错误不崩溃、技术文本不进入回复、超时与次数额度准确展示、摘要工具从各传输目录消失、真实动作无进展与后续进展、显式额度调整后的用量/约束保留、旧额度 CAS 冲突与活动任务拒绝、同版本会话账本刷新。
+- **收敛复核：** 根因路径与调用/提交边界已复核；删除原空转专用分支、折扣常量与 EMA 更新代码，公开停止原因仅一处实现；保留的时序与账本语义附中文 WHY。替换测试不再仅比较估算公式变小，而验证请求、结算、输出的实际行为。用户此前配置同步和监控脚本修改保持不动；历史日志按字节保留，只在末尾追加本条。
+- **限制：** 字节预留仍偏保守，未宣称精确计费或硬性阻止服务商异常超量计费；发生的用量不可撤回，但异常响应不会继续用于研究。本轮未启动真实 CNKI/LLM、未完成 40 篇交付验收、未重启服务、未修改生产会话额度、未 Git 提交。默认 1M 已同步；原会话需管理员明确执行预算更新命令后再显式恢复。测试产物保留在 Git 忽略目录。
+
+## 2026-09-22 22:20:48 +08:00 — 写作结果提交契约与后台公开错误修复
+
+- **修改文件：** `app/agent/action_contracts.py`、`app/agent/writing_plan.py`、`app/agent/public_errors.py`、`app/services/research_job_service.py`、`tests/test_writing_action_boundaries.py`（新增）、`tests/test_jobs_and_revision.py`、`docs/agent-runtime-and-cache.md` 及本日志。
+- **根因：** 写作/改写动作内部执行写后验证，却未获准提交主张对齐与引用授权一致性结果；背景规划将仅在本次编译使用的动态提纲写进全局状态，触发严格白名单拒绝。后台任务异常又直接透传至前端。此前集成测试模拟整个验证链，未产生真实验证字段。
+- **行为变化：** 写作产物集合补入 `claim_alignment`、`claim_citation_consistency`，覆盖生成、改写和独立验证；动态提纲改为函数局部参数，其目标和比较维度仍进入 WritingPlan，不写入状态、不沿用旧提纲。后台执行失败共用公开停止原因映射，原始异常保留在服务端日志。未关闭提交校验、扩大到任意分析输出，未修改年份、40 篇等用户约束或质量门禁。
+- **验证：** 新增 9 项回归，覆盖真实规划及写后对齐/引用检查经过 Controller 双端校验后提交、三种动作仍拒绝不足 40 篇的交付、非法字段/类型/约束修改拒绝、动态提纲不泄漏及旧提纲不复用、后台字段越界和未知异常安全展示且保留日志。外部模型使用替身；组合回归替代正文生成和语义模型节点，保留真实规划、确定性验证和门禁，并非完整外部 E2E。
+- **测试结果：** 首次定向 46 passed / 3 failed：新测试错误地把独立验证归属 Writing，另将无计划、无质量诊断的裸文本用作上轮候选，触发既有质量回滚。按动作注册表派发角色、明确测试输入为未生成正文后，定向 **49 passed**；全量 **1262 passed in 40.95s，0 failed，0 errors**（工作区隔离 basetemp）。compileall 与 git diff --check 通过。
+- **收敛复核：** 生产代码不再读写临时提纲状态键；仅保留明确的局部参数和已有输出契约，未添加忽略未知字段或吞掉边界异常的分支。必要生命周期与复合动作说明附中文 WHY；回归验证实际提交和阻断行为，不只检查字段集合。原有未提交改动保持，历史日志仅末尾追加。
+- **限制：** 未重启服务、未修改生产数据库、未恢复或重新运行真实 CNKI/LLM 任务、未 Git 提交。修复消除已复现的提交异常，不代表原任务已达到 40 篇有效引用及其他质量要求；旧失败任务记录不会自动变成成功，更新服务后需显式恢复或重试。
+
+## 2026-09-22 23:34:49 +08:00 — 路线拆分幻影缺口与恢复预算失配导致 39/40 空转阻断
+
+- **修改文件：** `app/agent/evidence_recovery.py`、`app/agent/generation_recovery.py`、`tests/test_evidence_recovery.py`、`tests/test_generation_recovery.py` 及本日志。
+- **根因：** 会话 `0e3c5741351342e4bc40c14a91995191`（课堂行为分析，要求 ≥40 篇）检索正常（133 篇入选、60 篇进证据池、8 条验证路线，`global_evidence_gate.passed=true`），却以 `agent_no_progress` 阻断、交付 0 引用。三处缺陷串联：(1) `_deterministic_route_gaps` 把 `deficit > 0` 判定放在结构动作之前，而 `SPLIT_INTO` 父路线的 `decision.scores` 为 `null`（证据已转移到 `R1_S1/S2/S3`、`R2_S1/S2`），按 0 篇核心证据算出幻影 `deficit=4`，使已完成的结构修订被报成永远无法闭合的 `SEARCH_COVERAGE_GAP`，`needs_recovery` 被永久钉死；(2) 缺口分类用 `mean_route_fit <= supporting_threshold` 判定精度缺口，但这两个键并非 `scores` 的固定字段，缺失时 `0.0 <= 0.0` 恒成立，真实的核心证据缺口（R5 仅 2 篇）被误标为 `SEARCH_PRECISION_GAP`，`decide_recovery` 据此改用 `QUERY_FILTER_REVISION` 收窄过滤，导致 `new_relevant=7` 却 `core_before=2 → core_after=2`；(3) `decide_generation_recovery` 的 `allow_search` 只看 `allow_evidence_expansion`，从不查 `route_recovery_stop_reason`，于是证据级预算已耗尽（`recovery_round=2` ≥ `evidence_recovery_max_rounds=2`、`evidence_recovery_status=EXHAUSTED`）时仍下发 `TARGETED_SEARCH` 并判为 `RECOVERABLE`，`_run_exhausted_best_effort_generation` 因状态不等于 `EXHAUSTED` 永不触发。
+- **行为变化：** 结构动作判定提前到 `deficit` 之前，`SPLIT_INTO`/`MERGED_INTO` 等一律归为 `ROUTE_STRUCTURE_GAP` 并按既有集合标记 `structurally_resolved`；精度缺口只在 `scores` 实际含 `mean_route_fit` 与 `supporting_threshold` 时才成立，否则归为覆盖缺口；`status=WEAK` 不再单独触发补检索，需同时满足 `deficit > 0` 或验证器 `evidence_sufficiency.sufficient is False`。恢复阶梯新增 `search_viable`（`allow_search` 且无 `route_recovery_stop_reason`）替换全部 `allow_search` 分支条件；篇数缺口分支在证据补充已停止且无其他自动动作时改为 `DEGRADE`，状态随之为 `EXHAUSTED`，由既有 `best_effort_on_failure` 路径执行一次明确标注限制的最佳努力生成。未修改用户约束、篇数要求、质量门禁阈值或 `enable_evidence_expansion` 语义；`allow_evidence_expansion=False` 时仍走 `REQUEST_USER_INPUT`。
+- **验证：** 用该 blocked 会话持久化的真实 `editable_research_state` 离线回放：缺口从 5 条（含 R1/R2 两条 `deficit=4` 幻影与 R2/R4 两条 `deficit=0`）收敛为 1 条真实缺口，`affected_route_ids` 由 `["R2","R4","R5","R1"]` 收窄为 `["R5"]`，R5 正确改标 `SEARCH_COVERAGE_GAP`；恢复决策由 `TARGETED_SEARCH`/`RECOVERABLE` 变为 `DEGRADE`/`EXHAUSTED`，`best_effort_on_failure=True` 下确认触发终态兜底。对照组（`recovery_round=0`）仍返回 `TARGETED_SEARCH`/`RECOVERABLE`，正常路径未回归。
+- **测试结果：** 新增 6 项回归（拆分父路线归为已解决结构缺口、WEAK 且核心证据达标不触发补检索、覆盖缺口不误标精度、证据预算耗尽落 `DEGRADE`/`EXHAUSTED`、预算未耗尽仍定向补证，均以生产格式 `scores=None` 与真实路线 ID 构造）。定向 `tests/test_evidence_recovery.py`、`test_generation_recovery.py`、`test_route_recovery_gold.py`、`test_autonomous_recovery_handoff.py` **64 passed**；全量 **1278 passed in 36.81s，0 failed，0 errors**（工作区隔离 basetemp）。首次全量在系统默认临时目录出现 32 项 `pytest-of-lenovo` 的 `PermissionError` fixture 错误，换隔离 basetemp 后全部通过；未放宽断言或改生产实现。`compileall` 与 `git diff --check` 通过（已移除新增文件末尾空行）。
+- **收敛复核：** 复核 `recovery_loop.py` 的 `remaining_search_gap` 为独立谓词、不读 `scores`，拆分记录（`status=KEEP`、`diagnosis=OVERSIZED_ROUTE`）不会命中，无需同步修改；`global_evidence_gate`、`context_builder`、`subagents` 仅消费 `needs_recovery` 布尔值，口径一致。未引入临时分支或重复逻辑，探索期回放脚本与临时目录已删除；三处非显然约束（结构动作优先于 deficit、精度字段缺失不得按 0.0 互比、WEAK 需配真实缺口、两套恢复预算边界）均附中文 WHY 注释。用户此前未提交的工作区改动保持不动，历史日志仅在末尾追加。
+- **限制：** 未重启服务、未 Git 提交、未重跑真实 CNKI/LLM，因此未验证 40 篇完整交付；本轮为离线状态回放与模拟回归，不构成外部端到端验收。原 blocked 会话记录不会自动变为成功，需更新服务后显式恢复或重试。修复后该任务的预期终态是 39 篇带 `recovery_exhausted_best_effort_generation` 限制标记的最佳努力草稿，而非 40 篇正式达标交付；R5 伦理隐私路线核心证据仅 2 篇的真实缺口仍然存在，本轮未解决中文库检索能力（该次运行 CNKI 因 `Chrome driver not installed` 全部失败）与 PDF 解析率（`Batch parse: 6 / 41`）问题。
+
+## 2026-09-23 00:25:53 +08:00 — 架构评价、旧架构残留清理与门禁陈旧根因修复
+
+- **修改文件：** 删除 `app/services/citation_service.py`、`app/utils/file_utils.py`、`app/agent/prompts.py`；修改 `app/agent/decorators.py`、`app/agent/nodes/synthesis.py`、`app/agent/nodes/__init__.py`、`app/agent/graph.py`、`app/agent/nodes/verification.py`、`app/agent/recovery_loop.py`、`app/agent/state_invariants.py`、`app/agent/generation_recovery.py`、`app/agent/route_targets.py`、`app/services/research_conversation_service.py`、`ARCHITECTURE.md`；`tests/test_state_invariants.py`、`tests/test_global_evidence_gate.py`、`tests/test_evidence_recovery.py`、`tests/test_route_targets.py`、`tests/test_prompts_generic.py`、`tests/test_domain_neutrality_regression.py` 及本日志。
+- **背景：** 用户要求先评价整体架构，再逐文件审核修 bug 并清除旧架构残留。经确认：保留 legacy/autonomous 双编排（生产库 147 个会话中 144 个未记录 `agent_orchestration_mode`，恢复时一律按 legacy，其中 4 个仍为 running）；审核范围锁定高风险恢复链；死代码删到底。
+- **根因（门禁陈旧）：** `global_evidence_gate` 由 `_claims` 处理器在 claim 规划后计算（`graph.py:166-170`），但 `recovery_loop.py:268/374` 在恢复轮内重跑 `validate_routes_node` 会 SPLIT 路线并改写 `validated_routes`，随后只重算 `evidence_gap_report`（`:460-463` 已有此模式与注释），从不重算门禁。门禁又不带快照版本，`state_invariants` 只校验缺口报告的陈旧性，因此陈旧无法被发现。真实 blocked 会话即为此状：`validated_routes` 已是 `R1_S1/S2/S3、R2_S1/S2、R3、R4、R5`，而 `gate.metrics.route_stats` 仍在统计拆分前的 `R1`、`R3`，`route_balance_ratio` 等指标与当前路线论域无关，`derive_result_status`（`graph.py:1642-1644`）却按它判定 success/partial。
+- **根因（目标口径）：** `route_targets._route_ids` 同时收集 `validated_routes`、`provisional_routes` 与 `route_decisions`，SPLIT 后父路线与子路线并存，分母被灌水（真实运行 10 个 ID 对应 8 条实际路线），per-route 目标被稀释；同时给已不持有证据的父路线派生永远补不满的目标，正是上一条日志中幻影 `deficit` 的第二个来源。
+- **行为变化：** 门禁结果写入时加盖 `evidence_snapshot_version` 与 `evidence_snapshot_fingerprint`；`state_invariants` 新增阻断项 `stale_global_evidence_gate`（仅对带版本戳的门禁生效，历史会话无该字段不误判）与告警项 `gate_route_universe_mismatch`（门禁统计了当前路线中不存在的路线）；`recovery_loop` 的 `finally` 块在重算缺口报告后一并按新快照重算门禁，沿用 `graph.py:1395-1410` 引用修复路径的既有做法与 `enable_global_evidence_gate` 开关。`stale_global_evidence_gate` 并入 `_INTERNAL_STATE_CODES`，经既有 `internal_state → RECOMPUTE_STATE` 分类恢复；`RECOMPUTE_STATE` 改为丢弃陈旧的缺口报告与门禁，由下游节点针对当前快照重算。`_route_ids` 在 `validated_routes` 非空时只以它为权威路线集合，为空时才回落到候选路线与决策记录。三处重复的快照陈旧判定收敛为 `state_invariants.is_stale_evidence_snapshot` 单一谓词。
+- **旧架构残留清理：** 删除全仓零引用的 `citation_service.py`、`file_utils.py`（`app/services/__init__.py` 与 `app/utils/__init__.py` 均为空，无再导出）；删除 `app/agent/prompts.py` 纯转发垫片，两个测试改为直连 `app.prompt_catalog`；删除 `nodes/synthesis.py` 三个零调用符号（`_research_status_evidence_disclosure`、`_add_scope_disclosure`、`_infer_evidence_role`）及 `nodes/__init__.py` 对应再导出——此前正是再导出掩盖了零调用；删除 `decorators.py` 的依赖分析孤岛（`analyze_dependencies`、`detect_circular_dependencies`、`suggest_execution_order`、`generate_dependency_graph_dot`、`print_dependency_report`、`get_all_nodes`，480 行降至 260 行），保留在用的 `node/requires/provides/optional/register_node/validate_requirements/verify_provides`。`graph.py` 文档字符串不再承诺"后续迁移到 LangGraph"（全仓无 LangGraph 代码，该计划已被主 Agent 决策循环取代），改为如实描述双编排与职责边界。
+- **判定为保留：** `get_node_metadata` 虽在 `app/` 内无调用，但 `tests/test_global_evidence_gate.py::test_node_registered` 用它验证节点确实经 `@node` 注册并声明 `provided_fields`，是有效契约防护，删除会连带删掉真实回归。`routes_review.py:110` 的 410 桩是对 API 客户端的显式弃用信号，删除会退化成 404，信息量更差。`app/prompt_catalog.py` 在删除垫片后已无生产引用（仅 3 个测试与 `ARCHITECTURE.md:85` 引用），但它是文档化的惰性加载公共入口且有专属测试，未擅自删除，留待决策。
+- **验证：** 用真实 blocked 会话状态回放，新增的 `gate_route_universe_mismatch` 精确捕获矛盾（`gate_only_routes: ["R1"]`，`gate_routes: ["R1","R3"]`，`current_routes: ["R1_S1","R1_S2","R1_S3","R2_S1","R2_S2","R3","R4","R5"]`）。新增 8 项回归：门禁版本戳与陈旧阻断、当前门禁不阻断、无版本历史门禁不阻断、FAILED 门禁不做陈旧校验、门禁统计已拆分路线告警、路线一致时无告警、拆分父路线不占目标名额且目标不被稀释（用 `required=10` 使 5 与 3 可区分，避免被 `target_max=12` 钳制而失去判别力）、恢复轮后门禁与缺口报告同步刷新且不变量通过。
+- **测试结果：** 全量 **1286 passed in 40.25s，0 failed，0 errors**（工作区隔离 basetemp）。定向 `test_state_invariants` + `test_global_evidence_gate` + `test_evidence_recovery` + `test_generation_recovery` 74 passed；`test_route_targets` + `test_route_recovery_gold` + `test_route_validator` 49 passed；删除垫片后 `test_prompts_generic` + `test_domain_neutrality_regression` + `test_prompt_lazy_loading` 10 passed。`compileall` 通过；`git diff --check` 通过。`test_global_evidence_gate.py` 顺带清理了重复的 `import pytest` 与被插在导入块中间的 autouse fixture。
+- **收敛复核：** 修正上一条日志中"`global_evidence_gate` 仅消费 `needs_recovery` 布尔值、口径一致"的结论——该复核不完整，门禁自身即存在陈旧缺陷，本轮已定位并修复。复核 `route_decisions[].scores` 有两个 schema 不同的生产者（`provisional_routes.py:280,289` 含 `mean_route_fit`/`supporting_threshold`，`route_validator.py:1159-1165` 不含），上一条日志的精度分类修复对两者都正确：字段齐备时精度判定照旧，缺失时不再谎报精度；`test_route_recovery_gold.py:250,285` 走含字段路径且仍通过。复核 `_decision`（`route_validator.py:469-488`）确认 `ROUTE_REVISION` 是验证器已执行修订的审计记录（R2 另有 `SPLIT_INTO`），故不再对它触发补检索不会丢失信号，R4 的 WEAK 状态仍由 `weak_route_count` 如实暴露。未引入临时分支；非显然约束均附中文 WHY。
+- **限制：** 未重启服务、未 Git 提交、未重跑真实 CNKI/LLM，本轮全部为离线状态回放与模拟回归，不构成端到端验收。门禁重算会使恢复轮多一次确定性计算（无 LLM 调用、不占预算），但未在真实运行中测量耗时。`_route_ids` 改动会提高发生过 SPLIT 的任务的 per-route 目标（真实案例 4→5），从而增加补检索强度，该行为变化未经真实检索验证。架构评价中提出的 `graph.py` 2124 行上帝模块、双编排长期维护税、208 键扁平状态、文档权威冲突（`ARCHITECTURE.md:7` 与 `docs/architecture.md:86-88` 各自称权威）均未在本轮处理；`route_decisions[].scores` 双 schema 分歧与 `prompt_catalog.py` 生产孤儿状态仅记录未改。
+
+## 2026-09-23 00:50:54 +08:00 — 恢复链深审第二批：模式相关假指标、硬编码阈值谎报与归属图死路线 ID
+
+- **修改文件：** `app/agent/deliverable_router.py`、`app/agent/route_validator.py`、`app/agent/evidence_recovery.py`、`app/agent/global_evidence_gate.py` 及本日志。本轮为用户要求"继续审"后对 `deliverable_router.py` 全文与 `route_validator.py` 剩余部分的深审结果，未改测试文件（新增用例经验证不可达后已完整撤回，`git diff` 对 `tests/test_route_validator.py` 为空）。
+- **根因 1（模式相关假指标）：** `check_generation_readiness` 只被 `generate_deliverables_node`（`nodes/synthesis.py:530`）调用，而该动作的输入白名单（`action_contracts.py:80`）刻意排除 SEARCH 字段，`candidate_papers` 不在其中。因此 `reference_coverage_stats.raw_candidates` 在 autonomous 模式下恒为 0（真实运行 665 篇候选记为 0），在 legacy 模式下却真实——同一指标随编排模式给出不同真值，比一律为死更误导。该键全仓只被写、从不被读（tests/docs/examples/scripts 零引用），`reference_coverage_stats` 类型为自由字典 `dict[str, int]`，无 schema 约束。
+- **根因 2（硬编码阈值谎报）：** `_split_oversized_routes` 的实际判据用可配置的 `policy.route_oversized_share_factor`（来自 `ROUTE_VALIDATOR_OVERSIZED_SHARE_FACTOR`），但落盘的审计 `reason` 用模块常量 `_OVERSIZED_CORE_SHARE_FACTOR = 1.2`。两者当前同值纯属巧合；运维改配置后，`route_decisions[].reason` 会声称一个并未生效的倍数。同批 `_MIN_SPLITTABLE_CORE = 6` 为完全死常量（真实来源是 `policy.route_min_splittable_core`），`_MAX_SUB_ROUTES = 3` 仅出现在文档字符串。
+- **根因 3（归属图引用死路线）：** `primary_owner` 构造时过滤了 `route_id in surviving_route_ids`（`route_validator.py:1236-1240`），但紧随其后的 `assignment_map` 构造未过滤，而 `per_route_features` 是在任何 DROP 判定之前为全部候选路线建立的。SPLIT 后父路线被子路线取代，同时 core 命中父路线与另一条存活路线的论文会把父路线写进 `secondary_routes`；仅被 supporting 命中 DROP 路线的论文会得到 `ambiguous_uncertain` 且 `best_route` 指向死路线。下游 `synthesize_themes` 按归属聚合，会把证据挂到不存在的小节上。
+- **根因 4（自相矛盾的诊断文案）：** `assess_evidence_sufficiency` 的 `score` 分子为 `核心数 + 0.5 × 支撑数`、分母为固定低阈值 `route_min_core_evidence`，任何正常规模路线都被 `min(1.0, ...)` 削平；`sufficient` 却要求真实核心数达标。真实运行中 R5 为 core=2/supporting=16 → `score=1.0` 而 `sufficient=False`，缺口报告 `reason` 于是输出"证据充分性 1.00；……缺口 2 篇"这种自相矛盾的句子，而该文案会进入主 Agent 的 `open_questions`（`context_builder.py:355`）与诊断提示词。
+- **行为变化：** 删除 `raw_candidates` 键，引用漏斗从 `confirmed_in_scope` 起算，并在原处留中文 WHY 说明为何不能在该投影内计算原始候选数。删除三个陈旧模块常量，SPLIT 审计 `reason` 改为引用 `policy.route_oversized_share_factor` 实际生效值。`assignment_map` 的 `core_routes` 与 `supporting_routes` 均按 `_split_oversized_routes` 之后的 `final_route_ids` 过滤（取在拆分之后才能同时排除父路线）。缺口 `reason` 改印真正参与判定的 `sufficient` 布尔与 `evidence_quality_rate`，不再印被削平的 `score`。`global_evidence_gate` 中描述该分数的文档字符串更正为真实分子口径，并补记 `score` 与 `sufficient` 可互相矛盾。未修改任何阈值默认值、判定逻辑或用户约束。
+- **自我纠正：** 本次审核中先写下"缺少过滤会虚高 `evidence_understood_rate`（恢复闭环的边际收益终止判据）"作为改动理由，随后核实 `positive_signal_count` 与 core 判据同源于 `signal_count`：DROP 要求 `best_signal_count < 2` 而 core 要求 `signal_count >= 2`，故**被 DROP 的路线不可能持有 core 论文**，该比率不受影响。已把代码内 WHY 注释改写为经核实的真实影响（`secondary_routes`/`best_route` 残留死路线 ID），并注明比率不变的原因，避免留下被推翻的理由。
+- **验证：** `compileall` 通过；全量 **1286 passed in 39.48s，0 failed，0 errors**（工作区隔离 basetemp），与本轮改动前同数，说明未引入回归也未减少覆盖。定向 `test_route_validator` + `test_route_targets` + `test_route_recovery_gold` + `test_evidence_recovery` 49 passed。
+- **测试缺口（明确未覆盖）：** 根因 3 的修复**没有新增回归测试**。DROP 分支经上述证明对 core 论文不可达，仅 supporting（`signal_count` 恰为 1）窗口可达，构造脆弱；SPLIT 分支需要 ≥ `route_min_splittable_core`(6) 篇独占成员、超额份额达标且两个子簇都能取出可区分名称的重型夹具。曾尝试用 monkeypatch `_decision`/`assess_route_validity` 构造 DROP，实测论文强匹配即变 core 从而阻止 DROP，与领域逻辑冲突；改用伪造 `_split_oversized_routes` 可让用例通过，但那验证的是替身而非真实拆分行为，故完整撤回该用例并把文件还原到改动前状态。此项修复因此只有代码内 WHY 与全量回归保护。
+- **收敛复核：** 确认 `_ANCHOR_TYPES` 仍在 `route_validator.py:162` 使用故保留，只删确实无引用或仅用于文案的常量。确认 `merge_weak_routes_for_writing` 的 `strong` 非空由 `:546-552` 保证、`_best_fit_route` 的 `route_order.index` 不会 ValueError（`route_order` 取自 `per_route_features.keys()`，覆盖全部候选路线）。复核 systemic-DROP 守卫（`:1198-1226`）产出 `status=WEAK, action=TARGETED_SEARCH`，在本轮之前的缺口判定修复下仍会正常产出缺口，未被误伤。未引入临时分支或重复逻辑。
+- **限制：** 未重启服务、未 Git 提交、未重跑真实 CNKI/LLM，本轮全部为静态审核加离线回归，不构成端到端验收。新发现但**未改**的四项：(1) `required_focus_evidence_not_met` 落到兜底 `quality` 类，`diagnose_generation_issues` 为它广告 `REWRITE_SECTIONS`，但恢复阶梯的 `codes & (_CLAIM_CODES | _SECTION_CODES)` 不含它，该动作永不可达；且证据补充耗尽时它走 `REQUEST_USER_INPUT` 而非 `DEGRADE`，与本轮之前修好的引用篇数路径不一致——涉及用户显式研究重点的终止语义，需产品决策。(2) `route_decisions[].scores` 仍有两个 schema 不同的生产者（`provisional_routes.py:280,289` 含 `mean_route_fit`/`supporting_threshold`，`route_validator.py:1159` 不含）。(3) `per_route_features` 与 `feature_matrix` 按 路线 × 全部论文 构建（665 候选 × 5 路线 ≈ 3325 次特征抽取并全量 dump），未评估内存与耗时。(4) 本轮审到的多个文件存在行尾空白（`decorators.py` 22 处等），属纯格式问题，为避免扩大 diff 噪音未处理。
+
+## 2026-09-23 01:01:29 +08:00 — 统一 required_focus_evidence_not_met 的恢复终止语义
+
+- **修改文件：** `app/agent/generation_recovery.py`、`tests/test_generation_recovery.py` 及本日志。
+- **根因：** `required_focus_evidence_not_met`（用户显式研究重点缺直接证据，由 `deliverable_router.py:324` 产出）此前不被 `_issue_category` 的任何集合命中，落到兜底 `"quality"` 类。两处后果：(1) `diagnose_generation_issues` 为 `"quality"` 类广告 `[REWRITE_SECTIONS, TARGETED_SEARCH]`，但恢复阶梯的 `codes & (_CLAIM_CODES | _SECTION_CODES)` 不含该码，`REWRITE_SECTIONS` 永不可达——诊断结果承诺了阶梯不会执行的动作；(2) 证据补充耗尽时它落到阶梯末尾的 `else: REQUEST_USER_INPUT`（状态 DEGRADED，停在询问用户），而系统其余部分早已把该码当作可降级：`can_offer_best_effort_draft` 对它返回 True（`tests/test_frontend_query_utils.py:93,110`），`_apply_final_quality_gate` 在 `forced_generation_issues` 含该码时保留 `passed=False` 并 `draft_released=True`（`tests/test_generation_quality_gate.py:349`），且 `nodes/synthesis.py:536` 会把 blocking_issues 原样写入 `forced_generation_issues`、`:1658` 再写进门禁 details——即"降级并暴露限制"的下游机制齐备且已有测试，只有阶梯不肯走到那一步。这与上一条日志为引用篇数缺口修好的终止语义不一致。
+- **前置核实：** 改动前先确认 `TARGETED_SEARCH` 对重点缺口是**实质有效**而非名义正确。`supplemental_focus_queries`（`focus_coverage.py:68`）接在 `refine_search_node`（`nodes/retrieval.py:1263`），而 `recovery_loop.py:352` 只调 `search_node`、不经过 refine，因此主 Agent 的 `targeted_search` 动作只用路线缺口查询、不会生成针对缺失重点的检索式。质量恢复阶梯的 `TARGETED_SEARCH` 走的是另一条路：`_continue_retrieval_and_persist`（`research_conversation_service.py:889`）→ `continue_research_agent` → `_run_search_subagent`（`graph.py:272`）→ `_search_rank_with_refinement` → `refine_search_node`，会生成重点检索式。本改动位于阶梯侧，故有效；该路径差异已写入代码 WHY 注释，避免后人误把两者当等价。
+- **行为变化：** 新增 `_FOCUS_CODES = {"required_focus_evidence_not_met"}` 与 `"focus_coverage"` 分类；该分类只广告 `[TARGETED_SEARCH]`。阶梯新增 focus 分支：可检索时 `TARGETED_SEARCH`；`search_stop_reason` 非空时 `DEGRADE`（状态随之 EXHAUSTED，触发既有的最佳努力生成并标注未覆盖重点）；用户禁止扩证时 `REQUEST_USER_INPUT`。未修改任何阈值、门禁判定或用户约束。
+- **自我纠正（排序）：** 最初把 focus 分支排在 `_COUNT_CODES` **之前**，理由是"针对缺失重点的补检索会同时带回新论文，一次动作缓解两类缺口"。随后核对本文件既有升级顺序 `REFRESH_EVIDENCE → REALLOCATE_CITATIONS → REWRITE_SECTIONS → REBUILD_CLAIMS → TARGETED_SEARCH`，其设计意图是先穷尽证据内廉价补救、最后才发起外部检索；focus 优先会在重分配引用本可解决篇数问题时直接发起外部检索，违背该顺序。已改为排在 `_COUNT_CODES` 之后，并在 WHY 注释中写明理由与迭代收敛方式（篇数解决后下一轮再处理重点缺口）。
+- **验证：** 新增 4 项回归——focus 缺口的分类为 `focus_coverage` 且 `available_actions == [TARGETED_SEARCH]`（改动前为 `[REWRITE_SECTIONS, TARGETED_SEARCH]`，故非空断言）；证据预算耗尽时落 `DEGRADE`/`EXHAUSTED`（改动前为 `REQUEST_USER_INPUT`）；`allow_evidence_expansion=False` 时仍询问用户；篇数与重点缺口并存时保持 `REALLOCATE_CITATIONS` 优先（该项改动前后同为 REALLOCATE，作用是锁定升级顺序、防止后人再次把 focus 提前）。
+- **测试结果：** 定向 `tests/test_generation_recovery.py` **29 passed**（原 25 + 新增 4）；全量 **1290 passed in 40.21s，0 failed，0 errors**（工作区隔离 basetemp）。`compileall` 通过；`git diff --check` 通过。
+- **收敛复核：** 确认分类字符串只在 `generation_recovery.py` 内部消费（`:206-223` 的 if/elif 链与 `:293` 的集合运算），无外部穷举匹配，新增分类安全。确认 `_run_exhausted_best_effort_generation` 的 `non_generatable_codes` 不含该码，降级不会被它拦下。未引入临时分支或重复逻辑；`allow_evidence_expansion=False` 的既有行为、篇数缺口路径与上一条日志的 DEGRADE 终态均保持不变。
+- **限制：** 未重启服务、未 Git 提交、未重跑真实 CNKI/LLM，本轮为确定性单元回归，不构成端到端验收；未构造真实"重点缺证据"的端到端场景验证 `supplemental_focus_queries` 实际召回效果。`REQUEST_USER_INPUT` 终止时仍复用 `research_conversation_service.py:1440-1448` 的通用澄清文案（`recovery_options` 为"提供所需材料或访问条件/结束任务"），未为重点缺口定制选项——该路径仅在用户显式禁止扩证时触发，且通用文案已内嵌具体 `user_input_reason`，故本轮未改。
+
+## 2026-09-23 20:17:32 +08:00 — 架构逐文件审核：重点补检索、路线拆分与主 Agent 工具边界
+
+- **修改文件：** `app/agent/graph.py`、`app/agent/generation_recovery.py`、`app/agent/action_contracts.py`、`app/agent/retrieval_loop.py`、`app/agent/provisional_routes.py`、`app/agent/route_validator.py`、`app/agent/main_policy.py`、`app/services/research_conversation_service.py`；`tests/test_focus_recovery_search.py`、`tests/test_autonomous_recovery_handoff.py`、`tests/test_action_contracts.py`、`tests/test_generation_recovery.py`、`tests/test_research_conversation.py`、`tests/test_route_validator.py`、`tests/test_main_agent_policy.py`；`docs/validation/2026-09-23-architecture-audit.md` 及本日志。
+- **根因：** 默认自主编排中，质量恢复已选定的重点检索仍可能被主 Agent 的路线检索动作替代；隔离检索任务拿不到活动恢复决策；候选论文的词面覆盖可让 refine 在证据卡缺直接证据时提前停止。SPLIT 子路线继承父路线充分性报告，可能把低于最低核心证据阈值的子簇标为 KEEP。主 Agent 原生工具清单包含本轮不可执行动作。旧路线评分器及私有辅助函数经全仓调用核对为零引用。
+- **行为变化：** 自主增量恢复先执行已选定的重点检索；检索任务以只读输入读取活动决策，并把由语义帧生成的重点查询放入首轮有预留名额的检索分支；重点缺口的用户澄清显示具体重点，重新授权后再次运行质量恢复决策并执行动作。恢复进展比较纳入硬问题代码消失。SPLIT 逐子簇重算证据充分性，任一子簇不足则保留父路线。原生工具只展示本轮允许的动作，返回值仍由服务端校验。删除 `provisional_routes.py` 中 673 行无人调用的旧评分实现，保留新路线验证器使用的命名函数及历史会话的 legacy 编排。
+- **验证：** 新增或扩展重点检索首轮派发、动作隔离、自主交接、用户重授权、SPLIT 子路线阈值与原生工具清单回归。定向路线验证 14 passed；主 Agent 策略及循环 9 passed；全量 1299 passed，0 failed，0 errors（隔离 basetemp）；`compileall`、`git diff --check` 通过。
+- **收敛复核：** 检索决策只作为任务输入，不开放写权限；SPLIT 子路线报告的 core IDs 与真实子簇一致；预算提交只记账，合并前已有额度预留和版本校验；未删持久化会话仍需的 legacy 模式，未留下临时评分分支。
+- **限制：** 仍未完成全仓逐文件审核；大文件的剩余段落及真实 CNKI/LLM 端到端召回未验证，SPLIT 的完整节点级重型夹具仍待补。此次仅为离线测试，未提交 Git。测试生成的 `.pytest_*` 临时目录仍在工作区；此前递归清理被自动审批拒绝，本轮未绕过该限制。
+
+## 2026-09-23 20:21:59 +08:00 — 主张证据门禁：按论文计数并拒绝无可读证据的主张
+
+- **修改文件：** `app/agent/claim_plan.py`、`tests/test_claim_alignment.py`、`docs/validation/2026-09-23-architecture-audit.md` 及本日志。
+- **根因：** `build_claim_plans` 用独立论文数执行主张类型最低证据门槛，但写作前的 `enforce_claim_evidence_gate` 用 evidence ID 数执行同一门槛，同篇论文的两个片段可冒充两篇支撑。LLM 蕴含核验只对找到可读证据片段的主张入队，找不到片段时直接跳过且未标记失败，导致主张仍进入 Writer。
+- **行为变化：** 门禁对类型最低要求改按唯一论文数判定，原因文案同步说明论文口径；无可读片段的主张按核验失败剔除并保持门禁失败。证据 ID 绑定仍须存在，未放宽验证或改变显式引用篇数要求。
+- **验证：** 新增同篇多片段不能满足 comparison 最低要求、无可读片段不得跳过 LLM 蕴含核验两项回归。定向 `test_claim_alignment.py` 13 passed；全量 1301 passed，0 failed，0 errors（隔离 basetemp）；先前 `compileall` 与差异检查通过。
+- **收敛复核：** 复查数据流为卡片证据 ID → 类型门槛 → 语言强度 → 蕴含核验 → Writer；两个修复均在写作前生效，没有新增回退分支。按同一论文计数与上游 Claim Plan 口径一致；无法核验的主张保守剔除。
+- **限制：** 尚未完成 `claim_plan.py` 其余聚合与正文句级校验、`nodes/synthesis.py` 全文及真实模型端到端验证；本轮未 Git 提交。测试临时目录仍受此前自动审批限制未清理。
+
+## 2026-09-23 20:28:36 +08:00 — 引用回填有效并集与检索结果公开文本
+
+- **修改文件：** `app/agent/nodes/synthesis.py`、`tests/test_generation_quality_gate.py`、`docs/validation/2026-09-23-architecture-audit.md` 及本日志。
+- **根因：** 跨交付物引用回填用纯语法提取的所有标记计算已引用并集，未知、失效和未确认论文均能占用用户要求的唯一引用名额，使补写在仍有已分配有效论文时提前返回。`extract_citation_ids(..., valid_ids=...)` 用该集合规范化语法，但返回值仍可包含其他稳定 ID，必须再显式筛选。检索结果的可见回答还直接附带内部 `paper_id`，违反公开输出边界。
+- **行为变化：** 回填只从有效且已确认的证据卡计算唯一引用并集；重写后的并集也仅累计这些论文，新增未知引用仍按既有规则拒绝。检索结果回答保留题名、年份、来源、外部链接和入选理由，不显示内部论文 ID。
+- **验证：** 将原有引用回填回归扩成同时含未知、失效、未确认引用的场景，另加公开回答不含内部 ID 的回归。定向写作门禁 83 passed；全量 1302 passed，0 failed，0 errors（隔离 basetemp）。
+- **收敛复核：** 初次修正只向 `extract_citation_ids` 传 `valid_ids`，新用例仍失败；确认该参数负责语法归一化而非结果过滤后，补上显式集合筛选，并沿用引用分配器排除失效卡片的口径。无临时分支残留，原有引用保留与新增引用检查保持不变。
+- **限制：** 尚未完成 `nodes/synthesis.py` 其余大型段落、完整节点级 SPLIT 夹具和真实 CNKI/LLM 验证；未 Git 提交。测试临时目录仍受此前自动审批限制未清理。
+
+## 2026-09-23 20:34:10 +08:00 — SPLIT 完整入口回归与共享路线查询审计归属
+
+- **修改文件：** `app/agent/evidence_recovery.py`、`tests/test_route_validator.py`、`tests/test_route_recovery_gold.py`、`docs/validation/2026-09-23-architecture-audit.md` 及本日志。
+- **根因：** SPLIT 子路线修复已有直接函数级回归，但缺少真实 `validate_route_evidence` 入口下父路线从论文归属中消失的验证。路线恢复查询轮询去重时，同一条查询由两条路线提出，只给第一条路线记录 `route_query_allocation`；查询预算恰好用尽时，后续路线甚至不会被轮询到，审计记录与实际受益路线不一致。
+- **行为变化：** 共享查询仍只派发一次；选定后把它回填到所有提出该查询的路线审计分配中，保留唯一查询预算。SPLIT 生产行为无新改动，仅补真实入口的独占归属和子路线证据报告回归。
+- **验证：** 新增完整路线验证入口夹具，真实经过特征匹配、路线判断、子聚类及 assignment_map，确认父路线消失、所有归属指向存活路线、子路线充分性报告与核心论文一致。新增 `max_queries=1` 的共享查询回归。定向路线验证 15 passed、路线恢复 15 passed；最终工作区全量 1304 passed，0 failed，0 errors（隔离 basetemp）。`compileall` 与 `git diff --check` 通过。
+- **收敛复核：** 最初只在去重分支为后续路线记账，但预算满额会在进入该分支前中止轮询；改为选定查询后统一回填审计归属，并用单条预算覆盖这一时序边界。没有重复派发或额外恢复动作，未改变用户边界或质量门禁。
+- **限制：** 其余大型文件仍按审核记录继续；未运行真实 CNKI/LLM E2E，未 Git 提交。测试临时目录仍受此前自动审批限制未清理。
+
+## 2026-09-23 22:17:07 +08:00 — 单一自主编排迁移收尾：删除模式开关残留与固定流程门禁夹具
+
+- **修改文件：** `.env.example`、`app/agent/orchestration.py`、`app/agent/graph.py`、`app/services/research_conversation_service.py`、`tests/test_global_evidence_gate.py`、`tests/test_agent_completion_regressions.py`、`README.md`、`ARCHITECTURE.md`、`docs/agent-context-architecture.md`、`change.md`（新建）及本日志。
+- **根因：** `plan.md` 步骤 1–3 与步骤 4 主体已落地（固定顺序 `legacy` 分支从 `graph.py` 删除，三个公共入口与会话澄清、检查点恢复统一进入 `_run_autonomous_pipeline`，`config.py` 已无编排模式设置），但收尾缺口仍在三处：`.env.example` 与两份架构文档继续宣传已无代码路径的 `AGENT_ORCHESTRATION_MODE`，读者会误以为可回滚固定流程；`orchestration_mode` 的 `existing` 参数在单模式下已成死参数，却仍迫使 `_run_and_persist` 为算出这个被忽略的值多做一次会话表读取，且函数名读起来像可返回多种模式的取值器；`tests/test_global_evidence_gate.py` 的 `_install_graph_fakes` 仍 monkeypatch 随 `legacy` 一起删除的 `app.agent.graph.expand_search_year_node`，并把 `_get_llm` 打成 `None`，3 项门禁集成回归以 `AttributeError` 失败。
+- **行为变化：** 生产不再有编排模式开关；`agent_orchestration_mode` 降为持久化审计字段，缺失/`legacy`/`autonomous` 三种历史取值在执行边界一律规范为 `autonomous`，迁移幂等，非法取值仍显式抛错。`orchestration_mode` 改名 `normalize_orchestration_mode` 并删去 `existing`，每次研究执行少一次会话表读取。全局证据门 3 项集成回归改经真实生产入口：主循环按 `search_and_rank → fetch_metadata → extract_paper_cards → validate_routes → plan_claims → generate_deliverables → validate_result → request_finish` 的注册动作序列推进，终态仍由代码门禁裁决。未放宽证据验证、显式约束或门禁，未改变研究目标、证据卡、恢复历史与预算消耗的保留语义。
+- **验证：** 两次变异校验确认测试非空过——打乱夹具动作次序使 2 项 smoke 失败；在生产 `_claims` 处理器内把全局门禁移到 `claim_plan_node` 之前，使 `test_gate_runs_after_claim_plan_and_reports_real_claim_source` 失败且 `claim_support_source` 退回 `route_evidence_volume_fallback`（即 2026-08-29 原始缺陷），两次变异后生产代码均完整还原。定向 `test_global_evidence_gate.py` 26 passed；改名相关五个文件 161 passed；全量离线 1303 passed、0 failed、0 errors（隔离 basetemp，迁移前基线为 1300 passed + 3 failed）；`compileall` 退出 0，`git diff --check` 无空白错误；全仓 grep 确认旧函数名无残留。
+- **收敛复核：** 门禁次序回归现由生产入口的真实动作序列证明而非已删除节点名。`_SequencedDecisionLLM` 沿用 `test_agent_graph.py::WorkflowLLM` 的原生工具替身写法；`_get_llm` 改为返回共享单实例，因主循环、写作与验证各自调用它，逐次新建会重置动作序列。已清理探索期残留：`fake_expand_year` 及其 patch、死参数 `existing`、多余数据库读取、原生工具路径下不可达的 `complete`/`complete_messages` 回退。只清理本轮自建的 `.pytest_*` 与 `/tmp` 备份，工作区原有临时目录未动。按 `plan.md` 第 9 行未批量删除其他同名 `legacy` 兼容语义（`import_legacy_history`、旧单数字段、旧计数器迁移、旧会话缺 CCC 审计的章节失败回归）。
+- **限制：** 真实 CNKI/LLM 端到端未执行，全部为离线模拟，不能证明生产 provider 原生工具兼容性、真实检索质量、成本与延迟。旧会话的实际数据库迁移未在生产库运行，`scripts/migrate_agent_runtime.py` 本轮未执行；规范发生在读取时的执行边界，未恢复过的历史会话落盘标记仍可能为 `legacy` 或缺失。本日志第 1248、1518 行的历史条目仍描述双编排时期决策，按追加式规则未改写。未重启现有服务，未创建 Git commit。
+
+## 2026-09-24 17:18:00 +08:00 — 单模式恢复语义与检查点收敛
+
+- **修改文件：** `plan.md`、`app/agent/graph.py`、`app/agent/orchestration.py`、`app/agent/main_loop.py`、`app/agent/controller.py`、`app/agent/state.py`、`app/agent/public_errors.py`、`app/agent/generation_recovery.py`、`tests/test_agent_graph.py`、`tests/test_agent_completion_regressions.py`、`tests/test_main_agent_loop.py`、`tests/test_durable_runtime.py`、`docs/architecture.md`、`docs/research-workflow.md`、`docs/agent-context-architecture.md`、`docs/validation/2026-09-23-architecture-audit.md` 及本日志。本次修改延续上一条的配置与文档收尾；未改写既有条目。
+- **根因：** 固定流程删除后，旧会话检查点与重生成入口需要一致的状态迁移；全文重建保留旧正文和引用授权会在候选失败时重新发布过期稿；局部验证只对同一证据和授权有效；质量恢复或最佳努力已经选定动作后，模型仍可先选择终止。若已选动作的出队晚于任务持久化，崩溃恢复还可能再次执行已付费动作。
+- **行为变化：** 旧模式标记在执行边界规范为 `autonomous`，旧验证指纹作废，原证据、约束与预算保留；刷新现有论文只用已选池。全文重建清理旧正文及授权，局部重写仅在证据和主张授权未变时使用上轮句级验证。预选恢复动作通过同一个主循环、Controller 权限、预算和版本校验执行；任务结果与队列出队同一数据库快照提交，无法执行则显式阻断。全局证据门仍在主张计划之后，失败正文继续隔离或明确降级。
+- **验证：** 历史检查点迁移、证据刷新范围、全文重建旧稿隔离、局部验证失效、最佳努力必做动作、不可执行动作阻断、动作与出队原子检查点均有定向回归。全量离线测试 **1311 passed，0 failed / 0 errors**；`python -m compileall -q app tests` 和 `git -c core.safecrlf=false diff --check` 通过。此前的节点级和门禁回归继续通过。
+- **收敛复核：** 仅移除编排意义上的固定流程和死步骤估算，保留仍用于证据迁移、旧事件导入或引用修复的同名兼容逻辑。检查三个入口、会话检查点、任务输入白名单及公开输出；已选动作在提交时出队，防止重复执行，非显然状态寿命和时序约束附中文 `WHY` 注释。初次重生成实现保留了旧全文正文，复核发现回滚风险后改为全文清理；初次预选动作在主循环提交后出队，复核持久化时序后改为 Controller 同事务出队。
+- **限制：** 未执行真实 CNKI/LLM 端到端、生产数据库历史会话回放、服务重启或 Git 提交。旧会话未恢复前的落盘标记仍可能为 `legacy` 或缺失；执行时规范化。其余大型文件的逐段架构审核仍按原审核记录继续。
+
+## 2026-09-24 17:21:21 +08:00 — 验证专用恢复必做动作收口
+
+- **修改文件：** `app/agent/graph.py`、`tests/test_agent_graph.py`、`tests/test_agent_completion_regressions.py` 及本日志。
+- **根因：** 验证专用恢复入口和检查点续跑若只限制可用动作，主 Agent 仍可能先请求结束，绕过用户已选定的重验。
+- **行为变化：** 进入验证专用主循环时排入 `validate_result` 必做动作；其执行仍经过注册动作、任务权限、预算与检查点提交，原正文不重写。
+- **验证：** 定向 97 passed；全量离线 1311 passed，0 failed / 0 errors；`compileall` 与 `git diff --check` 通过。收敛复核确认必做动作仅在验证专用入口建立，完成后由 Controller 随任务结果同一检查点出队，未增加固定流程分支。
+- **限制：** 未执行真实 CNKI/LLM 端到端和生产数据库历史会话回放。
+
+## 2026-09-24 17:27:11 +08:00 — 重新分类决策进入自主动作队列
+
+- **修改文件：** `app/agent/graph.py`、`tests/test_agent_graph.py`、`docs/validation/2026-09-23-architecture-audit.md`、`plan.md` 及本日志。
+- **根因：** 会话服务在用户选择重新分类后只设置 `force_taxonomy_remediation`；再生成入口清理旧分类，却未保证主 Agent 实际调用聚类，已选动作可能落空。
+- **行为变化：** 强制分类修复先执行 `cluster_papers`，再重建主张授权并写作；动作仍由同一主循环和 Controller 执行，旧正文不会在全文重建时复用。
+- **验证：** 新增入口回归，模拟模型立即申请结束，确认执行顺序为聚类、主张计划、写作、结束且聚类收到修复标记。定向 64 passed；全量离线 **1312 passed，0 failed / 0 errors**；`compileall` 与 `git diff --check` 通过。
+- **收敛复核：** 曾尝试将所有保守重写也纳入必做队列，导致既有局部验证路径重复写作；撤回该扩张，仅强制本次确认的重新分类动作。没有增加第二套编排或绕过门禁。
+- **限制：** 真实 CNKI/LLM 端到端及生产旧会话回放未执行；其余大文件仍按审核记录逐段继续。
+
+## 2026-09-24 17:31:37 +08:00 — 去除无效文献类型恢复选项
+
+- **修改文件：** `app/services/research_conversation_service.py`、`app/agent/deliverable_router.py`、`tests/test_research_conversation.py`、`docs/validation/2026-09-23-architecture-audit.md`、`plan.md` 及本日志。
+- **根因：** 篇数不足时提示“纳入更多文献类型”，选择后只写入全仓无人读取的 `include_preprints`；检索并未用该字段排除会议论文或预印本，提示承诺了不存在的行为。就绪门禁也给出相同建议，并留有双编排时期的注释。
+- **行为变化：** 新问句和就绪建议不再提供该空选项，改为可提供符合范围的新证据；旧会话若已展示并选择该选项，仍按原范围执行有界补检索，不写无效开关。保留原有文献形态识别和同行评审质量门禁。
+- **验证：** 新增回归覆盖新问句、旧回答继续执行及无死字段；定向 108 passed，全量离线 **1313 passed，0 failed / 0 errors**；`compileall` 与 `git diff --check` 通过。
+- **收敛复核：** 新会话不再宣传不存在的能力，旧会话解析仅作兼容，不引入第二套检索过滤；没有扩大显式年份或降低用户篇数要求。
+- **限制：** 真实 CNKI/LLM 端到端和生产旧会话回放未执行；大文件逐段审核继续按审核记录推进。
+
+## 2026-09-24 18:15:18 +08:00 — 预检复用、检索交付验收与主循环进展边界
+
+- **修改文件：** `app/agent/topic_disambiguation.py`、`app/services/research_conversation_service.py`、`app/agent/nodes/planning.py`、`app/agent/planner.py`、`app/agent/graph.py`、`app/agent/main_loop.py`、`app/agent/nodes/synthesis.py`、`app/agent/state.py`、`app/agent/public_errors.py`、`app/tools/verify_claims.py`、`tests/test_agent_graph.py`、`tests/test_main_agent_loop.py`、`tests/test_verify_claims.py`、`docs/validation/2026-09-23-architecture-audit.md` 及本日志。
+- **根因：** 会话预检与规划重复解析相同请求；只找论文可在篇数或重点缺口未满足时结束为成功；主循环只比较相邻状态而忽略 A→B→A 循环；句级语义核验虽已批处理和缓存，但缺少每轮实际批次观测。
+- **行为变化：** 同一请求复用预检意图、槽位和语义帧，工作查询变化则重解析；论文列表按去重篇数和重点覆盖度给出成功、部分或阻断状态，并公开缺口；主循环在短窗口检测状态回访，排名顺序变化不算新证据；语义核验报告增加批次、失败批次及提交主张数，不抽样事实主张。
+- **验证：** 新增预检复用与工作查询失效、论文列表不足与空结果、A→B→A 循环、缓存命中时零模型批次回归。定向 111 passed；全量离线 **1319 passed，0 failed / 0 errors**；`compileall` 和 `git diff --check` 通过。
+- **收敛复核：** 检索任务只用检索验收，不沿用正文门禁；列表与计数的去重口径一致。最初仅计相邻无进展，补充短窗口回访；Controller 的同输入幂等复用会在再次回访后阻止重复执行，故回访时即可安全停止。预检交接标记在规划层消费；现有批处理、缓存、质量门禁未复制或削弱。
+- **限制：** 未做真实 CNKI/LLM 端到端、生产旧会话回放或实际 token 成本对比；其他大文件的逐段审核仍在进行。

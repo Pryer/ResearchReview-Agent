@@ -74,7 +74,8 @@ def _synchronize_semantic_frame_time_window(
 )
 @optional(
     "current_time", "selected_scope", "topic_interpretations",
-    "research_request", "conversation_history"
+    "research_request", "conversation_history", "preflight_intent_result",
+    "research_semantic_frame", "semantic_frame_source_query"
 )
 def plan_node(state: "ResearchAgentState", llm=None, current_year: int | None = None) -> "ResearchAgentState":
     """解析用户需求，生成检索计划。"""
@@ -135,23 +136,44 @@ def plan_node(state: "ResearchAgentState", llm=None, current_year: int | None = 
                 else "request"
             )
         is_resumed_query = context_role in {"clarification_answer", "working_query"}
-        intent_result = recognize_intent(
-            user_query,
-            llm,
-            conversation_role=context_role,
-            previous_intent=persisted_intent if is_resumed_query else None,
-            original_query=persisted_request.get("original_query") if is_resumed_query else None,
+        preflight = state.pop("preflight_intent_result", None)
+        reuse_preflight = bool(
+            context_role == "request"
+            and isinstance(preflight, dict)
+            and persisted_request.get("original_query") == user_query
+            and state.get("semantic_frame_source_query") == user_query
+            and state.get("research_semantic_frame")
         )
+        if reuse_preflight:
+            from app.schemas.agent_schema import IntentResult, SlotResult
+            from app.schemas.research_plan_schema import ResearchSemanticFrame
+
+            # WHY: 会话预检已用同一原文确认意图、槽位和语义；规划层只生成
+            # 检索策略。工作查询或澄清文本变化时不能复用旧语义。
+            intent_result = IntentResult.model_validate(preflight)
+            slots = SlotResult.model_validate(persisted_request)
+            semantic_frame = ResearchSemanticFrame.model_validate(
+                state["research_semantic_frame"]
+            )
+        else:
+            intent_result = recognize_intent(
+                user_query,
+                llm,
+                conversation_role=context_role,
+                previous_intent=persisted_intent if is_resumed_query else None,
+                original_query=persisted_request.get("original_query") if is_resumed_query else None,
+            )
         state["intent"] = intent_result.intent
         state["confidence"] = intent_result.confidence
 
         # 槽位抽取
-        slots = extract_slots(
-            user_query,
-            intent_result.intent,
-            llm=llm,
-            current_year=current_year,
-        )
+        if not reuse_preflight:
+            slots = extract_slots(
+                user_query,
+                intent_result.intent,
+                llm=llm,
+                current_year=current_year,
+            )
         # 澄清回答不能替换已确认的主题。范围缩小保存在 semantic_frame / selected_scope 中，
         # 不用将内部工作查询的整段文字再次作为主题抽取。
         persisted_topic = str(persisted_request.get("topic") or "").strip()
@@ -159,7 +181,7 @@ def plan_node(state: "ResearchAgentState", llm=None, current_year: int | None = 
             slots = slots.model_copy(update={"topic": persisted_topic})
 
         semantic_frame_data = state.get("research_semantic_frame")
-        if semantic_frame_data:
+        if not reuse_preflight and semantic_frame_data:
             from app.schemas.research_plan_schema import ResearchSemanticFrame
 
             # 澄清问答发生在两次规划之间时，缓存的语义帧是在范围收窄前解析的：
@@ -181,7 +203,7 @@ def plan_node(state: "ResearchAgentState", llm=None, current_year: int | None = 
                 semantic_frame = ResearchSemanticFrame.model_validate(
                     semantic_frame_data
                 )
-        else:
+        elif not reuse_preflight:
             semantic_frame = parse_research_semantics(
                 user_query=user_query,
                 topic=slots.topic or user_query,

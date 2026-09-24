@@ -229,6 +229,15 @@ def global_evidence_gate_node(state: "ResearchAgentState") -> "ResearchAgentStat
             route_balance_min_ratio=settings.global_gate_route_balance_min_ratio,
             peer_review_ratio_threshold=settings.global_gate_peer_review_ratio,
         )
+        # WHY: 门禁读 validated_routes 与 claim_plans，而证据恢复轮会改写前者。
+        # 不带快照版本就无法判断它是否仍在描述当前证据，derive_result_status 却
+        # 把 explicit_constraint_unmet 当权威消费来决定 success/partial。
+        result["evidence_snapshot_version"] = int(
+            state.get("evidence_snapshot_version") or 0
+        )
+        result["evidence_snapshot_fingerprint"] = str(
+            state.get("evidence_snapshot_fingerprint") or ""
+        )
         state["global_evidence_gate"] = result
         append_step(
             state,

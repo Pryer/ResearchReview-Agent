@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from app.agent.graph import _compute_total_steps, run_research_agent
+from app.agent.graph import run_research_agent
 from app.agent.retrieval_loop import diagnose_search_drift
 from app.agent.nodes import (
     citation_check_node,
@@ -17,7 +17,6 @@ from app.agent.nodes import (
     refine_search_node,
     search_node,
 )
-from app.core.config import Settings
 
 
 def _paper(**kwargs) -> dict:
@@ -73,6 +72,19 @@ def test_search_drift_without_expansion_is_observational_only():
 class WorkflowLLM:
     """覆盖工作流控制面调用，确保单元测试不访问真实 API。"""
 
+    native_tools_enabled = True
+
+    def __init__(self, *actions):
+        self.actions = iter(actions or (
+            "search_and_rank", "fetch_metadata",
+            ("report_blocked", {"reason": "现有证据不足，无法生成正文"}),
+        ))
+
+    def complete_tool_call(self, messages, **kwargs):
+        action = next(self.actions)
+        name, arguments = action if isinstance(action, tuple) else (action, {})
+        return {"name": name, "arguments": arguments}
+
     def complete(self, prompt: str, **kwargs) -> str:
         operation = str(kwargs.get("operation") or "")
         if operation == "research_semantic_parsing":
@@ -112,28 +124,6 @@ class WorkflowLLM:
         if operation == "screening_protocol_planning":
             return '{"corpus_goal":"目标主题证据池","hard_include_criteria":[],"soft_include_criteria":[],"hard_exclude_title_terms":[],"routes":[],"notes":[]}'
         return "{}"
-
-
-def test_compute_total_steps_counts_all_checkpoint_slots(monkeypatch):
-    """进度分母必须覆盖 validate_routes / claim_plan / claim_alignment 检查点，
-    否则实际步骤数会超过分母，进度条超过 100%。"""
-    monkeypatch.setattr(
-        "app.agent.graph.get_settings",
-        lambda: Settings(
-            enable_pdf_pipeline=True,
-            enable_evidence_recovery=True,
-            enable_claim_verification=True,
-        ),
-    )
-    state = {"intent": "generate_review", "core_deliverables": ["research_status"]}
-    total = _compute_total_steps(state)
-    # 基础6 + fetch + download/parse(2) + cards + validate_routes
-    # + cluster + recovery + gate + claim_plan/gate(2) + generate
-    # + alignment + verify + citation = 20
-    assert total == 20
-
-    # 只查论文：检索排序后即返回，不包含生成链路步骤。
-    assert _compute_total_steps({"intent": "search_papers"}) == 6
 
 
 def test_build_output_deliverable_type_is_always_scalar():
@@ -189,6 +179,108 @@ def test_build_output_persists_final_best_effort_execution_record():
     assert private["best_effort_policy_source"] == "configuration"
     assert private["automatic_best_effort_attempted"] is True
     assert private["automatic_best_effort_generation"] is True
+
+
+def test_build_output_blocked_shows_budget_error():
+    """blocked + agent_budget_exhausted → 公开回复包含真实预算原因。"""
+    from app.agent.graph import _build_output
+    output = _build_output({
+        "agent_orchestration_mode": "autonomous",
+        "result_status": "blocked",
+        "generation_blocked": True,
+        "errors": [{"code": "agent_budget_exhausted", "message": "主 Agent 执行预算已耗尽"}],
+    })
+    assert "预算" in output["answer"]
+    assert "质量缺口" not in output["answer"]
+
+
+def test_build_output_blocked_without_errors_uses_fallback():
+    """blocked + 空 errors → 使用默认话术而非 KeyError。"""
+    from app.agent.graph import _build_output
+    output = _build_output({
+        "agent_orchestration_mode": "autonomous",
+        "result_status": "blocked",
+        "generation_blocked": True,
+        "errors": [],
+    })
+    assert "未满足交付要求" in output["answer"]
+
+
+def test_build_output_failed_shows_error_detail():
+    """failed status with error detail is shown in public answer."""
+    from app.agent.graph import _build_output
+    output = _build_output({
+        "agent_orchestration_mode": "autonomous",
+        "result_status": "failed",
+        "errors": [{"code": "main_context_invalid", "message": "context build failed"}],
+    })
+    assert "失败" in output["answer"]
+    assert "上下文校验未通过" in output["answer"]
+    assert "context build failed" not in output["answer"]
+
+
+def test_plan_reuses_matching_session_preflight_without_reparsing(monkeypatch):
+    from app.agent.topic_disambiguation import analyze_topic_ambiguity
+
+    query = "Find papers about object detection"
+    analysis = analyze_topic_ambiguity(query, llm=None, current_year=2026)
+    request = analysis["research_request"]
+    state = {
+        "user_query": query,
+        "intent_context_role": "request",
+        "research_request": request,
+        "preflight_intent_result": analysis["intent_result"],
+        "research_semantic_frame": request["semantic_frame"],
+        "semantic_frame_source_query": query,
+        "steps": [], "errors": [],
+    }
+
+    def unexpected_parse(name):
+        def fail(*args, **kwargs):
+            raise AssertionError(f"matching preflight must not repeat {name}")
+        return fail
+
+    monkeypatch.setattr("app.agent.intent.recognize_intent", unexpected_parse("intent"))
+    monkeypatch.setattr("app.agent.slot_extractor.extract_slots", unexpected_parse("slots"))
+    monkeypatch.setattr("app.agent.research_semantic_parser.parse_research_semantics", unexpected_parse("semantic"))
+
+    plan_node(state, llm=None, current_year=2026)
+
+    assert not state.get("planning_failed"), state.get("errors")
+    assert state["intent"] == request["task_type"]
+    assert state["topic"] == request["topic"]
+    assert "preflight_intent_result" not in state
+
+
+def test_plan_reparses_semantics_after_working_query_changes(monkeypatch):
+    from app.agent.topic_disambiguation import analyze_topic_ambiguity
+    from app.agent.research_semantic_parser import parse_research_semantics
+
+    original = "Find papers about object detection"
+    working = original + " focused on causal evaluation"
+    analysis = analyze_topic_ambiguity(original, llm=None, current_year=2026)
+    state = {
+        "user_query": working,
+        "intent_context_role": "working_query",
+        "research_request": analysis["research_request"],
+        "preflight_intent_result": analysis["intent_result"],
+        "research_semantic_frame": analysis["research_request"]["semantic_frame"],
+        "semantic_frame_source_query": original,
+        "steps": [], "errors": [],
+    }
+    calls = []
+
+    def record_parse(*args, **kwargs):
+        calls.append(kwargs["user_query"])
+        return parse_research_semantics(*args, **kwargs)
+
+    monkeypatch.setattr("app.agent.research_semantic_parser.parse_research_semantics", record_parse)
+
+    plan_node(state, llm=None, current_year=2026)
+
+    assert not state.get("planning_failed"), state.get("errors")
+    assert calls == [working]
+    assert state["semantic_frame_source_query"] == working
 
 
 def test_plan_uses_current_time_tool_for_relative_year_range():
@@ -403,6 +495,7 @@ def test_standalone_search_returns_paper_list(monkeypatch):
         "app.tools.search_papers.search_papers",
         fake_search,
     )
+    monkeypatch.setattr("app.agent.graph._get_llm", lambda: WorkflowLLM("search_and_rank", "request_finish"))
 
     result = run_research_agent("帮我找几篇关于目标检测的论文", current_year=2026)
 
@@ -418,6 +511,15 @@ def test_search_refines_keywords_after_low_recall(monkeypatch):
     """检索不足时，应把反馈交给 LLM 修正关键词并再次搜索。"""
 
     class FakeReActLLM:
+        native_tools_enabled = True
+
+        def __init__(self):
+            self.actions = iter(("search_and_rank", "report_blocked"))
+
+        def complete_tool_call(self, messages, **kwargs):
+            action = next(self.actions)
+            return {"name": action, "arguments": {"reason": "检索后证据仍不足"} if action == "report_blocked" else {}}
+
         def complete(self, prompt: str, **kwargs) -> str:
             if "意图识别模块" in prompt:
                 return '{"intent": "search_papers", "confidence": 0.95, "reason": "用户要求找论文"}'
@@ -574,9 +676,8 @@ def test_review_flow_does_not_count_unverified_pdf_url_as_download_failure(monke
     assert "parse" not in calls
     assert result["references"] == []
     assert result["generation_blocked"] is True
-    assert result["generation_readiness"]["ready"] is False
-    assert result["generation_readiness"]["blocking_issues"][0]["code"] == "minimum_references_not_met"
-    assert "正文生成已阻止" in result["answer"]
+    assert result["status"] == "blocked"
+    assert result["research_state"]["required_reference_count"] == 5
     download_step = next(s for s in result["steps"] if s["step_name"] == "download_pdf")
     assert download_step["output_data"]["downloaded"] == 0
     assert download_step["output_data"]["failed"] == 0
@@ -638,9 +739,9 @@ def test_review_returns_shortfall_message_when_no_cards_survive(monkeypatch):
         },
     )
 
-    assert "未生成相关工作" in result["answer"]
-    assert "未获得可用论文" in result["answer"]
-    assert result["answer"] != ""
+    assert result["status"] == "blocked"
+    assert result["paper_cards"] == []
+    assert result["answer"]
 
 
 def test_retrieval_shortfall_uses_requested_deliverable_names():
@@ -1270,6 +1371,15 @@ def test_search_node_reports_raw_and_unique_candidate_counts(monkeypatch):
 
 def test_agent_stops_when_all_search_sources_return_empty(monkeypatch):
     class FakePlanningLLM:
+        native_tools_enabled = True
+
+        def __init__(self):
+            self.actions = iter(("search_and_rank", "report_blocked"))
+
+        def complete_tool_call(self, messages, **kwargs):
+            action = next(self.actions)
+            return {"name": action, "arguments": {"reason": "数据源未返回论文，无法形成综述"} if action == "report_blocked" else {}}
+
         def complete(self, prompt: str, **kwargs) -> str:
             return """
             {
@@ -1286,7 +1396,9 @@ def test_agent_stops_when_all_search_sources_return_empty(monkeypatch):
 
     result = run_research_agent("帮我生成目标检测研究现状", current_year=2026)
 
-    assert "论文检索失败" in result["answer"]
+    assert result["status"] == "blocked"
+    assert result["paper_cards"] == []
+    assert "未返回论文" in result["answer"]
 
 
 def test_final_answer_quarantines_draft_when_unique_citations_below_requested_minimum():
@@ -1534,6 +1646,14 @@ def test_regeneration_clears_stale_readiness_and_section_diagnostics_before_writ
     from app.agent.graph import regenerate_research_agent
 
     observed = {}
+    monkeypatch.setattr("app.agent.graph._get_llm", lambda: WorkflowLLM(
+        "plan_claims", "generate_deliverables",
+        ("report_blocked", {"reason": "测试证据仍不足"}),
+    ))
+    monkeypatch.setattr("app.agent.graph.claim_plan_node", lambda state, **kw: state.update(
+        claim_plans=[{"route_id": "r1", "claims": []}],
+    ))
+    monkeypatch.setattr("app.agent.graph._run_claim_evidence_gate", lambda state: None)
 
     def fake_generate(state, should_cancel=None):
         observed["stale_readiness"] = state.get("generation_readiness")
@@ -1572,7 +1692,7 @@ def test_regeneration_clears_stale_readiness_and_section_diagnostics_before_writ
     result = regenerate_research_agent(state)
 
     assert observed == {"stale_readiness": None, "stale_sections": None}
-    assert result["answer"] == "## 研究现状\n\n重新生成的正文。"
+    assert result["research_state"]["review"] == "## 研究现状\n\n重新生成的正文。"
     assert result["research_state"]["max_papers_explicit"] is True
 
 
@@ -1581,6 +1701,14 @@ def test_regeneration_refreshes_existing_evidence_without_expanding_candidate_po
     from app.agent.graph import regenerate_research_agent
 
     observed = {}
+    monkeypatch.setattr("app.agent.graph._get_llm", lambda: WorkflowLLM(
+        "plan_claims", "generate_deliverables",
+        ("report_blocked", {"reason": "测试证据仍不足"}),
+    ))
+    monkeypatch.setattr("app.agent.graph.claim_plan_node", lambda state, **kw: state.update(
+        claim_plans=[{"route_id": "r1", "claims": []}],
+    ))
+    monkeypatch.setattr("app.agent.graph._run_claim_evidence_gate", lambda state: None)
 
     def fake_fetch(state, should_cancel=None):
         observed["fetch_ids"] = [item["paper_id"] for item in state["candidate_papers"]]
@@ -1617,14 +1745,129 @@ def test_regeneration_refreshes_existing_evidence_without_expanding_candidate_po
     result = regenerate_research_agent(state)
 
     assert observed == {"fetch_ids": ["selected"], "extract": True}
-    assert result["answer"] == "## 研究背景\n\n刷新后的正文。"
+    assert result["research_state"]["review"] == "## 研究背景\n\n刷新后的正文。"
     assert "refresh_existing_evidence" not in result["research_state"]
+
+
+def test_full_regeneration_cannot_release_old_draft_after_evidence_change(monkeypatch):
+    """全文重建尚未完成时，旧证据版本的正文和授权不得继续发布。"""
+    from app.agent.graph import regenerate_research_agent
+
+    monkeypatch.setattr("app.agent.graph._get_llm", lambda: WorkflowLLM(
+        ("report_blocked", {"reason": "变更后的证据尚不足"}),
+    ))
+    state = {
+        "intent": "generate_review", "topic": "测试主题",
+        "paper_details": [_paper(paper_id="selected")],
+        "paper_cards": [_paper(paper_id="selected")],
+        "review": "旧论文支撑的正文。", "claim_plans": [{"route_id": "old"}],
+        "quality_gate": {"passed": True, "draft_released": True},
+        "steps": [], "errors": [],
+    }
+
+    result = regenerate_research_agent(state)
+
+    assert result["status"] == "blocked"
+    assert result["body"] == ""
+    assert not result["research_state"].get("review")
+    assert not result["research_state"].get("claim_plans")
+    assert result["research_state"]["agent_orchestration_mode"] == "autonomous"
+
+
+def test_selected_best_effort_generation_cannot_be_skipped_by_main_agent(monkeypatch):
+    from app.agent.graph import regenerate_research_agent
+
+    monkeypatch.setattr("app.agent.graph._get_llm", lambda: WorkflowLLM("request_finish"))
+    monkeypatch.setattr("app.agent.graph.claim_plan_node", lambda current, **kw: current.update(
+        claim_plans=[{"route_id": "r1", "claims": []}],
+    ))
+    monkeypatch.setattr("app.agent.graph._run_claim_evidence_gate", lambda current: None)
+    monkeypatch.setattr("app.agent.graph.global_evidence_gate_node", lambda current: None)
+    monkeypatch.setattr("app.agent.graph._generate_deliverables_or_block", lambda current, **kw: current.update(
+        review="有限证据的草稿。",
+    ))
+    monkeypatch.setattr("app.agent.graph._verify_generated_draft", lambda current, **kw: current.update(
+        quality_gate={"passed": False, "partial_success": True, "draft_released": True},
+    ))
+    monkeypatch.setattr("app.agent.graph.final_answer_node", lambda current: current.update(
+        answer=current.get("review", ""),
+    ))
+    state = {
+        "intent": "generate_review", "topic": "测试主题", "core_deliverables": [],
+        "paper_details": [_paper(paper_id="p1")],
+        "paper_cards": [_paper(paper_id="p1")],
+        "best_effort_generation": True,
+        "automatic_best_effort_generation": True,
+        "steps": [], "errors": [],
+    }
+
+    result = regenerate_research_agent(state)
+
+    assert result["status"] == "partial"
+    assert result["body"] == "有限证据的草稿。"
+    assert [item["action"] for item in result["research_state"]["main_agent_decisions"]] == [
+        "plan_claims", "generate_deliverables", "request_finish",
+    ]
+    assert result["quality_gate"]["passed"] is False
+
+
+def test_selected_taxonomy_repair_runs_clustering_before_claims_and_writing(monkeypatch):
+    from app.agent.graph import regenerate_research_agent
+
+    calls = []
+    monkeypatch.setattr("app.agent.graph._get_llm", lambda: WorkflowLLM("request_finish"))
+
+    def cluster(current, **kwargs):
+        calls.append("cluster")
+        assert current["force_taxonomy_remediation"] is True
+        current["dynamic_taxonomy"] = {"themes": [{"theme_id": "theme_a", "name": "主题"}]}
+        current["clusters"] = [{"name": "主题", "paper_ids": ["p1"]}]
+
+    def claims(current, **kwargs):
+        calls.append("claims")
+        assert current.get("dynamic_taxonomy")
+        current["claim_plans"] = [{"route_id": "theme_a", "claims": []}]
+
+    def write(current, **kwargs):
+        calls.append("write")
+        current["review"] = "重新分类后的正文。"
+
+    monkeypatch.setattr("app.agent.graph.cluster_node", cluster)
+    monkeypatch.setattr("app.agent.graph.claim_plan_node", claims)
+    monkeypatch.setattr("app.agent.graph._run_claim_evidence_gate", lambda current: None)
+    monkeypatch.setattr("app.agent.graph.global_evidence_gate_node", lambda current: None)
+    monkeypatch.setattr("app.agent.graph._generate_deliverables_or_block", write)
+    monkeypatch.setattr("app.agent.graph._verify_generated_draft", lambda current, **kw: current.update(
+        quality_gate={"passed": True, "draft_released": True},
+    ))
+    monkeypatch.setattr("app.agent.graph.final_answer_node", lambda current: current.update(
+        answer=current.get("review", ""),
+    ))
+    state = {
+        "intent": "generate_review", "topic": "测试主题", "core_deliverables": [],
+        "paper_details": [_paper(paper_id="p1")],
+        "paper_cards": [_paper(paper_id="p1")],
+        "review": "旧分类正文。",
+        "dynamic_taxonomy": {"themes": [{"theme_id": "old", "name": "兜底主题"}]},
+        "force_taxonomy_remediation": True,
+        "steps": [], "errors": [],
+    }
+
+    result = regenerate_research_agent(state)
+
+    assert calls == ["cluster", "claims", "write"]
+    assert result["status"] == "success"
+    assert result["body"] == "重新分类后的正文。"
+    assert [item["action"] for item in result["research_state"]["main_agent_decisions"]] == [
+        "cluster_papers", "plan_claims", "generate_deliverables", "request_finish",
+    ]
 
 
 def test_verification_only_recovery_preserves_draft_and_skips_writer(monkeypatch):
     from app.agent.graph import regenerate_research_agent
 
     calls = []
+    monkeypatch.setattr("app.agent.graph._get_llm", lambda: WorkflowLLM("request_finish"))
 
     def unexpected_generate(*args, **kwargs):
         raise AssertionError("verification-only recovery must not regenerate text")
@@ -1696,6 +1939,11 @@ def test_local_rewrite_targets_derive_from_repairs_ccc_and_section_diagnostics()
 def test_conservative_regeneration_reuses_routes_and_claim_plan(monkeypatch):
     """纯文本/引用门禁失败时不得重新跑路线验证和 Claim Plan。"""
     from app.agent.graph import regenerate_research_agent
+    monkeypatch.setattr("app.agent.graph._get_llm", lambda: WorkflowLLM(
+        "generate_deliverables",
+        ("report_blocked", {"reason": "测试证据仍不足"}),
+    ))
+    monkeypatch.setattr("app.agent.graph._verify_generated_draft", lambda *args, **kwargs: None)
 
     def unexpected(*args, **kwargs):
         raise AssertionError("same-evidence local rewrite must reuse this stage")
@@ -1740,6 +1988,56 @@ def test_conservative_regeneration_reuses_routes_and_claim_plan(monkeypatch):
     )
     assert recovery_step["output_data"]["mode"] == "local_rewrite"
     assert result["research_state"]["claim_plans"] == state["claim_plans"]
+
+
+@pytest.mark.parametrize("change_authorization", [False, True])
+def test_local_regeneration_only_reuses_verification_for_unchanged_authorization(
+    monkeypatch, change_authorization,
+):
+    from app.agent.graph import regenerate_research_agent
+
+    actions = ["plan_claims"] if change_authorization else []
+    actions += ["generate_deliverables", "request_finish"]
+    llm = WorkflowLLM(*actions)
+    monkeypatch.setattr("app.agent.graph._get_llm", lambda: llm)
+    monkeypatch.setattr("app.agent.graph.claim_plan_node", lambda current, **kw: current.update(
+        claim_plans=[{"route_id": "r1", "claims": [{"claim_id": "new"}]}],
+    ))
+    monkeypatch.setattr("app.agent.graph._run_claim_evidence_gate", lambda current: None)
+    monkeypatch.setattr("app.agent.graph.global_evidence_gate_node", lambda current: None)
+    monkeypatch.setattr("app.agent.graph._generate_deliverables_or_block", lambda current, **kw: current.update(
+        review="新正文。",
+    ))
+    verification_kwargs = []
+
+    def verify(current, **kwargs):
+        verification_kwargs.append(kwargs)
+        current["quality_gate"] = {"passed": True, "draft_released": True}
+
+    monkeypatch.setattr("app.agent.graph._verify_generated_draft", verify)
+    monkeypatch.setattr("app.agent.graph.final_answer_node", lambda current: current.update(
+        answer=current.get("review", ""),
+    ))
+    state = {
+        "intent": "generate_review", "topic": "测试主题", "core_deliverables": [],
+        "paper_details": [_paper(paper_id="p1")],
+        "paper_cards": [_paper(paper_id="p1")],
+        "validated_routes": [{"route_id": "r1", "paper_ids": ["p1"]}],
+        "claim_plans": [{"route_id": "r1", "claims": [{"claim_id": "old"}]}],
+        "writing_plans": [{"section_id": "s1"}],
+        "review": "旧正文。",
+        "quality_gate": {"passed": False, "blocking_issues": [{"code": "final_text_integrity_not_met"}]},
+        "conservative_regeneration": True, "steps": [], "errors": [],
+    }
+
+    result = regenerate_research_agent(state)
+
+    assert result["status"] == "success"
+    assert len(verification_kwargs) == 1
+    if change_authorization:
+        assert "verify_claims_kwargs" not in verification_kwargs[0]
+    else:
+        assert verification_kwargs[0]["verify_claims_kwargs"]["verification_scope"]["mode"] == "local"
 
 
 def test_legacy_section_failure_without_ccc_rebuilds_claim_authorization():

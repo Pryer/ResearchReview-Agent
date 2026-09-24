@@ -7,6 +7,7 @@ import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from app.agent.execution_budget import submit_with_context
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
@@ -108,6 +109,8 @@ def search_node(
     should_cancel=None,
 ) -> "ResearchAgentState":
     """调用论文检索工具，获取候选论文。"""
+    from app.agent.execution_budget import consume
+    consume("retrieval")
     t0 = time.time()
     # search_failed 由本节点唯一写入：进入时清零，失败时置位。
     # 调用方不再散落手动重置，标志始终反映最近一次检索的结果。
@@ -417,7 +420,7 @@ def search_node(
             max_workers=keyword_workers, thread_name_prefix="keyword-search"
         ) as executor:
             futures = [
-                executor.submit(_dispatch_keyword, index, keyword, sources)
+                submit_with_context(executor, _dispatch_keyword, index, keyword, sources)
                 for index, (keyword, sources) in enumerate(
                     zip(search_keywords, keyword_sources)
                 )

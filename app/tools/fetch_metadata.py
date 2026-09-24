@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from app.agent.execution_budget import submit_with_context
 from copy import deepcopy
 from typing import Any, Dict, List
 
@@ -251,7 +252,7 @@ def fetch_batch_details(
         thread_name_prefix="paper-detail",
     ) as executor:
         future_to_index = {
-            executor.submit(_enrich_one_paper, paper): index
+            submit_with_context(executor, _enrich_one_paper, paper): index
             for index, paper in enumerate(inputs)
         }
         for future in as_completed(future_to_index):

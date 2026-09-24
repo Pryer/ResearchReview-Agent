@@ -14,7 +14,8 @@ from app.agent.evidence_recovery import (
 from app.agent.graph import _run_route_evidence_recovery
 from app.agent.nodes import validate_routes_node
 from app.core.config import Settings
-from app.schemas.recovery_schema import RecoveryAction
+from app.agent.state_invariants import validate_research_state_invariants
+from app.schemas.recovery_schema import RecoveryAction, RouteGapType
 
 
 def _route_state() -> dict:
@@ -331,6 +332,13 @@ def test_recovery_loop_runs_incrementally_and_stops_when_route_recovers(monkeypa
     assert state["evidence_gap_report"]["needs_recovery"] is False
     assert state["evidence_gap_report"]["evidence_snapshot_version"] == state["evidence_snapshot_version"]
     assert state["evidence_gap_report"]["evidence_snapshot_fingerprint"] == state["evidence_snapshot_fingerprint"]
+    # 恢复轮同时改写了 validated_routes，全局门禁必须一并针对新快照重算；
+    # 否则 derive_result_status 会继续按补检索前的路线论域判定终态。
+    gate = state["global_evidence_gate"]
+    assert gate["status"] == "EVALUATED"
+    assert gate["evidence_snapshot_version"] == state["evidence_snapshot_version"]
+    assert gate["evidence_snapshot_fingerprint"] == state["evidence_snapshot_fingerprint"]
+    assert validate_research_state_invariants(state)["valid"] is True
 
 
 def test_recovery_does_not_treat_off_target_evidence_as_progress(monkeypatch):
@@ -408,3 +416,95 @@ def test_recovery_does_not_treat_off_target_evidence_as_progress(monkeypatch):
     # 未达标路线如实落盘，供质量门禁 warning 使用。
     deficits = {item["route_id"] for item in state["route_evidence_deficits"]}
     assert "route_temporal" in deficits
+
+
+def _split_route_state() -> dict:
+    """复现真实 blocked 运行：R1/R2 被 SPLIT，父路线 decision.scores 为空。
+
+    scores 刻意不含 mean_route_fit / supporting_threshold，与生产 payload 一致。
+    """
+    return {
+        "core_deliverables": ["research_status"],
+        "required_reference_count": 40,
+        "max_papers": 40,
+        "searched_keywords": ["课堂行为分析"],
+        "provisional_framework": {"provisional_routes": [
+            {"route_id": "R1", "name": "视觉识别",
+             "search_queries": ["classroom behavior recognition"]},
+            {"route_id": "R2", "name": "多模态参与度",
+             "search_queries": ["multimodal engagement"]},
+            {"route_id": "R5", "name": "伦理隐私",
+             "search_queries": ["learning analytics ethics"]},
+        ]},
+        "validated_routes": [
+            {"route_id": "R1_S1", "name": "视觉识别-子1", "status": "KEEP",
+             "core_paper_ids": [f"p{i}" for i in range(17)]},
+            {"route_id": "R2_S1", "name": "多模态-子1", "status": "WEAK",
+             "core_paper_ids": [f"q{i}" for i in range(18)]},
+            {"route_id": "R5", "name": "伦理隐私", "status": "WEAK",
+             "core_paper_ids": ["e1", "e2"]},
+        ],
+        "route_decisions": [
+            {"route_id": "R1", "action": "KEEP", "status": "KEEP",
+             "diagnosis": "STRONG_ROUTE",
+             "route_validity": {"score": 0.96},
+             "evidence_sufficiency": {"score": 1.0, "sufficient": True},
+             "scores": {"paper_count": 93, "core_paper_count": 67}},
+            {"route_id": "R2", "action": "ROUTE_REVISION", "status": "WEAK",
+             "diagnosis": "ROUTE_REVISION_REQUIRED",
+             "route_validity": {"score": 0.85},
+             "evidence_sufficiency": {"score": 1.0, "sufficient": True},
+             "scores": {"paper_count": 87, "core_paper_count": 54}},
+            {"route_id": "R5", "action": "TARGETED_SEARCH", "status": "WEAK",
+             "diagnosis": "INSUFFICIENT_EVIDENCE",
+             "route_validity": {"score": 0.91},
+             "evidence_sufficiency": {"score": 1.0, "sufficient": False},
+             "scores": {"paper_count": 18, "core_paper_count": 2}},
+            {"route_id": "R1", "action": "SPLIT_INTO", "status": "KEEP",
+             "diagnosis": "OVERSIZED_ROUTE", "scores": None},
+            {"route_id": "R2", "action": "SPLIT_INTO", "status": "KEEP",
+             "diagnosis": "OVERSIZED_ROUTE", "scores": None},
+        ],
+        "route_validation_report": {
+            "coverage": {"evidence_understood_rate": 0.68},
+            "assignment_map": {},
+        },
+        "source_diagnostics": [{"source": "openalex", "status": "success"}],
+    }
+
+
+def test_split_parent_route_is_structural_gap_not_phantom_search_gap():
+    report = diagnose_evidence_gaps(_split_route_state())
+
+    structural = [g for g in report.gaps if g.route_id in {"R1", "R2"}]
+    assert structural, "已拆分父路线仍应留痕为结构缺口"
+    for gap in structural:
+        assert gap.gap_type == RouteGapType.ROUTE_STRUCTURE_GAP
+        assert gap.structurally_resolved is True
+    # 幻影缺口会让 needs_recovery 永久为真并把补检索指向已不存在的父路线。
+    assert report.affected_route_ids == ["R5"]
+
+
+def test_weak_route_with_met_core_target_does_not_request_recovery():
+    report = diagnose_evidence_gaps(_split_route_state())
+
+    search_gaps = {
+        g.route_id for g in report.gaps
+        if g.gap_type in {
+            RouteGapType.SEARCH_COVERAGE_GAP, RouteGapType.SEARCH_PRECISION_GAP,
+        }
+    }
+    # R2 有 54 篇核心证据、充分性 1.00，仅因 status=WEAK 不应触发补检索。
+    assert search_gaps == {"R5"}
+    assert report.needs_recovery is True
+
+
+def test_coverage_deficit_is_not_mislabeled_as_precision_gap():
+    report = diagnose_evidence_gaps(_split_route_state())
+
+    r5 = next(g for g in report.gaps if g.route_id == "R5")
+    # scores 缺少 mean_route_fit/supporting_threshold 时不得按 0.0 互比判成精度
+    # 缺口，否则 decide_recovery 会改用 QUERY_FILTER_REVISION 收窄过滤，
+    # 真实的核心证据缺口反而补不上。
+    assert r5.gap_type == RouteGapType.SEARCH_COVERAGE_GAP
+    assert r5.core_evidence_deficit > 0

@@ -14,8 +14,10 @@ from app.core.text_quality import (
 from app.deliverables.renderers import (
     get_renderer,
     _allocated_paper_ids,
+    _claim_constraints_for_title,
     _heading,
     _split_planned_sections,
+    _survey_papers,
     _validate_rewritten_section,
 )
 from app.schemas.deliverable_schema import WritingPlan
@@ -39,6 +41,10 @@ def _section_input_fingerprint(
         item for item in (state.get("citation_allocation_plan") or {}).get("sections") or []
         if str(item.get("section_id") or "") == section.id
     ), {})
+    section_paper_ids = {
+        *[str(value) for value in section.supporting_paper_ids],
+        *[str(value) for value in allocation.get("paper_ids") or []],
+    }
     cards = {
         str(card.get("paper_id") or ""): {
             "access": (card.get("evidence_state") or {}).get("access_level")
@@ -51,13 +57,18 @@ def _section_input_fingerprint(
             },
         }
         for card in state.get("paper_cards") or []
-        if str(card.get("paper_id") or "") in {
-            *[str(value) for value in section.supporting_paper_ids],
-            *[str(value) for value in allocation.get("paper_ids") or []],
-        }
+        if str(card.get("paper_id") or "") in section_paper_ids
     }
+    projected, synthesis = _writer_inputs(plan, state)
+    # WHY: 确定性证据草稿无需模型，复用前即可构建；授权/综合变化不能复用旧正文。
+    draft = get_renderer(plan.deliverable_type).render_fallback(
+        plan, {**state, "theme_synthesis": synthesis}, projected
+    )
+    from app.deliverables.renderers.base_renderer import _requires_cross_route_synthesis
+    semantic = state.get("research_semantic_frame") or {}
     payload = {
         "deliverable": plan.deliverable_type.value,
+        "citation_policy": plan.citation_policy or {},
         "section": section.model_dump(mode="json"),
         "allocation": allocation,
         "cards": cards,
@@ -69,7 +80,43 @@ def _section_input_fingerprint(
             for item in state.get("paper_details") or []
             if str(item.get("paper_id") or "") in cards
         ),
-        "evidence_snapshot": state.get("evidence_snapshot_fingerprint") or "",
+        # WHY: 逐项列出真正进入本节提示词的输入，替代原先的全局证据快照。
+        # 全局快照既过宽（新增一篇无关论文就废掉所有章节检查点），又覆盖不足
+        # （claim 约束、主题、研究重点都不在其中）。收窄的同时必须补齐这些
+        # 实际输入，否则会从"过度失效"变成"失效不足"，复用未重验的旧正文。
+        "routes": sorted(
+            (
+                str(route.get("route_id") or ""),
+                tuple(sorted(
+                    paper_id
+                    for paper_id in (
+                        str(value) for value in route.get("core_paper_ids") or []
+                    )
+                    if paper_id in section_paper_ids
+                )),
+            )
+            for route in state.get("validated_routes") or []
+            if route.get("route_id")
+            and {str(value) for value in route.get("core_paper_ids") or []}
+            & section_paper_ids
+        ),
+        # 综述论文清单注入每一节提示词，是唯一的合法全局输入。
+        "fingerprint_schema": 2,
+        "survey_papers": _survey_papers(projected),
+        "projected_cards": [card for card in projected if str(card.get("paper_id")) in section_paper_ids],
+        "original": _split_planned_sections(draft, plan).get(section.id, ""),
+        "require_cross_route_synthesis": _requires_cross_route_synthesis(plan, section.id),
+        "topic": str(state.get("canonical_topic") or state.get("topic") or ""),
+        "scope": str((state.get("selected_scope") or {}).get("description") or ""),
+        "focuses": [str(item) for item in semantic.get("required_focuses") or []],
+        "evidence_roles": [
+            str(item.get("label") or "")
+            for item in semantic.get("evidence_requirements") or []
+            if str(item.get("label") or "").strip()
+        ],
+        "claim_constraints": _claim_constraints_for_title(
+            state.get("claim_plans"), section.title
+        ),
     }
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
@@ -220,13 +267,8 @@ def _fallback_writer(
     return renderer.render_fallback(plan_obj, state, cards)
 
 
-def write_deliverable(
-    plan: WritingPlan | dict[str, Any],
-    state: dict[str, Any],
-    llm=None,
-) -> str:
-    """交付物主写作入口，按 deliverable_type 委派给独立渲染器。"""
-    plan = plan if isinstance(plan, WritingPlan) else WritingPlan.model_validate(plan)
+def _writer_inputs(plan: WritingPlan, state: dict[str, Any]):
+    """指纹和写作共用授权投影，禁止两套过滤逻辑漂移。"""
     allowed_paper_ids = {
         paper_id for section in plan.sections for paper_id in section.supporting_paper_ids
     }
@@ -346,6 +388,17 @@ def write_deliverable(
             ]
         safe_synthesis.append(combined)
 
+    return cards, safe_synthesis
+
+
+def write_deliverable(
+    plan: WritingPlan | dict[str, Any],
+    state: dict[str, Any],
+    llm=None,
+) -> str:
+    """交付物主写作入口，按 deliverable_type 委派给独立渲染器。"""
+    plan = plan if isinstance(plan, WritingPlan) else WritingPlan.model_validate(plan)
+    cards, safe_synthesis = _writer_inputs(plan, state)
     renderer = get_renderer(plan.deliverable_type)
     reusable_sections = _reusable_checkpoint_sections(plan, state)
     sentinel = object()

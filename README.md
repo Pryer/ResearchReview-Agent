@@ -12,7 +12,11 @@
 |------|------|
 | 研究请求理解 | LLM开放语义解析 + 规则校验，抽取主题、年份、篇数、范围与四类交付物 |
 | 多轮研究会话 | 保存澄清、论文集合、生成版本和修订历史；支持按序号/标题排除论文 |
+| 五字段主 Agent | 基于目标、状态、关键证据、决定和未决问题，每轮选择一个注册动作 |
+| 专业任务边界 | Controller 按动作投影输入，校验输出白名单、类型、身份与版本后提交 |
 | 后台任务控制 | 长任务异步执行，可查询步骤与进度，并在节点边界协作式取消 |
+| 持久化恢复 | 会话租约与数据库 CAS 保护提交；检查点恢复保留证据、显式约束及累计预算 |
+| 缓存与用量 | 固定提示规则前置，按实际输入复用章节；统计缓存 hit/miss、重试及备用请求用量 |
 | 增量重生成 | 编辑论文集合后只重做聚类、写作和引用验证，不重复检索与详情补全 |
 | 多源检索 | arXiv + Semantic Scholar + OpenAlex + Crossref + CNKI（Selenium） |
 | 失败诊断 | 区分"真空结果"与"检索失败"，避免误判关键词不合适 |
@@ -31,6 +35,32 @@
 
 正文生成与内部检索标识分离：主张验证阶段使用 DOI、Semantic Scholar、OpenAlex 或
 arXiv ID 追踪证据，最终论文正文统一渲染为顺序编码或作者—年份引用，完整元数据进入参考文献表。
+
+## 当前架构
+
+研究执行只有一套调度：主 Agent 每轮从已注册动作中选择一个，动作权限、预算、
+取消、证据版本与质量门禁由确定性代码裁决。历史会话（含未记录模式或标记为
+`legacy` 的旧状态）在恢复入口统一规范为这套调度；原研究目标、显式约束、论文
+与证据卡、恢复历史与预算消耗全部保留，只重算与旧调度绑定的派生结果。
+主 Agent 的模型输入只包含 `goal`、`state`、`key_evidence`、
+`decisions`、`open_questions`，完整论文、证据和历史保存在权威状态与数据库资料中。
+
+```text
+用户请求 → 需求解析 → 构建五字段 → 主 Agent 选择一个动作
+                                      ↓
+                         Controller 校验并委派
+                                      ↓
+                         Search / Analysis / Writing
+                                      ↓
+                    版本复核、事务提交 → 重建五字段 → 下一轮
+
+申请交付 → 确定性质量门禁 → 完成 / 明确降级 / 拒绝交付
+```
+
+会话服务将任务结果、资料引用、预算和检查点原子提交；取消、失效或越权结果不能
+随后覆盖研究状态。直接调用 graph 的脚本仍是内存执行模式。缓存优化保留完整
+证据核验，不代表已经测得固定节费比例。模块说明见 [ARCHITECTURE.md](ARCHITECTURE.md)，
+事务与恢复边界见 [执行、恢复与缓存说明](docs/agent-runtime-and-cache.md)。
 
 ---
 
@@ -63,6 +93,9 @@ copy .env.example .env
 ```bash
 python scripts/check_llm_api.py --target primary
 ```
+
+升级已有部署后需重启服务加载新代码，启动建表会添加执行与历史归档表。
+也可先运行 `python scripts/migrate_agent_runtime.py`；该迁移幂等，保留已有研究数据。
 
 ### 3. 启动 API 服务
 
@@ -104,7 +137,8 @@ curl -X POST http://localhost:8000/api/reviews/jobs \
 
 使用 `GET /api/reviews/jobs/{job_id}` 查询状态，或调用
 `POST /api/reviews/jobs/{job_id}/cancel` 请求取消。取消为节点边界协作式取消：
-正在执行的单次外部 API/LLM 请求结束后停止，不会继续进入下一个步骤。
+正在执行的外部 API/LLM 请求仍受客户端超时约束；取消先落库后，迟到研究结果不能
+提交，但已经发生的模型消耗仍结算。
 
 完成后可以按稳定 ID 排除论文并增量重生成：
 
@@ -116,6 +150,23 @@ curl -X POST http://localhost:8000/api/reviews/jobs/revise \
 
 也可只传自然语言指令，例如“删除第 2、5 篇后重新生成”。会话记忆可通过
 `GET /api/reviews/sessions/{session_id}` 查询。
+
+### 从已提交检查点恢复
+
+中断会话可向 `POST /api/reviews/jobs` 提交以下 JSON：
+
+```json
+{
+  "session_id": "demo-001",
+  "user_query": "继续上次研究",
+  "resume_from_checkpoint": true
+}
+```
+
+该入口适用于具有已提交检查点的 `running/failed/cancelled/blocked` 会话；已有活动
+任务需先结束，崩溃租约需到期后才能接管。恢复保留原目标、年份、篇数要求和累计
+预算，不自动提高额度或重放未决请求。待澄清会话仍提交 `clarification_answer`，
+已完成会话使用修订入口。历史在保留最近 50 条展示记录前归档，摘要按事件游标增量更新。
 
 ### 自然语言 Agent 请求
 
@@ -176,6 +227,10 @@ conda activate rragent
 pytest
 ```
 
+2026-09-22 运行时与缓存修复验收的全量回归为 **1224 项通过**；后续检查见变更日志。真实备用 LLM → CNKI
+检索 3 篇 → 提交 → 数据库重开恢复已通过；“至少 40 篇完整综述”场景因剩余预算
+不足以预留下一请求而阻断，尚未完成交付验收。详见[验收记录](docs/validation/2026-09-22-runtime-cache.md)。
+
 ---
 
 ## 📁 项目结构
@@ -186,6 +241,10 @@ ResearchReview-Agent/
 │   ├── agent/        # 意图识别、槽位抽取、规划、路由、节点、图编排
 │   │   ├── prompt_templates/  # 写作 Prompt 契约（review/related_work/introduction）
 │   │   ├── graph.py           # 四类交付物的主工作流入口（run/continue/regenerate）
+│   │   ├── main_loop.py / main_policy.py # 五字段决策循环与原生工具/JSON 动作策略
+│   │   ├── controller.py / action_contracts.py # 动作授权、输入投影、补丁与版本校验
+│   │   ├── context_builder.py / subagents/ # 上下文构建与 Search/Analysis/Writing
+│   │   ├── execution_budget.py # 跨主决策、专业任务和重试共享预算
 │   │   ├── nodes/             # 按阶段分组的节点包：planning/retrieval/extraction/synthesis/verification
 │   │   ├── retrieval_loop.py  # ReAct 检索精化循环
 │   │   ├── recovery_loop.py   # 路线证据恢复状态机
@@ -194,10 +253,10 @@ ResearchReview-Agent/
 │   ├── api/          # FastAPI 路由
 │   ├── clients/      # arXiv / Semantic Scholar / OpenAlex / Crossref / CNKI 客户端
 │   ├── core/         # 配置、日志、异常
-│   ├── database/     # SQLAlchemy 模型与仓储（支持 citation_count_by_source）
+│   ├── database/     # SQLAlchemy；runtime_repository 管理租约、CAS、任务/请求和快照
 │   ├── frontend/     # Streamlit 前端
 │   ├── schemas/      # Pydantic 数据模型（含 SourceDiagnostic）
-│   ├── services/     # 业务服务层
+│   ├── services/     # 会话/任务、执行作用域、资料存取、增量历史与 LLM 服务
 │   ├── tools/        # 检索、排序、PDF、聚类、写作分发、引用工具
 │   │   ├── write_deliverable.py     # 四类交付物统一写作分发
 │   │   ├── verify_claims.py         # 句子级 Claim–Evidence 校验
@@ -231,7 +290,13 @@ ResearchReview-Agent/
 | `LLM_THINKING_MAX_TOKENS` | 最终思考写作的单次输出预算 | `32768` |
 | `LLM_MAX_TOKENS` | 最终成文输出预算 | `8192` |
 | `LLM_CONTROL_PLANE_MAX_TOKENS` | 语义解析、筛选、聚类和验证等结构化任务预算 | `4096` |
+| `LLM_NATIVE_TOOLS_ENABLED` | 主 Agent 使用原生工具调用；关闭后使用受校验的 JSON 动作 | `true` |
 | `LLM_FAILOVER_TOTAL_TIMEOUT` | 单个逻辑请求跨主/备用模型的总超时（秒） | `180` |
+| `AGENT_MAIN_MAX_ROUNDS` | 单次主 Agent 循环最大决策轮数 | `24` |
+| `AGENT_EXECUTION_ACTION_BUDGET` | 会话累计专业动作预留上限 | `64` |
+| `AGENT_MAIN_TOKEN_BUDGET` | 主决策、解析、专业任务、重试及备用共享累计 token 上限 | `1000000` |
+| `AGENT_RETRIEVAL_BUDGET` | 累计检索轮次上限 | `64` |
+| `AGENT_EXECUTION_DEADLINE_SECONDS` | 当前执行期限及执行租约时长（秒） | `1800` |
 | `DATABASE_URL` | 数据库地址 | SQLite |
 | `SEMANTIC_SCHOLAR_API_KEY` | S2 可选密钥 | 空 |
 | `APP_API_KEY` | 共享部署时保护业务接口的可选密钥 | 空（仅建议本地） |
@@ -269,7 +334,10 @@ ResearchReview-Agent/
 ## 📚 文档与案例
 
 - [AGENTS.md](AGENTS.md)：Coding Agent 必须遵守的规则、验证要求和完成标准。
+- [ARCHITECTURE.md](ARCHITECTURE.md)：当前控制循环、模块目录与运行边界。
 - [docs/architecture.md](docs/architecture.md)：系统分层、模块边界和运行组件。
+- [docs/agent-context-architecture.md](docs/agent-context-architecture.md)：五字段、专业 Agent 与上下文边界。
+- [docs/agent-runtime-and-cache.md](docs/agent-runtime-and-cache.md)：动作契约、数据库提交、预算、恢复和缓存机制。
 - [docs/research-workflow.md](docs/research-workflow.md)：Agent 工作流、阶段契约和分支保证。
 - [docs/evidence-model.md](docs/evidence-model.md)：PaperMetadata、Evidence、Claim、Citation 的关系。
 - [docs/quality-gates.md](docs/quality-gates.md)：能力、路线、主张、交付物和生成质量门禁。

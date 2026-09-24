@@ -16,6 +16,7 @@ from app.core.logger import get_logger
 from app.database.models import (
     Paper,
     PaperCardModel,
+    ResearchArtifactModel,
     ResearchJobModel,
     ResearchSessionModel,
     ReviewModel,
@@ -24,6 +25,92 @@ from app.schemas.paper_schema import PaperCard, PaperMetadata
 from app.schemas.review_schema import LiteratureReview
 
 logger = get_logger(__name__)
+
+
+class ResearchArtifactCorruptionError(ValueError):
+    """持久化资料无法解析；不能把损坏证据静默替换为空对象。"""
+
+
+class ResearchArtifactRepository:
+    """按会话隔离研究资料；读取必须同时匹配 session_id 与 artifact_id。"""
+
+    def __init__(self, db: Session) -> None:
+        self.db = db
+
+    def save(
+        self,
+        *,
+        artifact_id: str,
+        session_id: str,
+        artifact_type: str,
+        version: int,
+        fingerprint: str,
+        payload: dict,
+        provenance: dict | None = None,
+    ) -> ResearchArtifactModel:
+        row = self.db.get(ResearchArtifactModel, artifact_id)
+        values = {
+            "session_id": session_id,
+            "artifact_type": artifact_type,
+            "version": int(version),
+            "fingerprint": fingerprint,
+            "payload_json": json.dumps(payload or {}, ensure_ascii=False),
+            "provenance_json": json.dumps(provenance or {}, ensure_ascii=False),
+        }
+        if row:
+            if row.session_id != session_id:
+                raise ValueError("artifact_id belongs to another research session")
+            current = {
+                "session_id": row.session_id,
+                "artifact_type": row.artifact_type,
+                "version": row.version,
+                "fingerprint": row.fingerprint,
+                "payload_json": row.payload_json,
+                "provenance_json": row.provenance_json,
+            }
+            if current != values:
+                raise ValueError("immutable artifact content cannot be overwritten")
+        else:
+            row = ResearchArtifactModel(artifact_id=artifact_id, **values)
+            self.db.add(row)
+        self.db.flush()
+        return row
+
+    def get(self, session_id: str, artifact_id: str) -> dict | None:
+        row = self.db.execute(
+            select(ResearchArtifactModel).where(
+                ResearchArtifactModel.session_id == session_id,
+                ResearchArtifactModel.artifact_id == artifact_id,
+            )
+        ).scalar_one_or_none()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row.payload_json or "{}")
+            provenance = json.loads(row.provenance_json or "{}")
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ResearchArtifactCorruptionError(
+                f"artifact {artifact_id} contains invalid JSON"
+            ) from exc
+        return {
+            "artifact_id": row.artifact_id,
+            "session_id": row.session_id,
+            "artifact_type": row.artifact_type,
+            "version": row.version,
+            "fingerprint": row.fingerprint,
+            "payload": payload,
+            "provenance": provenance,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+
+    def list(self, session_id: str, artifact_type: str | None = None) -> list[dict]:
+        stmt = select(ResearchArtifactModel).where(
+            ResearchArtifactModel.session_id == session_id
+        )
+        if artifact_type:
+            stmt = stmt.where(ResearchArtifactModel.artifact_type == artifact_type)
+        rows = self.db.execute(stmt.order_by(ResearchArtifactModel.created_at.desc())).scalars().all()
+        return [self.get(session_id, row.artifact_id) for row in rows]
 
 
 # ============================================================
@@ -361,10 +448,36 @@ class ResearchSessionRepository:
         clarification: dict | None = None,
     ) -> ResearchSessionModel:
         row = self.db.get(ResearchSessionModel, session_id)
+        from app.services.research_artifact_service import ResearchArtifactService
+        artifacts = ResearchArtifactService(self.db)
+        stored_state = dict(state or {})
+        if isinstance(stored_state.get("conversation_history"), list):
+            from app.services.research_memory_service import ResearchMemoryService
+            stored_state["conversation_history"] = ResearchMemoryService(self.db).archive_history(
+                session_id, stored_state["conversation_history"])
+        from app.services.durable_execution_service import active_runtime
+        runtime = active_runtime()
+        if runtime and runtime.session_id == session_id:
+            runtime.authorize_session_save(status)
+            stored_state["runtime_checkpoint_version"] = runtime.version
+        from app.agent.execution_budget import active_budget
+        active = active_budget()
+        if active is not None:
+            stored_state["agent_execution_budget"] = dict(active["ledger"])
+        if isinstance(stored_state.get("editable_research_state"), dict):
+            if active is not None:
+                stored_state["editable_research_state"] = {
+                    **stored_state["editable_research_state"], "agent_execution_budget": dict(active["ledger"]),
+                }
+            stored_state["editable_research_state"] = artifacts.externalize_state(
+                session_id, stored_state["editable_research_state"]
+            )
+        # WHY: 旧兼容字段也不能成为二进制/PDF 绕过资料边界的旁路。
+        artifacts.validate_payload(stored_state, max_bytes=8 * 1024 * 1024)
         values = {
             "status": status,
             "original_query": original_query,
-            "state_json": json.dumps(state or {}, ensure_ascii=False),
+            "state_json": json.dumps(stored_state, ensure_ascii=False),
             "clarification_json": (
                 json.dumps(clarification, ensure_ascii=False)
                 if clarification is not None
@@ -391,11 +504,32 @@ class ResearchSessionRepository:
             except (json.JSONDecodeError, TypeError):
                 return default
 
+        state = load(row.state_json, {})
+        if isinstance(state.get("editable_research_state"), dict):
+            from app.services.research_artifact_service import ResearchArtifactService
+            state["editable_research_state"] = ResearchArtifactService(self.db).hydrate_state(
+                session_id, state["editable_research_state"]
+            )
+        # WHY: 崩溃可能发生在动作提交后、公开会话保存前；已提交研究快照优先。
+        from app.database.models import ResearchRuntimeModel
+        runtime = self.db.get(ResearchRuntimeModel, session_id, populate_existing=True)
+        if runtime and runtime.version > int(state.get("runtime_checkpoint_version") or 0):
+            from app.services.research_artifact_service import ResearchArtifactService
+            restored = ResearchArtifactService(self.db).hydrate_state(session_id, json.loads(runtime.state_json))
+            restored["agent_execution_budget"] = json.loads(runtime.budget_json)
+            state["editable_research_state"] = restored
+            state["runtime_checkpoint_version"] = runtime.version
+        if runtime:
+            # WHY: 用量结算和显式额度更新不增加研究快照版本，账本必须每次单独刷新。
+            ledger = json.loads(runtime.budget_json)
+            state["agent_execution_budget"] = dict(ledger)
+            if isinstance(state.get("editable_research_state"), dict):
+                state["editable_research_state"]["agent_execution_budget"] = dict(ledger)
         return {
             "session_id": row.session_id,
             "status": row.status,
             "original_query": row.original_query,
-            "state": load(row.state_json, {}),
+            "state": state,
             "clarification": load(row.clarification_json, None),
             "created_at": row.created_at.isoformat() if row.created_at else None,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,

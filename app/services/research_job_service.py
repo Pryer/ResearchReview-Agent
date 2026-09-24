@@ -7,9 +7,11 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.agent.graph import AgentCancelledError
+from app.agent.public_errors import public_stop_reason
 from app.core.logger import get_logger
 from app.core.config import get_settings
 from app.database.db import SessionLocal
@@ -121,11 +123,14 @@ class ResearchJobService:
             return job
         # CAS 迁移：若 worker 在读取与写入之间恰好落了终态，这里影响行数为
         # 0，条件更新自动放弃覆盖，避免任务永久卡在 cancel_requested。
-        self.repo.update_status_if_in(
+        affected = self.repo.update_status_if_in(
             job_id,
             {"queued", "running", "cancel_requested"},
             status="cancel_requested",
         )
+        from app.database.runtime_repository import cancel_runtime
+        if affected:
+            cancel_runtime(self.db, job["session_id"])
         self.db.commit()
         return self.repo.get(job_id)
 
@@ -199,11 +204,14 @@ class ResearchJobService:
             if not job:
                 return
             if job["status"] == "cancel_requested":
-                repo.update(job_id, status="cancelled", current_step="cancelled")
+                repo.update_status_if_in(job_id, {"cancel_requested"}, status="cancelled", current_step="cancelled")
                 db.commit()
                 return
-            repo.update(job_id, status="running", current_step="preflight")
+            # WHY: 内存 guard 只保护本进程，数据库 CAS 阻止重复投递的另一个 worker 再执行。
+            claimed = repo.update_status_if_in(job_id, {"queued"}, status="running", current_step="preflight")
             db.commit()
+            if not claimed:
+                return
 
             def progress(step: str, current: int, total: int) -> None:
                 repo.update(
@@ -237,6 +245,8 @@ class ResearchJobService:
                     if result.get("status") == "blocked"
                     else "failed"
                     if result.get("status") == "failed"
+                    else "cancelled"
+                    if result.get("status") == "cancelled"
                     else "completed"
                 )
                 latest_job = repo.get(job_id) or job
@@ -267,8 +277,14 @@ class ResearchJobService:
                 db.commit()
             except AgentCancelledError as exc:
                 db.rollback()
-                session = ResearchSessionRepository(db).get(job["session_id"])
-                if session:
+                from app.database.models import ResearchRuntimeModel
+                # WHY: 旧 worker 的异常处理已离开执行租约，不能覆盖刚开始的新执行。
+                locked = db.execute(update(ResearchRuntimeModel).where(
+                    ResearchRuntimeModel.session_id == job["session_id"],
+                    ResearchRuntimeModel.owner.is_(None), ResearchRuntimeModel.cancelled.is_(True),
+                ).values(version=ResearchRuntimeModel.version)).rowcount
+                session = ResearchSessionRepository(db).get(job["session_id"]) if locked else None
+                if session is not None:
                     ResearchSessionRepository(db).save(
                         session_id=job["session_id"],
                         status="cancelled",
@@ -287,11 +303,15 @@ class ResearchJobService:
             except Exception as exc:  # 后台线程必须把错误写回任务状态
                 db.rollback()
                 logger.exception("Research job failed: %s", job_id)
+                # WHY: job.error 会直接显示在前端；技术异常留在日志，公开入口共用停止原因映射。
+                public_error = public_stop_reason([
+                    {"code": type(exc).__name__, "message": str(exc)},
+                ])
                 repo.update_status_if_in(
                     job_id,
                     {"running", "cancel_requested"},
                     status="failed",
                     current_step="failed",
-                    error=str(exc),
+                    error=public_error,
                 )
                 db.commit()

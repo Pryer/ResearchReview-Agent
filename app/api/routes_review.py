@@ -94,7 +94,10 @@ def get_research_session_api(session_id: str, db: Session = Depends(get_db)):
             "session_id": session_id,
             "status": session.get("status"),
             "original_query": session.get("original_query"),
-            "conversation_history": state.get("conversation_history") or [],
+            "conversation_history": [
+                {key: value for key, value in item.items() if not key.startswith("_")}
+                for item in state.get("conversation_history") or [] if isinstance(item, dict)
+            ],
             "revision_history": state.get("revision_history") or [],
             "revision_number": state.get("revision_number") or 0,
             "selected_paper_ids": state.get("selected_paper_ids") or [],

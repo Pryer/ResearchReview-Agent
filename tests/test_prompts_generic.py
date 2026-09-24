@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.agent.prompts import (
+from app.prompt_catalog import (
     ASSIGNMENT_PROMPT,
     AXIS_INDUCTION_PROMPT,
     CITATION_CHECK_PROMPT,

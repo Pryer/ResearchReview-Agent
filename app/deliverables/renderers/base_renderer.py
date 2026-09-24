@@ -8,6 +8,11 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+from app.agent.execution import AgentCancelledError
+from app.agent.execution_budget import (
+    AgentBudgetExceeded,
+    submit_with_context,
+)
 from app.core.citation_syntax import (
     extract_citation_ids as extract_normalized_citation_ids,
     normalize_citation_syntax,
@@ -48,6 +53,37 @@ def _survey_papers(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _claim_constraints_for_title(
+    claim_plans: list[dict[str, Any]] | None, section_title: str
+) -> str:
+    """按路线名或背景段落标签匹配该章节的 claim 约束文本。
+
+    章节检查点指纹复用本函数，保证失效判定与实际进入提示词的约束一致。
+    """
+    by_route = {
+        str(item.get("route_name") or ""): item for item in (claim_plans or [])
+    }
+    cleaned_title = str(section_title or "").strip()
+    # 精确匹配路线名
+    for route_name, plan_item in by_route.items():
+        if route_name in cleaned_title or cleaned_title in route_name:
+            return _render_claim_constraints(plan_item)
+    # 背景节：按标题关键词模糊匹配
+    if not cleaned_title:
+        return ""
+    title_tokens = set(re.findall(r"[一-鿿]{2,}", cleaned_title.lower()))
+    for route_name, plan_item in by_route.items():
+        plan_tokens = set(re.findall(r"[一-鿿]{2,}", route_name.lower()))
+        if title_tokens & plan_tokens:
+            return _render_claim_constraints(plan_item)
+    return ""
+
+
+def _requires_cross_route_synthesis(plan: WritingPlan, section_id: str) -> bool:
+    themes = [section.id for section in plan.sections if section.id.startswith("theme_")]
+    return len(themes) > 1 and section_id == themes[-1]
+
+
 def _write_sections_in_chinese(
     draft: str,
     plan: WritingPlan,
@@ -64,35 +100,8 @@ def _write_sections_in_chinese(
     completed: dict[str, str] = {}
     diagnostics: list[dict[str, Any]] = []
     survey_papers = _survey_papers(cards)
-    # 末条研究路线负责跨路线综合；多路线时才需要，单路线无“跨路线”可综合。
-    theme_section_ids = [
-        section.id for section in plan.sections if section.id.startswith("theme_")
-    ]
-    final_theme_section_id = theme_section_ids[-1] if len(theme_section_ids) > 1 else ""
-
     # 检查是否有 Claim Plan 约束
     claim_plans = state.get("claim_plans") or []
-    _claim_plan_by_route = {
-        str(plan_item.get("route_name") or ""): plan_item
-        for plan_item in claim_plans
-    }
-
-    def _claim_constraints_for_section(section_title: str) -> str:
-        """为指定章节生成 claim 约束文本。匹配路线名或背景段落标签。"""
-        cleaned_title = str(section_title or "").strip()
-        # 精确匹配路线名
-        for route_name, plan_item in _claim_plan_by_route.items():
-            if route_name in cleaned_title or cleaned_title in route_name:
-                return _render_claim_constraints(plan_item)
-        # 背景节：按标题关键词模糊匹配
-        if not cleaned_title:
-            return ""
-        title_tokens = set(re.findall(r"[一-鿿]{2,}", cleaned_title.lower()))
-        for route_name, plan_item in _claim_plan_by_route.items():
-            plan_tokens = set(re.findall(r"[一-鿿]{2,}", route_name.lower()))
-            if title_tokens & plan_tokens:
-                return _render_claim_constraints(plan_item)
-        return ""
 
     def rewrite(section) -> tuple[str, str, dict[str, Any]]:
         reusable = state.get("_reusable_section_texts") or {}
@@ -149,8 +158,8 @@ def _write_sections_in_chinese(
             required_ids=required_ids,
             survey_papers=survey_papers,
             comparison_dimensions=section.comparison_dimensions,
-            claim_constraints=_claim_constraints_for_section(section.title),
-            require_cross_route_synthesis=(section.id == final_theme_section_id),
+            claim_constraints=_claim_constraints_for_title(claim_plans, section.title),
+            require_cross_route_synthesis=_requires_cross_route_synthesis(plan, section.id),
         )
         last_errors: list[str] = []
         previous_candidate = ""
@@ -181,6 +190,10 @@ def _write_sections_in_chinese(
                     ),
                 )
                 attempts_made = attempt + 1
+            except (AgentBudgetExceeded, AgentCancelledError):
+                # WHY: 预算耗尽与取消属于执行边界；当作可重试的模型失败会在章节
+                # 内部静默重试三次，再把取消伪装成正文降级。
+                raise
             except Exception as exc:
                 last_errors = [f"模型调用失败：{exc}"]
                 continue
@@ -268,6 +281,8 @@ def _write_sections_in_chinese(
                     best_candidate = localized
                     best_score = localized_score
                     last_errors = localized_errors
+            except (AgentBudgetExceeded, AgentCancelledError):
+                raise
             except Exception as exc:
                 last_errors = [*last_errors, f"英文残留局部修复失败：{exc}"]
         if _is_safe_partial_section(
@@ -307,13 +322,19 @@ def _write_sections_in_chinese(
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(rewrite, section): section.id
+            # WHY: 章节改写在工作线程内调用模型；不复制上下文则预算账本、取消和
+            # 截止时间全部失效，最重的 LLM 路径会静默绕过共享账本。
+            submit_with_context(executor, rewrite, section): section.id
             for section in plan.sections
         }
         for future in as_completed(futures):
             section_id = futures[future]
             try:
                 result_id, text, diagnostic = future.result()
+            except (AgentBudgetExceeded, AgentCancelledError):
+                # WHY: 取消与预算边界必须穿透章节 fallback，否则会被记为降级
+                # 并继续合成正文。
+                raise
             except Exception as exc:
                 result_id = section_id
                 text = sections[section_id]
@@ -932,94 +953,9 @@ def _render_claim_constraints(plan_item: dict[str, Any] | None) -> str:
     return "\n".join(lines)
 
 
-def _section_rewrite_prompt(
-    *,
-    deliverable_type: CoreDeliverableType,
-    section_id: str,
-    title: str,
-    heading_level: int = 2,
-    topic: str,
-    original: str,
-    required_ids: list[str],
-    purpose: str = "",
-    target_word_count: int | None = None,
-    research_focus: str = "",
-    survey_papers: list[dict[str, Any]] | None = None,
-    comparison_dimensions: list[str] | None = None,
-    claim_constraints: str = "",
-    require_cross_route_synthesis: bool = False,
-) -> str:
-    blueprint = get_section_blueprint(deliverable_type, section_id)
-    survey_papers_json = json.dumps(survey_papers or [], ensure_ascii=False)
-    dimensions = [str(value) for value in comparison_dimensions or [] if str(value).strip()]
-    # 末条研究路线承担跨路线综合：该要求原先只写在 purpose 里，与"避免空泛
-    # 固定结尾"的要求冲突而常被模型忽略，导致结构校验报"末段缺少跨路线综合"。
-    cross_route_requirement = (
-        "\n20. **本节是最后一条研究路线，必须以一个独立末段完成跨路线综合**："
-        "概括各路线的共同进展、彼此差异与有证据支持的共性不足，"
-        "并显式使用“综合”“总体”“共同”“差异”等表述；"
-        "该段只综合本正文各路线已写明的判断，不得引入新事实，"
-        "也不得另设“研究空白”“未来方向”之类的小标题。"
-        if require_cross_route_synthesis
-        else ""
-    )
-    if dimensions:
-        comparison_instruction = (
-            "仅在真实证据能够形成比较时，围绕 WritingPlan 动态给出的维度 "
-            f"{json.dumps(dimensions, ensure_ascii=False)} 归纳差异、取舍或演进；"
-            "比较结论必须由本节引用证据直接支持，不得套用预设方法分类。"
-        )
-    else:
-        comparison_instruction = (
-            "WritingPlan 未要求固定比较维度；根据章节任务和真实证据决定是否比较，"
-            "不得为了形成趋势而发明方法类别、演进方向或适用条件。"
-        )
-    return f"""你是中文学术综述的章节编辑。请只改写下面这一个章节。
-
-研究主题：{topic}
-用户确认的分析重点：{research_focus or topic}
-章节标题：{title}
-章节任务：{purpose}
-目标字数：{target_word_count or '按证据充分程度合理展开'}
-必须原样保留且每个至少出现一次的引用编号：
-{json.dumps(required_ids, ensure_ascii=False)}
-
-【脱敏写作少样本——只示范修辞结构，不是事实证据】
-建议修辞步骤：{json.dumps(blueprint["moves"], ensure_ascii=False)}
-写法示例：{blueprint["example"]}
-
-硬性要求：
-1. 第一行必须且只能是“{_heading(title, heading_level)}”，不得增加其他标题、前言或修改说明。
-2. 把英文证据忠实转述为自然、严谨的中文；模型名、缩写、数据集名可保留英文，但不得保留完整英文句子。
-3. 只使用草稿已有事实，不补充常识、数字、结论或推测；摘要证据只按摘要可见范围表述。
-4. 按共同研究问题、方法或发现进行综合，不逐篇列举，不使用“论文明确报告”“从其他纳入证据看”等机械句式。
-5. 引用必须紧跟所支持的中文主张，并严格使用半角 ASCII 方括号 [paper_id]；禁止改成〔paper_id〕或其他括号。可把支持同一综合判断的多篇文献并列引用，但不能遗漏、新增或改写任何引用编号。
-6. 删除残缺的英文片段、摘要页眉和关键词串；若片段无法形成完整事实，只保留其引用并与同节已有、确有证据的综合判断合并。
-7. 避免空泛的固定结尾，避免与其他章节可能重复的通用句。
-8. 只模仿少样本的组织方式；不得输出其中的〈占位内容〉、〔证据A〕或任何示例事实。
-9. 每个“现有研究、多项工作、普遍、共同、形成趋势”类综合判断都必须紧跟支持它的引用，不能作为无引用的过渡句。
-10. 必须按“用户确认的分析重点”区分感知或识别输出、结构化编码产物、指定分析方法与下游解释；不得用相邻阶段的证据替代当前章节要求的证据角色。
-11. 对“该领域快速发展”“获得持续关注”“研究热点”“呈现X格局”等宏观判断，只能引用综述/调研类论文：{survey_papers_json}；不得用单篇方法论文支撑领域级断言。若名单为空，把宏观断言收窄到具体技术路线或子领域层面。
-12. 与研究主题或当前任务阶段只有场景邻接关系的陈述不得作为方法证据；低相关论文可以不写，不得为了凑引用数量强行拼接。
-13. 禁止连续句号、句号与逗号叠加等异常标点。
-14. 严格完成”章节任务”规定的段落数量和组织方式，并在证据允许时接近目标字数；若要求连续自然段，不得自行增加内部小标题。
-15. **动态比较要求**：{comparison_instruction}
-16. **证据强度决定语言强度**（按草稿中支持同一主张的独立 paper_id 数量）：
-    - 仅 1 篇 → 只能写"有研究尝试…""一项工作提出…""X 等人报告…"
-    - 2–3 篇 → 可写"部分研究采用…""若干工作探索…""已有证据显示…"
-    - 4–6 篇 → 可写"多项研究…""形成了较为明确的…""在…方面取得了可验证的进展"
-    - 7+ 篇且有综述支撑 → 才可写"已成为重要研究方向""该领域形成了…格局"
-    违反此映射表的"趋势""已成为""共同面临""普遍认为""主流"等宏观断言将被视为无引用支撑。
-17. **授权主张清单**：只能写以下清单中的主张，使用对应措辞强度，引用对应证据ID。不能创造新的趋势判断、领域空白、性能声明或方法优劣评价。过渡句和结构连接可以自由生成，但不能包含新的事实性内容。
-{claim_constraints}
-18. **引用密度与点名引用**：单处引用建议 1~2 篇，最多不得超过 3 篇。绝对严禁在段落首尾一次性倾倒大段连排引用（如 [p1..p20]）。每次引用[paper_id]时，必须在同句中写明该论文的方法/模型名称缩写或第一作者姓；禁止"有研究提出[id]""有工作尝试[id]""另有研究指出[id]"等匿名引用句式。正确写法示例："Author 等提出的 Method 模型[paper_id]通过特定机制优化了核心任务表现"。
-19. **章节文体与定位解耦**：
-    - 若当前为【研究背景】：重点阐明现实应用痛点、理论与技术驱动力、数据与场景约束以及研究范式的现实需求，不罗列具体算法细节。
-    - 若当前为【国内外研究现状】：直接聚焦于各方法学流派的核心网络机制、代表模型（包含创新点）、基准评测表现与技术边界；严禁在开头或子节中重复复述背景定义（如“本研究领域旨在...”）。{cross_route_requirement}
-
-【真实证据草稿——正文事实与引用的唯一来源】
-{original}
-"""
+def _section_rewrite_prompt(**kwargs) -> str:
+    from app.prompt.writing.section import _section_rewrite_prompt as build_prompt
+    return build_prompt(**kwargs)
 
 
 def _english_residue_repair_prompt(

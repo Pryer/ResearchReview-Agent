@@ -84,7 +84,8 @@ while True:
                 print(f"[{ts}] ⚠️  {str(e)[:120]}")
                 seen_errors.add(e)
 
-        if status in ("completed", "failed", "needs_clarification", "cancelled"):
+        # WHY: 降级与阻断也是本次任务终态，不能继续轮询或显示为完整成功。
+        if status in ("completed", "partial", "blocked", "failed", "needs_clarification", "cancelled"):
             print("\n" + "=" * 70)
             print(f"⏱️  总耗时: {elapsed//60}m{elapsed%60}s")
             if status == "completed":
@@ -110,6 +111,22 @@ while True:
                     with open(f"result_{JOB_ID[:8]}_{ts2}.md", "w", encoding="utf-8") as f2:
                         f2.write(answer)
                     print(f"  正文已保存: result_{JOB_ID[:8]}_{ts2}.md")
+            elif status in ("partial", "blocked"):
+                print(f"  研究状态: {status}（未达到完整交付）")
+                result = d.get("result") or {}
+                answer = result.get("answer")
+                if answer:
+                    print(answer)
+                else:
+                    # WHY: 预算耗尽/无进展阻断时 quality_gate 为空，必须展示
+                    # result.errors 中的真实原因，不能用"查看质量缺口"误导。
+                    reasons = []
+                    for err in (result.get("errors") or []):
+                        if isinstance(err, dict):
+                            reasons.append(str(err.get("message") or err.get("code") or err))
+                        else:
+                            reasons.append(str(err))
+                    print("；".join(reasons) if reasons else "任务未完成，未返回具体原因。")
             elif status == "failed":
                 print(f"  错误: {d.get('error')}")
             elif status == "needs_clarification":

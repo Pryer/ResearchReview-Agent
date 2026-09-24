@@ -157,6 +157,9 @@ def test_entailment_cache_reuses_only_matching_claim_evidence_fingerprint():
     assert first["entailment_cache_stats"] == {"reused": 0, "computed": 1}
     assert second["entailment_cache_stats"] == {"reused": 1, "computed": 0}
     assert third["entailment_cache_stats"] == {"reused": 0, "computed": 1}
+    assert first["entailment_llm_batch_stats"] == {"attempted": 1, "failed": 0, "claims_submitted": 1}
+    assert second["entailment_llm_batch_stats"] == {"attempted": 0, "failed": 0, "claims_submitted": 0}
+    assert third["semantic_verification"]["llm_claims_submitted"] == 1
 
 
 def test_supported_claim_links_to_evidence_span():

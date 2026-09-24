@@ -20,10 +20,21 @@ class ResearchAgentState(TypedDict, total=False):
 
     # ---------- 用户输入 ----------
     user_query: str
+    session_id: str
+    user_operation_sequence: int
+    agent_orchestration_mode: str
+    agent_operation_mode: str
+    agent_mandatory_actions: List[Dict[str, Any]]
+    user_clarifications: List[str]
+    clarification: Dict[str, Any]
+    artifact_manifest: Dict[str, Any]
+    autonomous_verified_fingerprint: str
 
     # ---------- 意图与槽位 ----------
     intent: str
     confidence: float
+    # 会话预检的一次性结果；仅在来源查询与本轮规划查询一致时复用。
+    preflight_intent_result: Dict[str, Any]
     # 意图识别的轮次角色：request / clarification_answer / working_query。
     intent_context_role: str
     topic: str
@@ -73,6 +84,7 @@ class ResearchAgentState(TypedDict, total=False):
     search_expanded: bool
     search_failed: bool
     retrieval_requirement_met: bool
+    search_result_quality: Dict[str, Any]
     language: str
     citation_style: str
     # 由主题语言倾向判断映射的中文分支配额；缺省时 rank 回落到全局配置。
@@ -110,6 +122,20 @@ class ResearchAgentState(TypedDict, total=False):
     allow_unvalidated_taxonomy: bool
     forced_generation_issues: List[Dict[str, Any]]
     state_schema_version: str
+    # 主 Agent 的五字段可重建视图及其外层版本元数据。它们不是权威状态，
+    # 任一来源指纹变化都必须由 context_builder 重建。
+    main_agent_context: Dict[str, Any]
+    main_context_snapshot: Dict[str, Any]
+    main_context_artifact_ref: str
+    context_snapshot_version: int
+    agent_task_results: List[Dict[str, Any]]
+    state_revision: int
+    agent_execution_budget: Dict[str, Any]
+    agent_execution_status: str
+    allowed_agent_actions: List[str]
+    research_memory_artifact_ref: str
+    research_memory_migrated: bool
+    research_memory_legacy_loss_unknown: bool
 
     # ---------- 检索结果 ----------
     candidate_papers: List[Dict[str, Any]]
@@ -121,7 +147,7 @@ class ResearchAgentState(TypedDict, total=False):
     retrieval_eligible_count: int
 
     # ---------- PDF ----------
-    pdf_paths: Dict[str, str]
+    pdf_paths: Dict[str, Optional[str]]
     parsed_papers: Dict[str, Dict[str, Any]]
 
     # ---------- PaperCard ----------
@@ -212,9 +238,34 @@ class ResearchAgentState(TypedDict, total=False):
     target_length: int  # 目标字数
 
     # ---------- 执行记录 ----------
-    errors: List[str]
+    errors: List[str | Dict[str, Any]]
     steps: List[Dict[str, Any]]
     # @requires 契约违例记录（节点执行前缺必需输入时由装饰器写入，随结果导出供审计）
     contract_violations: List[Dict[str, Any]]
     state_invariant_check: Dict[str, Any]
     recovery_statistics: Dict[str, Any]
+    # WHY: 动作投影校验使用这些既有节点字段的真实类型，禁止新增字段静默退化为 Any。
+    step_metrics: Dict[str, Any]
+    query_roles: Dict[str, str]
+    global_recall_queries: List[str]
+    incremental_new_paper_keys: List[str]
+    screening_report_low_pass_protection: Dict[str, Any]
+    english_screening_recovery: Dict[str, Any]
+    english_screening_recovery_attempted: bool
+    cnki_anchor_query_used: str
+    conservative_regeneration: bool
+    force_section_rewrite: bool
+    force_taxonomy_remediation: bool
+    user_accepted_best_effort_generation: bool
+    citation_gap_repair_attempted: bool
+    citation_gap_repair_history: List[Dict[str, Any]]
+    citation_gap_repair_count: int
+    citation_shortfall_count: int
+    _citation_gap_repair_snapshot: Dict[str, Any]
+    _citation_gap_repair_previous_cited: int
+    claim_repairs: Dict[str, Any]
+    coverage: Dict[str, Any]
+    result_status: str
+    draft_available: bool
+    draft_released: bool
+    draft_disposition: str

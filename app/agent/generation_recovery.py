@@ -18,7 +18,7 @@ from app.schemas.recovery_schema import (
 
 _INTERNAL_STATE_CODES = {
     "recovery_readiness_conflict", "stale_evidence_snapshot",
-    "state_time_window_mismatch",
+    "state_time_window_mismatch", "stale_global_evidence_gate",
 }
 _STRUCTURE_CODES = {
     "taxonomy_not_ready", "fallback_theme_present", "route_validation_failed",
@@ -37,9 +37,33 @@ _COUNT_CODES = {
     "minimum_references_not_met", "minimum_planned_references_not_met",
     "minimum_cited_references_not_met",
 }
+# WHY: 用户显式研究重点缺证据与引用篇数不足是两类问题。篇数不足可以靠重分配引用
+# 或重建授权在现有证据内缓解，重点缺证据不行——重写和重分配都无法凭空造出某个
+# 研究重点的直接证据，唯一真实手段是定向补检索，耗尽后只能降级并标注未覆盖重点。
+_FOCUS_CODES = {"required_focus_evidence_not_met"}
 _USER_INPUT_CODES = {
     "authentication_required", "human_action_required", "missing_user_material",
 }
+
+
+def active_focus_recovery_targets(state: dict[str, Any]) -> list[str]:
+    """返回当前已选定补检索动作需要覆盖的研究重点。"""
+    recovery = state.get("active_quality_recovery") or {}
+    if recovery.get("action") != RecoveryAction.TARGETED_SEARCH.value:
+        return []
+    targets: list[str] = []
+    has_focus_issue = False
+    for issue in recovery.get("issues") or []:
+        if not isinstance(issue, dict) or issue.get("code") not in _FOCUS_CODES:
+            continue
+        has_focus_issue = True
+        details = issue.get("details") or {}
+        for key in ("missing_requirement_ids", "missing_focuses"):
+            targets.extend(str(item).strip() for item in details.get(key) or [] if str(item).strip())
+    if has_focus_issue and not targets:
+        coverage = state.get("focus_coverage") or {}
+        targets.extend(str(item).strip() for item in coverage.get("missing_focuses") or [] if str(item).strip())
+    return list(dict.fromkeys(targets))
 
 
 def _ints(value: Any) -> int:
@@ -180,6 +204,8 @@ def _issue_category(code: str) -> str:
         return "claim_verification"
     if code in _SECTION_CODES:
         return "section_generation"
+    if code in _FOCUS_CODES:
+        return "focus_coverage"
     if code in _COUNT_CODES:
         return "reference_coverage"
     if code in _USER_INPUT_CODES:
@@ -210,6 +236,10 @@ def diagnose_generation_issues(state: dict[str, Any]) -> list[GenerationRecovery
                 RecoveryAction.REBUILD_CLAIMS,
                 RecoveryAction.TARGETED_SEARCH,
             ]
+        elif category == "focus_coverage":
+            # 只广告真实可达的手段：重写章节与重分配引用都无法为缺失的研究重点
+            # 造出直接证据，广告它们会让诊断结果承诺阶梯永远不会执行的动作。
+            actions = [RecoveryAction.TARGETED_SEARCH]
         elif category == "claim_or_citation":
             actions = [RecoveryAction.REWRITE_SECTIONS, RecoveryAction.REBUILD_CLAIMS]
         elif category == "claim_verification":
@@ -295,6 +325,13 @@ def decide_generation_recovery(
     ))
     used = _used_actions_for_same_input(state, fingerprint)
     allow_search = state.get("allow_evidence_expansion", True) is not False
+    # WHY: 任务级恢复预算与证据级恢复预算是两套独立边界。证据恢复已耗尽时
+    # TARGETED_SEARCH 必然是空动作，仍按 RECOVERABLE 下发会让主循环重复同一诊断
+    # 直到 no-progress 阻断，且永远进不了 EXHAUSTED 分支的最佳努力兜底。
+    from app.agent.evidence_recovery import route_recovery_stop_reason
+
+    search_stop_reason = route_recovery_stop_reason(state) if allow_search else ""
+    search_viable = allow_search and not search_stop_reason
     readiness = state.get("generation_readiness") or {}
     stats = (
         state.get("reference_coverage_stats")
@@ -350,17 +387,45 @@ def decide_generation_recovery(
         elif eligible >= requested > 0 and RecoveryAction.REBUILD_CLAIMS.value not in used:
             action = RecoveryAction.REBUILD_CLAIMS
             reason = "证据池足够但主张授权不足，重建覆盖计划"
-        elif allow_search and RecoveryAction.TARGETED_SEARCH.value not in used:
+        elif search_viable and RecoveryAction.TARGETED_SEARCH.value not in used:
             action = RecoveryAction.TARGETED_SEARCH
             reason = "当前证据无法覆盖引用硬约束，按原范围定向补证"
+        elif search_stop_reason:
+            # 证据补充已停止且没有其他可自动推进的动作时转为 DEGRADE：状态随之
+            # 变为 EXHAUSTED，由调用方执行一次明确标注限制的最佳努力生成，
+            # 而不是把已达标的证据整体丢弃。
+            action = RecoveryAction.DEGRADE
+            reason = f"证据补充已停止（{search_stop_reason}），基于现有证据降级生成"
         else:
             action = RecoveryAction.REQUEST_USER_INPUT
             reason = "当前允许的证据范围无法满足引用硬约束"
+    elif codes & _FOCUS_CODES:
+        # WHY: 排在篇数缺口之后，以保留本文件既有的升级顺序——先穷尽证据内手段
+        # （重分配引用、重建授权），最后才发起外部检索。两类缺口并存时，篇数分支
+        # 的廉价补救可能先解决篇数问题，下一轮再由本分支处理重点缺口。
+        # 该动作经 _continue_retrieval_and_persist → continue_research_agent；
+        # 后者在唯一自主模式中先检索缺失重点。主 Agent 的
+        # targeted_search 动作走 recovery_loop，只用路线缺口查询，不等价。
+        if search_viable and RecoveryAction.TARGETED_SEARCH.value not in used:
+            action = RecoveryAction.TARGETED_SEARCH
+            reason = "针对缺失的用户研究重点执行专项定向补检索"
+        elif search_stop_reason:
+            # 与门禁、前端既有语义对齐：can_offer_best_effort_draft 接受该码，
+            # 最佳努力草稿会把它写进 forced_generation_issues 并保留 gate 失败，
+            # 因此耗尽后应降级并标注未覆盖重点，而不是把已有证据整体丢弃。
+            action = RecoveryAction.DEGRADE
+            reason = (
+                f"证据补充已停止（{search_stop_reason}），"
+                "基于现有证据降级生成并标注未覆盖的研究重点"
+            )
+        else:
+            action = RecoveryAction.REQUEST_USER_INPUT
+            reason = "当前允许的证据范围无法覆盖用户明确的研究重点"
     elif categories & {"metadata"}:
         if RecoveryAction.REFRESH_EVIDENCE.value not in used:
             action = RecoveryAction.REFRESH_EVIDENCE
             reason = "重新核验并提取现有论文的元数据与可访问证据"
-        elif allow_search and RecoveryAction.TARGETED_SEARCH.value not in used:
+        elif search_viable and RecoveryAction.TARGETED_SEARCH.value not in used:
             action = RecoveryAction.TARGETED_SEARCH
             reason = "现有论文重新核验后仍不足，按原范围定向补证"
         else:
@@ -373,13 +438,13 @@ def decide_generation_recovery(
         elif RecoveryAction.REBUILD_CLAIMS.value not in used:
             action = RecoveryAction.REBUILD_CLAIMS
             reason = "局部重写无进展，重建主张授权后再次验证"
-        elif allow_search:
+        elif search_viable:
             action = RecoveryAction.TARGETED_SEARCH
             reason = "现有主张修复无进展，按缺口补充证据"
         else:
             action = RecoveryAction.REQUEST_USER_INPUT
             reason = "现有证据内的写作修复已无可验证进展"
-    elif allow_search and RecoveryAction.TARGETED_SEARCH.value not in used:
+    elif search_viable and RecoveryAction.TARGETED_SEARCH.value not in used:
         action = RecoveryAction.TARGETED_SEARCH
         reason = "未知质量问题先按原始范围补足可验证证据"
     else:
@@ -418,6 +483,8 @@ def start_recovery_action(
     state: dict[str, Any],
     decision: GenerationRecoveryDecision,
 ) -> dict[str, Any]:
+    from app.agent.execution_budget import reserve_recovery
+    reserve_recovery(state)
     entry = GenerationRecoveryHistoryEntry(
         action=decision.action,
         action_fingerprint=decision.action_fingerprint,
@@ -454,8 +521,15 @@ def complete_recovery_action(state: dict[str, Any]) -> None:
     entry["progress_after"] = after.model_dump(mode="json")
     # WHY: 各维质量指标都是独立硬边界。不能让首个指标改善后，以元组字典序
     # 掩盖另一个指标恶化；只有所有维度不增且至少一维下降才算取得进展。
-    non_worse = all(new <= old for old, new in zip(before_tuple, after_tuple))
-    improved = non_worse and any(new < old for old, new in zip(before_tuple, after_tuple))
+    old_codes = set(before.hard_issue_codes)
+    new_codes = set(after.hard_issue_codes)
+    # WHY: 重点缺口等硬问题没有独立数值维度；代码消失本身就是可验证进展。
+    # 新增其他硬问题不能被引用数等改善抵消。
+    non_worse = all(new <= old for old, new in zip(before_tuple, after_tuple)) and new_codes <= old_codes
+    improved = non_worse and (
+        any(new < old for old, new in zip(before_tuple, after_tuple))
+        or bool(old_codes - new_codes)
+    )
     entry["outcome"] = "improved" if improved else "no_progress"
     if entry["outcome"] == "no_progress":
         entry["stop_reason"] = "恢复后完整质量向量未改善"

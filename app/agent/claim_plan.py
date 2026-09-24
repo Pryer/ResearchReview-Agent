@@ -687,7 +687,9 @@ def enforce_claim_evidence_gate(
 
             type_config = _CLAIM_TYPES.get(claim_type, _CLAIM_TYPES["finding"])
             minimum = int(type_config.get("min_evidence", 1))
-            if len(valid_evidence_ids) < minimum:
+            if len(paper_ids) < minimum:
+                # WHY: 同一论文的多个字段/片段不构成多篇独立支撑；
+                # 与 build_claim_plans 的类型门槛保持同一计数口径。
                 gap_type = (
                     ClaimGapType.OPTIONAL_UNSUPPORTED
                     if claim_type in optional_types else ClaimGapType.MISSING_SUPPORT
@@ -698,8 +700,8 @@ def enforce_claim_evidence_gate(
                     gap_type=gap_type,
                     action="DROP",
                     reason=(
-                        f"有效证据 {len(valid_evidence_ids)} 条，低于 {claim_type} "
-                        f"主张所需的最低证据数 {minimum}。"
+                        f"有效论文 {len(paper_ids)} 篇，低于 {claim_type} "
+                        f"主张所需的最低独立论文数 {minimum}。"
                     ),
                 )
                 gaps.append(gap)
@@ -790,6 +792,7 @@ def _filter_non_entailed_claims(
     from app.schemas.verification_schema import ClaimEvidenceResult
 
     candidates: list[ClaimEvidenceResult] = []
+    failed_ids: set[str] = set()
     for plan in plans:
         for claim in plan.get("claims") or []:
             snippets = []
@@ -808,6 +811,9 @@ def _filter_non_entailed_claims(
                     if span.get("text")
                 )
             if not snippets:
+                # WHY: 有效 evidence_id 只证明绑定存在；没有可读证据片段时
+                # 无法执行蕴含核验，不能把该主张当作已通过后交给 Writer。
+                failed_ids.add(str(claim.get("claim_id") or ""))
                 continue
             result = ClaimEvidenceResult(
                 claim_id=str(claim.get("claim_id") or ""),
@@ -820,7 +826,6 @@ def _filter_non_entailed_claims(
             candidates.append(result)
 
     results = _llm_entailment_results(candidates, llm)
-    failed_ids: set[str] = set()
     for result in candidates:
         verdict = results.get(result.claim_id)
         if not verdict or str(verdict.get("label") or "").lower() != "entailed":

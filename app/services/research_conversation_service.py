@@ -14,6 +14,7 @@ from app.agent.topic_disambiguation import (
 )
 from app.database.repositories import ResearchSessionRepository
 from app.schemas.agent_schema import AgentRequest, ResearchRevisionRequest
+from app.services.research_execution_service import with_artifact_store
 
 # 质量决策问句的选项词表：问句措辞与解析判据同源。
 # WHY: 问句曾提供"基于现有证据保守重写"，但解析器里 force_generate 的宽口径
@@ -30,6 +31,8 @@ _QUALITY_DECISION_OPTIONS: dict[str, tuple[str, str, str]] = {
     ),
     "accept_available": ("accept_available", "接受当前篇数", r"接受当前篇数"),
     "expand_time_range": ("expand_time_range", "扩大时间范围", r"扩大时间范围"),
+    # WHY: 只兼容旧会话已展示的选项；检索并无“排除预印本”的开关，
+    # 新问句不再声称此选项能扩大可用文献类型。
     "include_more_types": (
         "include_more_types",
         "纳入更多文献类型",
@@ -113,6 +116,16 @@ class ResearchConversationService:
         self.should_cancel = should_cancel
         self.progress_callback = progress_callback
 
+    def _retain_history(self, history):
+        from app.services.durable_execution_service import active_runtime
+        from app.services.research_memory_service import ResearchMemoryService
+        runtime = active_runtime()
+        if runtime:
+            return ResearchMemoryService(self.db).archive_history(runtime.session_id, history)
+        # 非执行期调用由仓储保存时归档；不在落库之前截断。
+        return list(history)
+
+    @with_artifact_store
     def handle(self, request: AgentRequest) -> dict[str, Any]:
         if self.should_cancel and self.should_cancel():
             from app.agent.graph import AgentCancelledError
@@ -120,6 +133,8 @@ class ResearchConversationService:
             raise AgentCancelledError("任务在会话处理前已取消")
         if not request.session_id:
             raise ValueError("多轮研究请求必须提供 session_id")
+        if request.resume_from_checkpoint:
+            return self._resume_checkpoint(request)
         if request.clarification_answer:
             return self._resume_after_clarification(request)
         # 服务端兜底：同一 session 若正等待澄清，下一条自然语言消息
@@ -148,6 +163,27 @@ class ResearchConversationService:
                 )
         return self._start_turn(request)
 
+    def _resume_checkpoint(self, request: AgentRequest) -> dict[str, Any]:
+        session = self.repo.get(str(request.session_id))
+        if not session or session["status"] not in {"running", "failed", "cancelled", "blocked"}:
+            raise ValueError("当前会话不处于可恢复的中断状态")
+        state = dict(session.get("state") or {})
+        editable = dict(state.get("editable_research_state") or {})
+        if not editable or not state.get("runtime_checkpoint_version"):
+            raise ValueError("当前会话没有已提交的执行检查点")
+        # WHY: 恢复是一个明确的新操作，只重决策未完成工作；原约束、证据和消耗全部保留。
+        history = list(state.get("conversation_history") or [])
+        history.append({"role": "user", "content": request.user_query, "type": "checkpoint_resume"})
+        state["conversation_history"] = self._retain_history(history)
+        from app.agent.graph import _run_autonomous_pipeline
+        from app.agent.orchestration import normalize_orchestration_mode
+
+        normalize_orchestration_mode(editable)
+        editable["user_operation_sequence"] = int(editable.get("user_operation_sequence") or 0) + 1
+        result = _run_autonomous_pipeline(editable, should_cancel=self.should_cancel,
+                                          progress_callback=self.progress_callback)
+        return self._persist_or_pause_result(str(request.session_id), session["original_query"], state, result)
+
     def _start_turn(
         self,
         request: AgentRequest,
@@ -175,6 +211,10 @@ class ResearchConversationService:
         # 避免把上一主题的论文池混入新主题。
         existing_session = self.repo.get(session_id)
         existing_state = (existing_session or {}).get("state") or {}
+        from app.agent.orchestration import normalize_orchestration_mode
+        initial_state["agent_orchestration_mode"] = normalize_orchestration_mode(
+            existing_state if existing_session else initial_state
+        )
         history = list(
             initial_state.get("conversation_history")
             or existing_state.get("conversation_history")
@@ -188,13 +228,22 @@ class ResearchConversationService:
             if isinstance(item, dict)
         )
         if current_query and not already_recorded:
+            from app.services.research_memory_service import ResearchMemoryService
+
+            memory = ResearchMemoryService(self.db)
+            memory.import_legacy_history(session_id, initial_state)
             history.append({
                 "role": "user",
                 "content": current_query,
                 "type": "research_request",
             })
+            memory.append_event(
+                session_id=session_id,
+                event_type="research_request",
+                payload={"content": current_query},
+            )
         if history:
-            initial_state["conversation_history"] = history[-50:]
+            initial_state["conversation_history"] = self._retain_history(history)
         if existing_state.get("revision_history") and "revision_history" not in initial_state:
             initial_state["revision_history"] = list(existing_state["revision_history"])
 
@@ -251,10 +300,12 @@ class ResearchConversationService:
 
             raise AgentCancelledError("任务在主题消歧后已取消")
         initial_state["research_request"] = analysis["research_request"]
+        initial_state["preflight_intent_result"] = analysis.get("intent_result")
         initial_state["canonical_topic"] = analysis["research_request"].get("topic")
         initial_state["research_semantic_frame"] = (
             analysis["research_request"].get("semantic_frame") or {}
         )
+        initial_state["semantic_frame_source_query"] = request.user_query
         initial_state["topic_interpretations"] = analysis["ambiguity"].get("scopes") or []
 
         # 相关工作依赖用户自己的研究问题与方法方向，应在耗时检索前澄清。
@@ -394,6 +445,47 @@ class ResearchConversationService:
         state = dict(session.get("state") or {})
         state.update(request.state or {})
         answer = request.clarification_answer or ""
+        if clarification.get("kind") == "main_agent":
+            from app.agent.graph import _run_autonomous_pipeline
+            from app.services.research_memory_service import ResearchMemoryService
+            editable = dict(state.get("editable_research_state") or {})
+            editable.setdefault("user_clarifications", []).append(answer)
+            editable["session_id"] = session_id
+            editable["user_operation_sequence"] = int(editable.get("user_operation_sequence") or 0) + 1
+            editable.pop("result_status", None)
+            editable.pop("clarification", None)
+            from app.agent.slot_extractor import extract_slots
+            from app.agent.research_semantic_parser import parse_research_semantics
+            slots = extract_slots(answer, editable.get("intent") or "generate_review")
+            updated_request = dict(editable.get("research_request") or {})
+            keys = []
+            if slots.year_range_explicit:
+                keys += ["start_year", "end_year", "year_range_explicit", "strict_year_range"]
+            if slots.max_papers_explicit:
+                keys += ["required_reference_count", "max_papers", "max_papers_explicit", "retrieval_target", "generation_limit"]
+            for key in keys:
+                editable[key] = updated_request[key] = getattr(slots, key)
+            editable["research_request"] = updated_request
+            semantic_query = session["original_query"] + "\n用户补充约束：\n" + "\n".join(editable["user_clarifications"])
+            editable["research_semantic_frame"] = parse_research_semantics(
+                semantic_query, str(editable.get("topic") or session["original_query"]),
+                deliverables=editable.get("core_deliverables") or [], llm=self.llm,
+            ).model_dump(mode="json")
+            editable["semantic_frame_source_query"] = semantic_query
+            editable.pop("autonomous_verified_fingerprint", None)
+            # WHY: 保留研究目标和已有证据，用户的新约束进入五字段后重新决策，
+            # 不把澄清文本当成新主题，也不自动降低原有显式要求。
+            history = list(state.get("conversation_history") or [])
+            history.append({"role": "user", "content": answer, "type": "clarification_answer"})
+            state["conversation_history"] = self._retain_history(history)
+            memory = ResearchMemoryService(self.db)
+            memory.append_event(session_id=session_id, event_type="clarification_answer",
+                                payload={"content": answer, "resolved_question_ids": ["clarification"]})
+            self.repo.save(session_id=session_id, status="running", original_query=session["original_query"], state=state)
+            self.db.commit()
+            result = _run_autonomous_pipeline(editable, should_cancel=self.should_cancel,
+                                              progress_callback=self.progress_callback)
+            return self._persist_or_pause_result(session_id, session["original_query"], state, result)
         if clarification.get("kind") == "quality_decision":
             return self._resume_after_quality_decision(
                 session_id=session_id,
@@ -553,7 +645,7 @@ class ResearchConversationService:
                 "turn_count": int(clarification.get("turn_count") or 1) + 1,
             }
             history.append({"role": "assistant", "content": question, "type": "clarification"})
-            state["conversation_history"] = history[-50:]
+            state["conversation_history"] = self._retain_history(history)
             self.repo.save(
                 session_id=session_id,
                 status="needs_clarification",
@@ -573,7 +665,7 @@ class ResearchConversationService:
                 "answer": message,
             })
             history.append({"role": "assistant", "content": message, "type": "quality_decision"})
-            state["conversation_history"] = history[-50:]
+            state["conversation_history"] = self._retain_history(history)
             state["result_snapshot"] = snapshot
             self.repo.save(
                 session_id=session_id,
@@ -646,7 +738,7 @@ class ResearchConversationService:
                 "allow_unvalidated_taxonomy": True,
                 "quality_recovery_attempts": recovery_attempts,
                 "research_request": research_request,
-                "conversation_history": history[-50:],
+                "conversation_history": self._retain_history(history),
             })
             return self._regenerate_and_persist(
                 session_id, session["original_query"], state, editable
@@ -706,10 +798,46 @@ class ResearchConversationService:
                 editable["force_taxonomy_remediation"] = True
                 
             editable["research_request"] = research_request
-            editable["conversation_history"] = history[-50:]
+            editable["conversation_history"] = self._retain_history(history)
             editable["quality_recovery_attempts"] = recovery_attempts + 1
             return self._regenerate_and_persist(
                 session_id, session["original_query"], state, editable
+            )
+
+        if decision["action"] == "retry_search" and clarification.get("recovery_kind") == "focus_coverage":
+            from app.agent.generation_recovery import decide_generation_recovery
+            from app.core.config import get_settings
+            from app.schemas.recovery_schema import RecoveryAction, RecoveryStatus
+
+            # WHY: 用户撤销“禁止扩证”后必须重新运行质量恢复决策；普通 retry_search
+            # 没有活动重点决策，在自主模式下可能只做路线补检索，仍漏掉缺失重点。
+            editable["allow_evidence_expansion"] = True
+            research_request["allow_evidence_expansion"] = True
+            editable["research_request"] = research_request
+            state["research_request"] = research_request
+            state["editable_research_state"] = editable
+            recovery = decide_generation_recovery(
+                editable, max_actions=int(get_settings().recovery_total_action_budget)
+            )
+            recovery_data = recovery.model_dump(mode="json")
+            if recovery.status == RecoveryStatus.EXHAUSTED:
+                return self._persist_exhausted_quality_result(
+                    session_id=session_id,
+                    original_query=session["original_query"],
+                    state=state,
+                    result={"research_state": editable},
+                    decision=recovery_data,
+                    history=history,
+                )
+            if recovery.action != RecoveryAction.TARGETED_SEARCH:
+                raise ValueError(f"当前重点补检索不能执行：{recovery.reason}")
+            return self._execute_quality_recovery_decision(
+                session_id=session_id,
+                original_query=session["original_query"],
+                state=state,
+                result={"research_state": editable},
+                decision=recovery_data,
+                history=history,
             )
 
         # 生成后“引用篇数不足”不一定意味着证据池不足。若现有卡片已经达到
@@ -719,7 +847,7 @@ class ResearchConversationService:
             evidence_pool = len(editable.get("paper_cards") or [])
             if requested and evidence_pool >= requested and editable:
                 editable["conservative_regeneration"] = True
-                editable["conversation_history"] = history[-50:]
+                editable["conversation_history"] = self._retain_history(history)
                 editable["quality_recovery_attempts"] = recovery_attempts + 1
                 return self._regenerate_and_persist(
                     session_id, session["original_query"], state, editable
@@ -757,10 +885,6 @@ class ResearchConversationService:
                 },
             })
             query_suffix = f"用户在质量决策中将时间范围扩大为近{years}年。"
-        elif decision["action"] == "include_more_types":
-            research_request["include_preprints"] = True
-            editable["incremental_retrieval"] = True
-            query_suffix = "用户明确允许纳入高相关会议论文和预印本。"
         elif decision["action"] == "broaden_scope":
             research_request["scope_adjustment"] = answer
             relaxed_scope = dict(editable.get("selected_scope") or state.get("selected_scope") or {})
@@ -771,6 +895,8 @@ class ResearchConversationService:
             editable["incremental_retrieval"] = True
             query_suffix = f"用户在质量决策中放宽研究范围：{answer}"
         else:
+            # WHY: 旧会话的 include_more_types 答案仍可恢复；文献类型从未
+            # 被该字段筛除，因此按有界补检索执行，不写无人消费的开关。
             editable["incremental_retrieval"] = True
             editable["allow_evidence_expansion"] = True
             research_request["allow_evidence_expansion"] = True
@@ -778,9 +904,9 @@ class ResearchConversationService:
 
         state["research_request"] = research_request
         state["intent_context_role"] = "working_query"
-        state["conversation_history"] = history[-50:]
+        state["conversation_history"] = self._retain_history(history)
         editable["research_request"] = research_request
-        editable["conversation_history"] = history[-50:]
+        editable["conversation_history"] = self._retain_history(history)
         resumed_query = f"{session['original_query']}\n\n{query_suffix}"
         if decision["action"] in {
             "expand_time_range", "retry_search", "broaden_scope", "include_more_types"
@@ -1008,7 +1134,6 @@ class ResearchConversationService:
                 f"当前只核验到 {available} 篇可用论文，未达到至少 {requested} 篇的要求。"
                 f"你希望{_quality_option_label('accept_available')}、"
                 f"{_quality_option_label('expand_time_range')}、"
-                f"{_quality_option_label('include_more_types')}、"
                 f"{_quality_option_label('broaden_scope')}，"
                 f"还是{_quality_option_label('keep_searching')}？"
             )
@@ -1133,7 +1258,64 @@ class ResearchConversationService:
             "revision_history": list(state.get("revision_history") or []),
             "revision_number": int(state.get("revision_number") or 0),
         }
-        clarification = self._quality_clarification(result)
+        # WHY: 模型可见上下文是可重建视图，必须与本次可编辑研究状态使用
+        # 同一来源指纹持久化。将其存成独立 artifact 后，后续任务只传引用，
+        # 不需要在主 Agent 上下文中携带完整论文卡和历史轨迹。
+        from app.services.research_artifact_service import ResearchArtifactService
+
+        authoritative_state = result.get("research_state") or state
+        authoritative_state["session_id"] = session_id
+        from app.agent.orchestration import normalize_orchestration_mode
+
+        persisted_state["agent_orchestration_mode"] = normalize_orchestration_mode(
+            authoritative_state
+        )
+        ResearchArtifactService(self.db).persist_main_context(
+            session_id, authoritative_state
+        )
+        from app.services.research_memory_service import ResearchMemoryService
+
+        memory = ResearchMemoryService(self.db)
+        memory.import_legacy_history(session_id, persisted_state)
+        memory.append_event(
+            session_id=session_id,
+            event_type="research_result",
+            payload={
+                "findings": authoritative_state.get("main_agent_context", {}).get(
+                    "key_evidence", []
+                ),
+                "decisions": authoritative_state.get("main_agent_context", {}).get(
+                    "decisions", []
+                ),
+                "open_questions": authoritative_state.get("main_agent_context", {}).get(
+                    "open_questions", []
+                ),
+                "citations": [
+                    ref
+                    for item in authoritative_state.get("main_agent_context", {}).get(
+                        "key_evidence", []
+                    )
+                    for ref in item.get("source_refs", [])
+                ],
+            },
+            source_refs=[authoritative_state.get("main_context_artifact_ref", "")],
+        )
+        persisted_state["research_memory_artifact_ref"] = memory.rebuild_summary(session_id)
+        result["research_state"] = authoritative_state
+        persisted_state["editable_research_state"] = authoritative_state
+        persisted_state["main_context_artifact_ref"] = authoritative_state.get(
+            "main_context_artifact_ref"
+        )
+        main_clarification = result.get("clarification") or authoritative_state.get("clarification") or {}
+        if main_clarification.get("kind") == "main_agent" and main_clarification.get("needed"):
+            question = main_clarification["question"]
+            history.append({"role": "assistant", "content": question, "type": "clarification"})
+            persisted_state["conversation_history"] = self._retain_history(history)
+            self.repo.save(session_id=session_id, status="needs_clarification",
+                           original_query=original_query, state=persisted_state, clarification=main_clarification)
+            self.db.commit()
+            return self._clarification_result(session_id, persisted_state, main_clarification, question)
+        clarification = self._quality_clarification(result) if result.get("status") not in {"failed", "cancelled"} else None
         if clarification:
             automatic = self._auto_recover_actionable_result(
                 session_id=session_id,
@@ -1153,7 +1335,7 @@ class ResearchConversationService:
             clarification["recovery_attempts"] = recovery_attempts
             question = clarification["question"]
             history.append({"role": "assistant", "content": question, "type": "quality_decision"})
-            persisted_state["conversation_history"] = history[-50:]
+            persisted_state["conversation_history"] = self._retain_history(history)
             self.repo.save(
                 session_id=session_id,
                 status="needs_clarification",
@@ -1181,7 +1363,7 @@ class ResearchConversationService:
             "type": "generated_result",
             "paper_count": len(result.get("paper_cards") or []),
         })
-        persisted_state["conversation_history"] = history[-50:]
+        persisted_state["conversation_history"] = self._retain_history(history)
         persisted_state["result_snapshot"] = {
             key: value for key, value in result.items() if key != "research_state"
         }
@@ -1294,6 +1476,29 @@ class ResearchConversationService:
                     ],
                     "required_user_input": decision.user_input_reason,
                 })
+            elif any(issue.get("category") == "focus_coverage" for issue in decision_data["issues"]):
+                missing_focuses = list(dict.fromkeys(
+                    str(focus).strip()
+                    for issue in decision_data["issues"]
+                    if issue.get("category") == "focus_coverage"
+                    for focus in (issue.get("details") or {}).get("missing_focuses") or []
+                    if str(focus).strip()
+                ))
+                focus_label = "、".join(missing_focuses) or "用户明确的研究重点"
+                clarification.update({
+                    "question": (
+                        f"当前证据缺少对{focus_label}的直接支持，已验证内容和检查点均已保存。"
+                        "若允许在原主题和时间范围内补充检索，可针对这些重点继续找证据；"
+                        "也可明确接受未覆盖重点，生成标注限制的最佳可用草稿。"
+                    ),
+                    "recovery_options": [
+                        _QUALITY_DECISION_OPTIONS["retry_search"][1],
+                        _QUALITY_DECISION_OPTIONS["best_effort_draft"][1],
+                        _QUALITY_DECISION_OPTIONS["stop"][1],
+                    ],
+                    "recovery_kind": "focus_coverage",
+                    "required_user_input": decision.user_input_reason,
+                })
             else:
                 clarification.update({
                     "question": (
@@ -1335,7 +1540,7 @@ class ResearchConversationService:
         start_recovery_action(editable, decision_obj)
         attempts = int(editable.get("quality_recovery_attempts") or 0) + 1
         editable["quality_recovery_attempts"] = attempts
-        editable["conversation_history"] = history[-50:]
+        editable["conversation_history"] = self._retain_history(history)
         editable["best_effort_generation"] = False
         editable["automatic_best_effort_generation"] = False
         editable["allow_unvalidated_taxonomy"] = False
@@ -1369,7 +1574,7 @@ class ResearchConversationService:
             "action": action.value,
             "attempt": attempts,
         })
-        editable["conversation_history"] = history[-50:]
+        editable["conversation_history"] = self._retain_history(history)
         editable["target_section_ids"] = list(decision_obj.target_section_ids)
         editable["target_claim_ids"] = list(decision_obj.target_claim_ids)
         editable["conservative_regeneration"] = True
@@ -1391,17 +1596,13 @@ class ResearchConversationService:
                     editable[key] = request[key]
             editable.pop("generation_readiness", None)
             editable.pop("state_invariant_check", None)
-            gap = editable.get("evidence_gap_report") or {}
-            if gap and (
-                gap.get("evidence_snapshot_version") != editable.get("evidence_snapshot_version")
-                or (
-                    gap.get("evidence_snapshot_fingerprint")
-                    and editable.get("evidence_snapshot_fingerprint")
-                    and gap.get("evidence_snapshot_fingerprint")
-                    != editable.get("evidence_snapshot_fingerprint")
-                )
-            ):
-                editable.pop("evidence_gap_report", None)
+            # WHY: 陈旧派生报告一律丢弃，由下游节点针对当前快照重算。不在此处内联
+            # 重算全局门禁，因为它的主张强度指标必须排在 claim_plans 之后才有意义。
+            from app.agent.state_invariants import is_stale_evidence_snapshot
+
+            for key in ("evidence_gap_report", "global_evidence_gate"):
+                if is_stale_evidence_snapshot(editable.get(key) or {}, editable):
+                    editable.pop(key, None)
         elif action == RecoveryAction.REFRESH_EVIDENCE:
             editable["refresh_existing_evidence"] = True
             editable["force_taxonomy_remediation"] = True
@@ -1411,7 +1612,7 @@ class ResearchConversationService:
         state["quality_recovery_attempts"] = attempts
         state["recovery_action_count"] = editable.get("recovery_action_count")
         state["quality_recovery_history"] = editable.get("quality_recovery_history")
-        state["conversation_history"] = history[-50:]
+        state["conversation_history"] = self._retain_history(history)
         if self.progress_callback:
             current = int(editable.get("recovery_action_count") or 1)
             self.progress_callback(
@@ -1494,9 +1695,9 @@ class ResearchConversationService:
             "type": "quality_recovery_progress",
             "action": "FINAL_BEST_EFFORT_GENERATION",
         })
-        editable["conversation_history"] = history[-50:]
+        editable["conversation_history"] = self._retain_history(history)
         state["editable_research_state"] = editable
-        state["conversation_history"] = history[-50:]
+        state["conversation_history"] = self._retain_history(history)
         if self.progress_callback:
             self.progress_callback(
                 "quality_recovery:final_best_effort_generation", 1, 1
@@ -1546,7 +1747,7 @@ class ResearchConversationService:
             "content": answer,
             "type": "quality_recovery_exhausted",
         })
-        state["conversation_history"] = history[-50:]
+        state["conversation_history"] = self._retain_history(history)
         state["result_snapshot"] = {
             key: value for key, value in result.items()
             if key not in {"research_state", "session_id"}
@@ -1567,6 +1768,9 @@ class ResearchConversationService:
         state: dict[str, Any],
         original_query: str | None = None,
     ) -> dict[str, Any]:
+        from app.agent.orchestration import normalize_orchestration_mode
+        state["session_id"] = session_id
+        normalize_orchestration_mode(state)
         self.repo.save(
             session_id=session_id,
             status="running",
@@ -1603,6 +1807,7 @@ class ResearchConversationService:
             result,
         )
 
+    @with_artifact_store
     def revise(self, request: ResearchRevisionRequest) -> dict[str, Any]:
         """排除指定论文并仅重跑聚类、生成和验证阶段。"""
         session = self.repo.get(request.session_id)
@@ -1689,7 +1894,7 @@ class ResearchConversationService:
             session_id=request.session_id,
             status="running",
             original_query=session["original_query"],
-            state={**state, "conversation_history": history[-50:]},
+            state={**state, "conversation_history": self._retain_history(history)},
         )
         self.db.commit()
 
@@ -1766,7 +1971,7 @@ class ResearchConversationService:
             "excluded_paper_ids": sorted(
                 set(state.get("excluded_paper_ids") or []) | excluded
             ),
-            "conversation_history": history[-50:],
+            "conversation_history": self._retain_history(history),
             "revision_history": revisions,
             "revision_number": revision_number,
         }

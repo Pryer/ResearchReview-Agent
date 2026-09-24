@@ -6,14 +6,9 @@ PAPER_CARD_EXTRACTION_PROCTION_PROMPT = """\
 必须严格返回 JSON，不要编造任何论文中没有的信息。
 论文可能属于任意学科，也可能采用理论论证、定性研究、定量研究、实验研究、系统设计或混合方法。请按原文实际研究范式理解字段，不得强行套用算法论文结构。
 
-{evidence_label}
-
-论文标题：{title}
-{full_text_or_json}
-
 返回 JSON 结构：
 {{
-  "paper_id": "{paper_id}",
+  "paper_id": "输入给定的论文编号",
   "title": "...",
   "authors": ["作者"],
   "year": 整数或 null,
@@ -35,7 +30,7 @@ PAPER_CARD_EXTRACTION_PROCTION_PROMPT = """\
   "contributions": ["贡献1"],
   "limitations": ["局限1"],
   "relevance_reason": "与主题的相关性说明",
-  "evidence_source": "{evidence_source}"
+  "evidence_source": "输入给定的证据来源"
 }}
 
 重要：
@@ -44,7 +39,17 @@ PAPER_CARD_EXTRACTION_PROCTION_PROMPT = """\
 - 如果当前仅提供摘要，只能提取摘要明确陈述的研究问题、概括性方法、数据/样本/指标和作者明确报告的结果；limitations 必须返回空数组，不得补充详细模型结构、数据划分、实验设置、消融结论或公平基线比较。
 - 即使标签写有“全文”，也只能使用输入中实际出现的章节；看不到的章节和细节必须留空。
 - results 中的数字、比较和强结论必须逐字存在于输入内容中；不得将“更高”改写为“显著优于”。
-- evidence_source 必须设为 "{evidence_source}"。
+- paper_id 和 evidence_source 必须原样使用下文给定值。
+
+【本次输入】
+论文编号：{paper_id}
+证据来源：{evidence_source}
+{evidence_label}
+
+论文标题：{title}
+{full_text_or_json}
+
+
 """
 
 __all__ = ("PAPER_CARD_EXTRACTION_PROCTION_PROMPT",)

@@ -213,6 +213,41 @@ def search_rank_with_refinement(
     if state.get("incremental_retrieval"):
         max_rounds = min(max_rounds, 1)
 
+    from app.agent.generation_recovery import active_focus_recovery_targets
+
+    focus_targets = active_focus_recovery_targets(state)
+    if focus_targets:
+        from app.agent.focus_coverage import supplemental_focus_queries
+        from app.core.source_capabilities import sanitize_search_keyword
+
+        semantic_frame = state.get("research_semantic_frame") or {}
+        focus_queries = list(dict.fromkeys(
+            cleaned for query in supplemental_focus_queries(
+                focus_targets,
+                str(state.get("canonical_topic") or state.get("topic") or ""),
+                semantic_frame,
+            )
+            if (cleaned := sanitize_search_keyword(query))
+        ))
+        if focus_queries:
+            # WHY: 写作门禁依据证据卡中的直接证据；候选元数据即使命中重点词，
+            # 也不能证明缺口已闭合。先将门禁记录的缺失重点加入本轮首批检索，
+            # targeted_recovery 分支会为它预留关键词名额，避免普通批次挤出。
+            state["keywords"] = [
+                *focus_queries,
+                *(item for item in state.get("keywords") or [] if item not in focus_queries),
+            ]
+            focus_branch = {
+                "branch_type": "quality_focus_recovery",
+                "queries": focus_queries,
+                "constraint_level": "targeted_recovery",
+                "rationale": "补齐写作门禁记录的用户研究重点直接证据",
+            }
+            state["search_branches"] = [focus_branch, *(
+                branch for branch in state.get("search_branches") or []
+                if branch != focus_branch
+            )]
+
     search_node(state, should_cancel=should_cancel)
     _checkpoint(state, "rank_papers", 2, total_steps, should_cancel, progress_callback)
     if state.get("search_failed") and not state.get("candidate_papers"):

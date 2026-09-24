@@ -79,6 +79,10 @@ class LLMInvocationError(AgentBaseError):
     """LLM 调用失败。"""
 
 
+class NativeToolsUnsupportedError(LLMInvocationError):
+    """Provider 明确拒绝原生工具协议，允许切换受校验的 JSON 动作通道。"""
+
+
 # ---------- 数据库相关 ----------
 class DatabaseError(AgentBaseError):
     """数据库操作失败。"""

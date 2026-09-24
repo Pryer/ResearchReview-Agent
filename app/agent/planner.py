@@ -100,6 +100,7 @@ def build_search_plan(
         plan_topic or user_query,
         llm,
         user_query=user_query,
+        semantic_frame=semantic_frame,
     )
     keywords = strategy["keywords"]
     keyword_batches = strategy.get("keyword_batches") or []
@@ -555,6 +556,7 @@ def generate_search_strategy(
     topic: str,
     llm=None,
     user_query: str | None = None,
+    semantic_frame=None,
 ) -> Dict[str, Any]:
     """生成检索关键词和主题锚点（仅用于词法打分，不参与硬过滤）。"""
     topic = (topic or "").strip()
@@ -563,7 +565,7 @@ def generate_search_strategy(
     topic_anchors: list[list[str]] = []
     dropped_anchor_groups: list[dict[str, str]] = []
     planning_error: str | None = None
-    fallback = _fallback_search_strategy(topic) if topic else {
+    fallback = _fallback_search_strategy(topic, semantic_frame=semantic_frame) if topic else {
         "keywords": [],
         "topic_anchors": [],
     }
@@ -764,7 +766,7 @@ def llm_refine_search_strategy(
     )
 
 
-def _fallback_search_strategy(topic: str) -> dict[str, Any]:
+def _fallback_search_strategy(topic: str, *, semantic_frame=None) -> dict[str, Any]:
     """LLM 不可用时只保留原主题，不猜测翻译、同义词或检索后缀。"""
     from app.agent.research_semantic_parser import parse_research_semantics
     from app.agent.search_plan_builder import (
@@ -772,7 +774,13 @@ def _fallback_search_strategy(topic: str) -> dict[str, Any]:
         prioritized_branch_queries,
     )
 
-    frame = parse_research_semantics(topic, topic, llm=None)
+    from app.schemas.research_plan_schema import ResearchSemanticFrame
+
+    frame = (
+        ResearchSemanticFrame.model_validate(semantic_frame)
+        if semantic_frame is not None
+        else parse_research_semantics(topic, topic, llm=None)
+    )
     branches = build_semantic_search_branches(frame)
     return {
         "keywords": prioritized_branch_queries(branches),

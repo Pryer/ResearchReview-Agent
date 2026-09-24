@@ -11,6 +11,7 @@ from app.agent.decorators import get_node_metadata
 from app.agent.global_evidence_gate import evaluate_global_sufficiency
 from app.agent.graph import _build_output, derive_result_status, run_research_agent
 from app.agent.nodes import global_evidence_gate_node
+from app.agent.state_invariants import validate_research_state_invariants
 from app.core.config import Settings
 
 
@@ -382,6 +383,27 @@ def test_node_wrapper_success_and_step_record():
     assert step["status"] == "success"
 
 
+def test_node_stamps_evidence_snapshot_version():
+    # 门禁必须携带它取数时的证据快照版本，否则恢复轮改写 validated_routes 后
+    # 无人能判断它是否仍在描述当前证据，而 derive_result_status 会按它判终态。
+    state = _make_state(n_details=40, required=40, user_query="综述论文")
+    state["evidence_snapshot_version"] = 7
+    state["evidence_snapshot_fingerprint"] = "fp-7"
+
+    global_evidence_gate_node(state)
+
+    gate = state["global_evidence_gate"]
+    assert gate["evidence_snapshot_version"] == 7
+    assert gate["evidence_snapshot_fingerprint"] == "fp-7"
+    assert validate_research_state_invariants(state)["valid"] is True
+
+    state["evidence_snapshot_version"] = 8
+    state["evidence_snapshot_fingerprint"] = "fp-8"
+    result = validate_research_state_invariants(state)
+    codes = {item["code"] for item in result["blocking_issues"]}
+    assert "stale_global_evidence_gate" in codes
+
+
 def test_node_wrapper_degraded_when_deficit():
     state = _make_state(
         n_details=25,
@@ -522,6 +544,32 @@ def test_global_gate_control_limits_are_configurable_and_clamped():
 
 # ---------- 图集成 smoke ----------
 
+# WHY: 生产只有一条调度路径。门禁次序必须经该入口的真实动作序列证明，
+# 不能再用已删除的固定顺序节点名驱动，否则测试通过而生产路径未被覆盖。
+_GATE_ACTION_SEQUENCE = (
+    "search_and_rank",
+    "fetch_metadata",
+    "extract_paper_cards",
+    "validate_routes",
+    "plan_claims",
+    "generate_deliverables",
+    "validate_result",
+)
+
+
+class _SequencedDecisionLLM:
+    """按注册动作驱动五字段主循环；终态仍由代码的质量门禁裁决。"""
+
+    native_tools_enabled = True
+
+    def __init__(self, actions=_GATE_ACTION_SEQUENCE) -> None:
+        self._actions = list(actions)
+
+    def complete_tool_call(self, messages, **kwargs):
+        name = self._actions.pop(0) if self._actions else "request_finish"
+        return {"name": name, "arguments": {}}
+
+
 def _install_graph_fakes(monkeypatch, *, n_papers: int) -> None:
     """把 run_research_agent 的节点全部替换为填充 state 的假节点，
     只保留真实的 global_evidence_gate_node 和 final_answer_node。"""
@@ -563,9 +611,6 @@ def _install_graph_fakes(monkeypatch, *, n_papers: int) -> None:
         current["ranked_papers"] = list(current["candidate_papers"])
         current["searched_keywords"] = ["object detection"]
         current["focus_coverage"] = {"missing_focuses": []}
-        return current
-
-    def fake_expand_year(current, should_cancel=None):
         return current
 
     def fake_fetch(current, should_cancel=None):
@@ -619,11 +664,13 @@ def _install_graph_fakes(monkeypatch, *, n_papers: int) -> None:
         current["unique_cited_paper_count"] = 1
         return current
 
-    monkeypatch.setattr("app.agent.graph._get_llm", lambda: None)
+    # WHY: 主循环、写作与验证各自调用 _get_llm()；必须共享同一实例，
+    # 否则每次调用都会重置动作序列，门禁次序不再由真实决策序列驱动。
+    decision_llm = _SequencedDecisionLLM()
+    monkeypatch.setattr("app.agent.graph._get_llm", lambda: decision_llm)
     monkeypatch.setattr("app.agent.graph.plan_node", fake_plan)
     monkeypatch.setattr("app.agent.nodes.provisional_route_node", fake_provisional_routes)
     monkeypatch.setattr("app.agent.graph._search_rank_with_refinement", fake_search_rank)
-    monkeypatch.setattr("app.agent.graph.expand_search_year_node", fake_expand_year)
     monkeypatch.setattr("app.agent.graph.fetch_detail_node", fake_fetch)
     monkeypatch.setattr("app.agent.graph.download_pdf_node", fake_download)
     monkeypatch.setattr("app.agent.graph.should_parse_pdf", lambda current: False)

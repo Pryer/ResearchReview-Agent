@@ -337,9 +337,10 @@ def _route_evidence_volume_proxy(state: dict[str, Any]) -> float:
     裸 float 两种形态，均需兼容。
 
     注意该分数的分母是 ``route_min_core_evidence``（默认 3）这一固定低阈值，
-    分子是路线实际论文数，因此任何正常规模的路线都会被 ``min(1.0, ...)``
-    削平到 1.0。它只能说明"路线凑够了最低证据数"，不反映主张是否得到交叉
-    验证，仅在主张统计缺失时作为兜底。
+    分子是 ``核心证据数 + 0.5 × 支撑证据数``，因此任何正常规模的路线都会被
+    ``min(1.0, ...)`` 削平到 1.0，且它与 ``sufficient`` 判定可以互相矛盾
+    （支撑证据多时 score=1.0 而 sufficient=False）。它只能说明"路线凑够了最低
+    证据数"，不反映主张是否得到交叉验证，仅在主张统计缺失时作为兜底。
     """
     scores: list[float] = []
     for route in state.get("validated_routes") or []:

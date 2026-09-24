@@ -23,12 +23,20 @@ _COMPETING_WORK_MARKERS = ("competing", "competitor", "baseline", "竞争", "对
 
 
 def _route_ids(state: dict[str, Any]) -> list[str]:
-    """收集所有需要目标的路线，包含 SPLIT 产出的子路线。"""
+    """收集所有需要目标的路线，包含 SPLIT 产出的子路线。
+
+    WHY: ``validated_routes`` 是验证后的权威路线集合。SPLIT/MERGE 之后父路线已
+    不再持有证据，继续把它计入会同时造成两个后果：分母变大使 per-route 目标被
+    稀释，以及给已不存在的路线派生永远补不满的目标（随后被诊断成幻影缺口）。
+    只有验证尚未运行、``validated_routes`` 为空时，才回落到候选路线和决策记录。
+    """
     ids: list[str] = []
     for route in state.get("validated_routes") or []:
         route_id = str(route.get("route_id") or "")
         if route_id:
             ids.append(route_id)
+    if ids:
+        return list(dict.fromkeys(ids))
     framework = state.get("provisional_framework") or {}
     for route in framework.get("provisional_routes") or []:
         route_id = str(route.get("route_id") or "")

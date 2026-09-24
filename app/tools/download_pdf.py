@@ -9,6 +9,7 @@ import hashlib
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from app.agent.execution_budget import submit_with_context
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -284,7 +285,7 @@ def batch_download_pdfs(
     workers = min(max(1, int(config.pdf_download_max_workers)), len(pending) or 1)
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pdf-download") as executor:
         futures = {
-            executor.submit(download_open_access_pdf, paper, save_dir): str(paper.get("paper_id") or "")
+            submit_with_context(executor, download_open_access_pdf, paper, save_dir): str(paper.get("paper_id") or "")
             for paper in pending
         }
         for future in as_completed(futures):

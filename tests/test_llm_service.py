@@ -23,6 +23,19 @@ def _resp(content: str, finish_reason: str = "stop"):
     )
 
 
+def _tool_resp(name: str, arguments: dict):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(
+            content=None,
+            tool_calls=[SimpleNamespace(
+                id="call-1",
+                function=SimpleNamespace(name=name, arguments=json.dumps(arguments)),
+            )],
+        ))],
+        usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3),
+    )
+
+
 def _fake_client(create_fn):
     """构造一个假 OpenAI 客户端，chat.completions.create 调用 create_fn。"""
     return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create_fn)))
@@ -74,7 +87,7 @@ def test_control_plane_can_disable_empty_content_retry(monkeypatch):
     monkeypatch.setattr(
         service,
         "_call_with_possible_fallback",
-        lambda kwargs, response_format, client=None: response,
+        lambda kwargs, response_format, client=None, record=None: response,
     )
     monkeypatch.setattr(
         service,
@@ -83,6 +96,97 @@ def test_control_plane_can_disable_empty_content_retry(monkeypatch):
     )
 
     assert service.complete("test", retry_empty=False) == ""
+
+
+def test_role_bound_llm_uses_stable_system_prefix_and_structured_messages():
+    service = LLMService()
+    service.api_key = "test"
+    service.backup_enabled = False
+    captured = []
+    service._client = _fake_client(
+        lambda **kwargs: (captured.append(kwargs) or _resp("ok"))
+    )
+    bound = service.for_agent("search")
+
+    assert bound.complete("query one", retry_empty=False) == "ok"
+    assert bound.complete("query two", retry_empty=False) == "ok"
+
+    assert captured[0]["messages"][0]["role"] == "system"
+    assert captured[0]["messages"][0] == captured[1]["messages"][0]
+    assert captured[0]["messages"][1] == {"role": "user", "content": "query one"}
+    assert captured[1]["messages"][1] == {"role": "user", "content": "query two"}
+
+
+def test_role_bound_native_tool_call_injects_prefix_and_returns_one_call():
+    service = LLMService()
+    service.api_key = "test"
+    service.backup_enabled = False
+    captured = {}
+    service._client = _fake_client(
+        lambda **kwargs: (captured.update(kwargs) or _tool_resp("search_and_rank", {}))
+    )
+
+    result = service.for_agent("main").complete_tool_call(
+        [{"role": "user", "content": '{"goal":{}}'}],
+        tools=[{"type": "function", "function": {
+            "name": "search_and_rank", "description": "search",
+            "parameters": {"type": "object", "properties": {}},
+        }}],
+    )
+
+    assert result["name"] == "search_and_rank"
+    assert result["arguments"] == {}
+    assert result["usage"] == {
+        "prompt_tokens": 5,
+        "completion_tokens": 3,
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 0,
+    }
+    assert captured["tool_choice"] == "required"
+    assert captured["messages"][0]["role"] == "system"
+
+
+def test_native_tool_decision_records_usage_and_cache_tokens():
+    """主 Agent 原生工具决策轮次必须进入指标，并带缓存命中明细。"""
+    from app.core.metrics import get_metrics_collector
+
+    service = LLMService()
+    service.api_key = "test"
+    service.backup_enabled = False
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(
+            content=None,
+            tool_calls=[SimpleNamespace(
+                id="call-1",
+                function=SimpleNamespace(name="search_and_rank", arguments="{}"),
+            )],
+        ))],
+        usage=SimpleNamespace(
+            prompt_tokens=1000,
+            completion_tokens=20,
+            prompt_cache_hit_tokens=700,
+            prompt_cache_miss_tokens=300,
+        ),
+    )
+    service._client = _fake_client(lambda **kwargs: response)
+    collector = get_metrics_collector()
+    collector.reset()
+
+    result = service.complete_tool_call(
+        [{"role": "user", "content": '{"goal":{}}'}],
+        tools=[{"type": "function", "function": {
+            "name": "search_and_rank", "description": "search",
+            "parameters": {"type": "object", "properties": {}},
+        }}],
+        operation="main_decision",
+    )
+
+    assert result["usage"]["prompt_cache_hit_tokens"] == 700
+    report = collector.get_token_report()
+    assert report["total_calls"] == 1
+    assert report["total_cache_hit_tokens"] == 700
+    assert report["total_cache_miss_tokens"] == 300
+    assert report["by_operation"]["main_decision"]["prompt_tokens"] == 1000
 
 
 # ---------- 主用 → 备用 切换测试 ----------

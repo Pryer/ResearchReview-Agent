@@ -868,8 +868,9 @@ def verify_review_claims(
             sentence_units.append((sentence_index, sentence, unit_results))
 
     cache_stats = {"reused": 0, "computed": 0}
+    llm_batch_stats = {"attempted": 0, "failed": 0, "claims_submitted": 0}
     if llm is not None:
-        atomic_claims, cache_stats = _apply_llm_entailment(
+        atomic_claims, cache_stats, llm_batch_stats = _apply_llm_entailment(
             atomic_claims,
             llm,
             entailment_cache=entailment_cache,
@@ -920,6 +921,7 @@ def verify_review_claims(
     )
     output = report.model_dump()
     output["entailment_cache_stats"] = cache_stats
+    output["entailment_llm_batch_stats"] = llm_batch_stats
     output["verification_scope"] = {
         "mode": "local" if local_mode else "full",
         "target_sentence_indices": sorted(target_indices),
@@ -935,6 +937,9 @@ def verify_review_claims(
         "cache_reused": cache_stats["reused"],
         "completed": cache_stats["reused"] + cache_stats["computed"],
         "not_completed": unverified,
+        "llm_batches_attempted": llm_batch_stats["attempted"],
+        "llm_batches_failed": llm_batch_stats["failed"],
+        "llm_claims_submitted": llm_batch_stats["claims_submitted"],
     }
     return output
 
@@ -972,7 +977,7 @@ def _apply_llm_entailment(
     llm,
     *,
     entailment_cache: Dict[str, Dict[str, Any]] | None = None,
-) -> tuple[List[ClaimEvidenceResult], Dict[str, int]]:
+) -> tuple[List[ClaimEvidenceResult], Dict[str, int], Dict[str, int]]:
     """复用同指纹的成功判定，并把其余主张合并为有界批次。"""
     cache = entailment_cache if entailment_cache is not None else {}
     results: Dict[str, Dict[str, Any]] = {}
@@ -993,7 +998,8 @@ def _apply_llm_entailment(
         else:
             pending.append(claim)
 
-    computed_results = _llm_entailment_results(pending, llm) if pending else {}
+    batch_stats = {"attempted": 0, "failed": 0, "claims_submitted": 0}
+    computed_results = _llm_entailment_results(pending, llm, batch_stats=batch_stats) if pending else {}
     results.update(computed_results)
     for claim_id, result in computed_results.items():
         fingerprint = fingerprints.get(claim_id)
@@ -1062,12 +1068,14 @@ def _apply_llm_entailment(
                 else str(result.get("reason") or "删除、弱化或补充能够直接支持该主张的证据。")
             ),
         }))
-    return revised, {"reused": reused, "computed": len(computed_results)}
+    return revised, {"reused": reused, "computed": len(computed_results)}, batch_stats
 
 
 def _llm_entailment_results(
     claims: List[ClaimEvidenceResult],
     llm,
+    *,
+    batch_stats: Dict[str, int] | None = None,
 ) -> Dict[str, Dict[str, Any]]:
     """批量判断证据是否蕴含主张；失败或漏项由调用方按未验证处理。"""
     factual = [
@@ -1077,6 +1085,9 @@ def _llm_entailment_results(
     results: Dict[str, Dict[str, Any]] = {}
     for start in range(0, len(factual), 12):
         batch = factual[start:start + 12]
+        if batch_stats is not None:
+            batch_stats["attempted"] += 1
+            batch_stats["claims_submitted"] += len(batch)
         payload = [
             {
                 "claim_id": claim.claim_id,
@@ -1114,6 +1125,8 @@ def _llm_entailment_results(
                 if claim_id in {claim.claim_id for claim in batch}:
                     results[claim_id] = item
         except Exception:
+            if batch_stats is not None:
+                batch_stats["failed"] += 1
             continue
     return results
 

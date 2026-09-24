@@ -83,18 +83,19 @@ def build_writing_plan(
         for synthesis in syntheses
         if any(str(paper_id) in usable_set for paper_id in synthesis.get("paper_ids") or [])
     ]
-    if dtype == CoreDeliverableType.RESEARCH_BACKGROUND and llm is not None:
-        state["_dynamic_background_outline"] = _induce_background_outline(
-            state, usable_ids, llm,
-        )
-
     builders = {
-        CoreDeliverableType.RESEARCH_BACKGROUND: _build_background_plan,
         CoreDeliverableType.RESEARCH_STATUS: _build_research_status_plan,
         CoreDeliverableType.RELATED_WORK: _build_related_work_plan,
         CoreDeliverableType.NARRATIVE_REVIEW: _build_narrative_review_plan,
     }
-    sections, hidden_nodes = builders[dtype](state, spec, syntheses, usable_ids)
+    if dtype == CoreDeliverableType.RESEARCH_BACKGROUND:
+        # WHY: 提纲只服务本次计划编译；论证目标已进入 WritingPlan，不跨动作保存或复用旧提纲。
+        outline = _induce_background_outline(state, usable_ids, llm) if llm is not None else {}
+        sections, hidden_nodes = _build_background_plan(
+            state, spec, syntheses, usable_ids, outline=outline,
+        )
+    else:
+        sections, hidden_nodes = builders[dtype](state, spec, syntheses, usable_ids)
     requested_references = int(state.get("required_reference_count") or 0)
     if dtype in {
         CoreDeliverableType.RESEARCH_BACKGROUND,
@@ -158,6 +159,8 @@ def _build_background_plan(
     spec,
     syntheses: list[dict[str, Any]],
     usable_ids: list[str],
+    *,
+    outline: dict[str, Any],
 ) -> tuple[list[WritingSection], list[PlanningNode]]:
     del syntheses
     topic = str(state.get("canonical_topic") or state.get("topic") or "当前研究主题")
@@ -176,7 +179,6 @@ def _build_background_plan(
         ("importance", "研究对象与价值", f"说明{topic}的研究对象为何重要及其理论或实践价值"),
         ("challenges", "待解决问题", f"归纳现有证据能够支持的主要挑战，不套用通用研究空白"),
     ]
-    outline = state.get("_dynamic_background_outline") or {}
     dynamic_goals = [
         (
             str(item.get("id") or f"dynamic_{index}"),

@@ -75,6 +75,30 @@ def test_split_sub_routes_receive_targets():
     assert "R1_S1" in targets and "R1_S2" in targets
 
 
+def test_split_parent_route_is_excluded_from_targets():
+    """已拆分父路线不再持有证据，不得占用目标名额或稀释 per-route 目标。"""
+    state = _state(
+        required_reference_count=10,
+        validated_routes=[
+            {"route_id": "R1_S1", "name": "子路线一", "core_paper_ids": []},
+            {"route_id": "R1_S2", "name": "子路线二", "core_paper_ids": []},
+        ],
+        route_decisions=[
+            {"route_id": "R1", "action": "SPLIT_INTO"},
+            {"route_id": "R1_S1"},
+            {"route_id": "R1_S2"},
+        ],
+        provisional_framework={"provisional_routes": [{"route_id": "R1"}]},
+    )
+    targets = derive_route_core_targets(state)
+
+    assert "R1" not in targets
+    assert set(targets) == {"R1_S1", "R1_S2"}
+    # 分母只含 2 条真实路线：ceil(10 × 0.85 / 2) = 5。若父路线仍被计入，
+    # 分母变成 3 会把目标稀释到 ceil(8.5 / 3) = 3。
+    assert all(value == 5 for value in targets.values())
+
+
 def test_narrative_review_reports_year_span_deficit_separately():
     """补足篇数不代表能写研究脉络，多样性缺口独立记录。"""
     state = _state(

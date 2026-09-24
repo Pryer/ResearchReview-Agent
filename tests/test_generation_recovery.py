@@ -5,7 +5,9 @@ from __future__ import annotations
 from app.agent.deliverable_router import check_generation_readiness
 from app.agent.graph import _build_output, _verify_generated_draft
 from app.agent.generation_recovery import (
+    active_focus_recovery_targets,
     candidate_is_not_worse,
+    complete_recovery_action,
     decide_generation_recovery,
     input_fingerprint,
     quality_progress_vector,
@@ -182,6 +184,118 @@ def test_recovery_controller_respects_existing_evidence_only_permission():
 
     assert decision.action == RecoveryAction.REQUEST_USER_INPUT
     assert decision.requires_user_input is True
+
+
+def test_recovery_controller_degrades_when_evidence_budget_exhausted():
+    state = _count_failure(eligible=3, authorized=3)
+    # 证据级恢复预算已耗尽，此时 TARGETED_SEARCH 必然是空动作。
+    state["recovery_round"] = 2
+    state["evidence_recovery_status"] = "EXHAUSTED"
+
+    decision = decide_generation_recovery(state, max_actions=6)
+
+    # 必须落到 EXHAUSTED，调用方才能执行明确标注限制的最佳努力生成；
+    # 若仍报 RECOVERABLE，主循环会重复同一诊断直到 no-progress 阻断。
+    assert decision.action == RecoveryAction.DEGRADE
+    assert decision.status == RecoveryStatus.EXHAUSTED
+    assert decision.requires_user_input is False
+
+
+def test_recovery_controller_still_searches_while_evidence_budget_remains():
+    state = _count_failure(eligible=3, authorized=3)
+    state["recovery_round"] = 0
+
+    decision = decide_generation_recovery(state, max_actions=6)
+
+    assert decision.action == RecoveryAction.TARGETED_SEARCH
+    assert decision.status == RecoveryStatus.RECOVERABLE
+
+
+def _focus_failure(*, allow_search: bool = True) -> dict:
+    return {
+        "required_reference_count": 4,
+        "allow_evidence_expansion": allow_search,
+        "reference_coverage_stats": {
+            "evidence_backed": 4, "claim_authorized": 4, "final_valid": 4,
+        },
+        "quality_gate": {
+            "passed": False,
+            "phase": "pre_generation",
+            "blocking_issues": [{
+                "code": "required_focus_evidence_not_met",
+                "message": "用户明确研究重点缺少足够直接证据：S-T分析法",
+                "missing_focuses": ["S-T分析法"],
+            }],
+        },
+    }
+
+
+def test_focus_gap_advertises_only_the_reachable_action():
+    decision = decide_generation_recovery(_focus_failure(), max_actions=6)
+
+    assert decision.issues[0].category == "focus_coverage"
+    assert decision.action == RecoveryAction.TARGETED_SEARCH
+    # 重写章节无法为缺失的研究重点造出直接证据，此前却被广告为可用动作。
+    assert decision.issues[0].available_actions == [RecoveryAction.TARGETED_SEARCH]
+
+
+def test_focus_gap_degrades_when_evidence_budget_exhausted():
+    state = _focus_failure()
+    state["recovery_round"] = 2
+    state["evidence_recovery_status"] = "EXHAUSTED"
+
+    decision = decide_generation_recovery(state, max_actions=6)
+
+    # 门禁与前端已把该码视为可降级（can_offer_best_effort_draft 返回 True、
+    # 最佳努力草稿保留 gate 失败并释放 partial），阶梯不得停在询问用户。
+    assert decision.action == RecoveryAction.DEGRADE
+    assert decision.status == RecoveryStatus.EXHAUSTED
+
+
+def test_focus_gap_asks_user_when_expansion_forbidden():
+    decision = decide_generation_recovery(
+        _focus_failure(allow_search=False), max_actions=6
+    )
+
+    assert decision.action == RecoveryAction.REQUEST_USER_INPUT
+    assert decision.requires_user_input is True
+
+
+def test_focus_recovery_target_and_progress_use_the_blocking_issue():
+    state = _focus_failure()
+    decision = decide_generation_recovery(state, max_actions=6)
+    state["active_quality_recovery"] = decision.model_dump(mode="json")
+    state["quality_recovery_history"] = [{
+        "progress_before": decision.progress.model_dump(mode="json"),
+        "outcome": "started",
+    }]
+
+    assert active_focus_recovery_targets(state) == ["S-T分析法"]
+    state["quality_gate"]["blocking_issues"] = []
+    complete_recovery_action(state)
+
+    assert state["quality_recovery_history"][-1]["outcome"] == "improved"
+    assert "active_quality_recovery" not in state
+
+
+def test_count_gap_keeps_cheaper_in_evidence_remedy_before_focus_search():
+    state = _focus_failure()
+    state["reference_coverage_stats"] = {
+        "evidence_backed": 6, "claim_authorized": 4, "planned": 2, "final_valid": 2,
+    }
+    state["quality_gate"]["blocking_issues"].append({
+        "code": "minimum_planned_references_not_met",
+        "message": "证据池有 6 篇可用论文，4 篇已获主张授权，但只有 2 篇进入分配计划",
+        "requested": 4,
+        "available": 2,
+        "eligible": 6,
+    })
+
+    decision = decide_generation_recovery(state, max_actions=6)
+
+    # 升级顺序必须保持"先证据内补救、后外部检索"：重分配引用比定向补检索便宜，
+    # 篇数缺口解决后下一轮再由 focus 分支处理重点缺口。
+    assert decision.action == RecoveryAction.REALLOCATE_CITATIONS
 
 
 def test_recovery_controller_targets_failed_section():

@@ -702,6 +702,7 @@ def batch_extract_paper_cards(
         return []
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from app.agent.execution_budget import submit_with_context
     from app.core.config import get_settings
 
     settings = get_settings()
@@ -739,7 +740,7 @@ def batch_extract_paper_cards(
     else:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [
-                executor.submit(_extract_single, (i, p))
+                submit_with_context(executor, _extract_single, (i, p))
                 for i, p in enumerate(papers)
             ]
             results = []

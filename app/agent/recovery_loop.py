@@ -19,6 +19,7 @@ from app.agent.nodes import (
     download_pdf_node,
     extract_card_node,
     fetch_detail_node,
+    global_evidence_gate_node,
     parse_pdf_node,
     rank_node,
     recovery_controller_node,
@@ -171,10 +172,21 @@ def run_route_evidence_recovery(
     should_cancel: Callable[[], bool] | None = None,
 ) -> None:
     """在路线验证和 Claim Planning 之间执行有界、增量的证据恢复闭环。"""
-    from app.agent.evidence_recovery import count_new_relevant_evidence
+    from app.agent.evidence_recovery import count_new_relevant_evidence, route_recovery_stop_reason
     from app.schemas.recovery_schema import RecoveryAction, RecoveryStatus
 
     settings = get_settings()
+    if should_cancel and should_cancel():
+        raise AgentCancelledError("任务已在证据恢复前取消")
+    stop_reason = route_recovery_stop_reason(state)
+    if stop_reason:
+        # WHY: 即使旧任务或直接调用绕过动作目录，也不能重新请求模型并重开耗尽的恢复循环。
+        state["recovery_decision"] = {
+            "action": RecoveryAction.DEGRADE.value, "status": RecoveryStatus.EXHAUSTED.value,
+            "reason": stop_reason, "queries": [],
+        }
+        state["evidence_recovery_status"] = RecoveryStatus.EXHAUSTED.value
+        return
     state.setdefault("recovery_round", 0)
     state.setdefault("route_recovery_attempts", {})
     state.setdefault("scope_revision_count", 0)
@@ -231,6 +243,8 @@ def run_route_evidence_recovery(
                 break
 
             if action == RecoveryAction.SCOPE_REVISION.value:
+                from app.agent.execution_budget import consume
+                consume("recovery")
                 state["recovery_action_count"] = int(
                     state.get("recovery_action_count") or 0
                 ) + 1
@@ -280,6 +294,8 @@ def run_route_evidence_recovery(
                 state["evidence_recovery_status"] = RecoveryStatus.NOT_REQUIRED.value
                 break
 
+            from app.agent.execution_budget import consume
+            consume("recovery")
             state["recovery_action_count"] = int(
                 state.get("recovery_action_count") or 0
             ) + 1
@@ -446,6 +462,11 @@ def run_route_evidence_recovery(
         # 必须针对新快照重算 gap，不能把补检索前的 0/N 报告留给后续门禁。
         if state.get("route_validation_report") is not None:
             diagnose_evidence_gaps_node(state, llm=None)
+            # WHY: 恢复轮内的 validate_routes_node 可能 SPLIT 路线并改写
+            # validated_routes。全局门禁的 route_stats 若不同步重算，就会继续描述
+            # 拆分前的路线论域，而 derive_result_status 仍按它判定 success/partial。
+            if state.get("paper_details") and settings.enable_global_evidence_gate:
+                global_evidence_gate_node(state)
         _record_route_evidence_deficits(state)
 
 

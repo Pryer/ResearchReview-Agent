@@ -834,100 +834,6 @@ def generate_deliverables_node(
     return state
 
 
-def _research_status_evidence_disclosure(
-    cards: list[dict[str, Any]],
-) -> str:
-    """披露研究现状实际使用的全文/摘要证据分布。"""
-    counts = {
-        "full_text": 0,
-        "partial_full_text": 0,
-        "abstract": 0,
-    }
-    for card in cards:
-        level = str(getattr(
-            (card.get("evidence_state") or {}).get("access_level")
-            or card.get("evidence_source"),
-            "value",
-            (card.get("evidence_state") or {}).get("access_level")
-            or card.get("evidence_source"),
-        ))
-        if level in counts and card.get("quality_status") != "invalid":
-            counts[level] += 1
-    abstract_count = counts["abstract"]
-    full_count = counts["full_text"] + counts["partial_full_text"]
-    if not abstract_count:
-        return ""
-    if full_count:
-        scope = (
-            f"当前证据池包含 {full_count} 篇全文或部分全文论文、"
-            f"{abstract_count} 篇摘要论文。"
-        )
-    else:
-        scope = (
-            f"当前可用的 {abstract_count} 篇论文均为摘要级证据；"
-            "PDF 下载或解析失败不阻断研究现状生成。"
-        )
-    return (
-        "> **证据范围说明：** "
-        + scope
-        + "摘要级论文仅用于原文明确报告的研究问题、方法概述和主要发现，"
-        "不用于详细模型结构、数据划分、消融实验、作者局限或公平指标比较。"
-    )
-
-
-def _add_scope_disclosure(text: str, scope: Dict[str, Any], language: str) -> str:
-    """在正文开头明确用户确认的概念边界，避免把相邻任务混为一谈。"""
-    label = str(scope.get("label") or "").strip()
-    description = str(scope.get("description") or "").strip()
-    if not text or not label:
-        return text
-    if language == "zh":
-        disclosure = f"**研究范围说明：** 本文按“{label}”界定主题"
-        if description:
-            disclosure += f"，即{description.rstrip('。')}"
-        disclosure += "。相邻含义仅在与该范围存在直接证据关系时作为背景纳入。"
-    else:
-        disclosure = f"**Scope:** This review uses the “{label}” interpretation"
-        if description:
-            disclosure += f": {description.rstrip('.')}"
-        disclosure += ". Neighboring meanings are included only when directly supported."
-    lines = text.splitlines()
-    insert_at = 1 if lines and lines[0].lstrip().startswith("#") else 0
-    lines[insert_at:insert_at] = ["", disclosure, ""]
-    return "\n".join(lines)
-
-
-def _infer_evidence_role(paper: Dict[str, Any]) -> str:
-    """根据论文标题和筛选决策推断其在综述中的证据角色。
-
-    优先采用聚类阶段已写入卡片的 ``evidence_role``（单一事实来源），
-    未写入时按标题关键词 + 筛选决策兜底推断。
-
-    Returns:
-        "survey" | "method" | "benchmark" | "application"
-    """
-    preset = paper.get("evidence_role")
-    if preset in ("survey", "method", "benchmark", "application"):
-        return preset
-    title = str(paper.get("title", "")).lower()
-    if any(kw in title for kw in [
-        "survey", "review", "综述", "comprehensive", "systematic",
-        "bibliometric", "meta-analysis", "元分析",
-    ]):
-        return "survey"
-    if any(kw in title for kw in [
-        "dataset", "benchmark", "数据集", "基准",
-    ]):
-        return "benchmark"
-    from app.tools.paper_rerank import RULE_SCREENED_RESERVE
-
-    screening_decision = str(paper.get("_screening_decision", ""))
-    if screening_decision in ("uncertain", RULE_SCREENED_RESERVE):
-        return "application"
-    return "method"
-
-
-
 # ============================================================
 # Final Answer 节点
 # ============================================================
@@ -963,6 +869,13 @@ def final_answer_node(state: "ResearchAgentState") -> "ResearchAgentState":
             if gate.get("passed") is False
             else "success"
         )
+        if state.get("intent") == "search_papers":
+            search_quality = state.get("search_result_quality") or {}
+            final_status = (
+                "blocked" if not search_quality.get("actual")
+                else "partial" if not search_quality.get("passed")
+                else "success"
+            )
         append_step(
             state, "final_answer", final_status,
             input_data={
@@ -1015,17 +928,25 @@ def _backfill_global_citation_union(
     from app.schemas.deliverable_schema import WritingPlan
     from app.tools.validate_deliverable import validate_deliverable
 
-    cited_union: set[str] = set()
-    for text in outputs:
-        cited_union.update(extract_citation_ids(text))
-    if len(cited_union) >= required:
-        return outputs, validations
-
+    unconfirmed_ids = {str(item) for item in state.get("unconfirmed_reference_ids") or []}
     cards_by_id = {
         str(card.get("paper_id") or ""): card
         for card in state.get("paper_cards") or []
-        if card.get("paper_id")
+        if card.get("paper_id") and card.get("quality_status") != "invalid"
+        and str(card.get("paper_id")) not in unconfirmed_ids
     }
+    # WHY: 语法上像引用的未知、失效或未确认论文不能抵扣用户的唯一论文下限；
+    # 否则回填提前返回，明明有已分配的有效证据却不尝试修复引用缺口。
+    valid_ids = set(cards_by_id)
+    cited_union: set[str] = set()
+    for text in outputs:
+        cited_union.update(
+            paper_id for paper_id in extract_citation_ids(text, valid_ids=valid_ids)
+            if paper_id in valid_ids
+        )
+    if len(cited_union) >= required:
+        return outputs, validations
+
     outputs = list(outputs)
     validations = list(validations)
     for index, allocation in enumerate(allocation_plans):
@@ -1092,7 +1013,6 @@ def _backfill_global_citation_union(
         if not revised or not revised.strip():
             continue
 
-        valid_ids = set(cards_by_id)
         # 补写模型有时复用证据清单中的 ``paper_id:eNNN``，与逐节写作
         # 使用同一映射规则，先还原为论文 ID 再做新增引用检查。
         revised = _normalize_evidence_citations(revised.strip(), list(cards_by_id.values()))
@@ -1152,7 +1072,7 @@ def _backfill_global_citation_union(
 
         outputs[index] = revised
         validations[index] = new_validation
-        cited_union.update(new_ids)
+        cited_union.update(new_ids & valid_ids)
         logger.info(
             "Citation backfill applied: deliverable=%s added=%d union=%d/%d",
             allocation.get("deliverable_type"),
@@ -2263,7 +2183,21 @@ def _assemble_answer(state: "ResearchAgentState") -> str:
         parts.append(banner)
 
     if state.get("intent") == "search_papers":
-        papers = state.get("ranked_papers") or []
+        from app.agent.nodes.base import _paper_identity_key
+
+        seen_papers: set[str] = set()
+        papers = []
+        for paper in state.get("ranked_papers") or []:
+            identity = _paper_identity_key(paper)
+            if identity not in seen_papers:
+                seen_papers.add(identity)
+                papers.append(paper)
+        search_quality = state.get("search_result_quality") or {}
+        if search_quality.get("issues"):
+            prefix = "检索结果部分满足要求：" if papers else "检索结果未满足要求："
+            parts.append(prefix + "；".join(search_quality["issues"]) + "。")
+        if search_quality.get("warnings"):
+            parts.append("；".join(search_quality["warnings"]) + "。")
         topic = state.get("topic") or state.get("user_query", "")
         parts.append(f"# {topic} 相关论文\n")
         if not papers:
@@ -2273,12 +2207,9 @@ def _assemble_answer(state: "ResearchAgentState") -> str:
             title = paper.get("title", "Untitled")
             year = paper.get("year") or "未知年份"
             venue = paper.get("venue") or "未知来源"
-            paper_id = paper.get("paper_id") or ""
             url = paper.get("url") or paper.get("pdf_url") or ""
             reason = paper.get("ranking_reason") or paper.get("relevance_reason") or ""
             line = f"{i}. **{title}** ({year}, {venue})"
-            if paper_id:
-                line += f" `{paper_id}`"
             if url:
                 line += f"\n   {url}"
             if reason:

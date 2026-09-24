@@ -328,6 +328,25 @@ def test_rr11_every_gap_route_receives_at_least_one_query():
     assert all(queries for queries in decision.route_query_allocation.values())
 
 
+def test_shared_recovery_query_is_dispatched_once_and_attributed_to_each_route():
+    shared = "classroom behavior temporal analysis"
+    report = EvidenceGapReport(
+        needs_recovery=True, affected_route_ids=["A", "B"],
+        gaps=[RouteEvidenceGap(
+            route_id=route_id, gap_type=RouteGapType.SEARCH_COVERAGE_GAP,
+            reason="gap", core_evidence_deficit=2, suggested_queries=[shared],
+        ) for route_id in ("A", "B")],
+    )
+
+    decision = decide_recovery(
+        {}, report, max_rounds=2, max_route_attempts=2,
+        min_query_novelty=0.2, max_scope_revisions=1, max_queries=1,
+    )
+
+    assert decision.queries == [shared]
+    assert decision.route_query_allocation == {"A": [shared], "B": [shared]}
+
+
 def test_rr14_route_query_regeneration_survives_novelty_gate_without_llm():
     """无 LLM 时路线概念子集组合必须能产生通过新颖度门槛的补检索查询。"""
     from app.agent.evidence_recovery import _regenerated_route_queries

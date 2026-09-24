@@ -1,23 +1,26 @@
 """Agent 工作流编排。
 
-MVP 阶段使用顺序节点风格，不引入 LangGraph 依赖。
-``run_research_agent`` 是主入口函数。
-后续迁移到 LangGraph 时，只需重写本文件的编排逻辑，
-节点函数保持不变。
+``run_research_agent`` / ``continue_research_agent`` / ``regenerate_research_agent``
+是三个公共入口，统一进入五字段主 Agent 的单动作决策循环。历史状态在执行入口
+规范为自主编排；节点权限、预算、提交版本复核与质量门禁仍由代码裁决。
 
-执行原语（协作式取消、节点边界检查、LLM 工厂）在 ``app.agent.execution``，
-检索精化循环在 ``app.agent.retrieval_loop``，证据恢复状态机在
-``app.agent.recovery_loop``；本文件只保留编排顺序与分支路由。
+本文件同时承载写作质量边界（主张对齐、引用一致性、引用缺口修复与草稿回滚）和
+最终输出组装。执行原语（协作式取消、节点边界检查、LLM 工厂）在
+``app.agent.execution``，检索精化循环在 ``app.agent.retrieval_loop``，
+证据恢复状态机在 ``app.agent.recovery_loop``。
 """
 
 from __future__ import annotations
 
-import os
 import re
+import copy
 
 from typing import Any, Callable, Dict, List, Optional
 
+from app.agent.controller import AgentController
+from app.agent.orchestration import normalize_orchestration_mode
 from app.agent.execution import AgentCancelledError
+from app.agent.execution_budget import research_budget
 from app.agent.execution import checkpoint as _checkpoint
 from app.agent.execution import get_llm as _get_llm
 from app.agent.nodes import (
@@ -26,9 +29,7 @@ from app.agent.nodes import (
     claim_evidence_gate_node,
     claim_plan_node,
     cluster_node,
-    diagnose_evidence_gaps_node,
     download_pdf_node,
-    expand_search_year_node,
     fetch_detail_node,
     final_answer_node,
     extract_card_node,
@@ -36,19 +37,10 @@ from app.agent.nodes import (
     global_evidence_gate_node,
     parse_pdf_node,
     plan_node,
-    rank_node,
-    recovery_controller_node,
-    refine_search_node,
-    retrieval_shortfall_node,
-    search_node,
-    scope_revision_node,
     validate_routes_node,
     verify_claims_node,
 )
-from app.agent.recovery_loop import (
-    run_route_evidence_recovery as _run_route_evidence_recovery,
-    _record_recovery_statistics,
-)
+from app.agent.recovery_loop import run_route_evidence_recovery as _run_route_evidence_recovery
 from app.agent.retrieval_loop import (
     search_rank_with_refinement as _search_rank_with_refinement,
 )
@@ -56,67 +48,333 @@ from app.agent.router import should_parse_pdf
 from app.agent.state import ResearchAgentState
 from app.core.config import get_settings
 from app.core.logger import get_logger
+from app.schemas.agent_task_schema import AgentRole
 
 logger = get_logger(__name__)
 
 
-def _compute_total_steps(state: ResearchAgentState) -> int:
-    """根据当前已知的意图和配置，动态估算本次运行的总步骤数。
+def _role_llm(llm, role: str):
+    """生产客户端使用稳定角色前缀；测试/旧适配器保持 duck typing 兼容。"""
+    binder = getattr(llm, "for_agent", None)
+    return binder(role) if callable(binder) else llm
 
-    步骤索引与 ``run_research_agent`` 中的 ``_checkpoint`` 调用保持一致：
-    0 plan, 1 search_and_rank, 2 rank_papers, 3 refine_search,
-    4 expand_search_year, 5 fetch_detail, 6 download_pdf, 7 parse_pdf,
-    8 extract_paper_cards, 9 cluster_papers, 10 generate_deliverables,
-    11 verify_claims, 12 citation_check, 13 final_answer。
 
-    在 plan 节点执行前，``intent`` / ``core_deliverables`` 尚未知晓，本函数
-    返回一个保守估计；plan 完成后应重新调用本函数以获得更准确的总数。
-    这只影响进度条的分母展示，不影响任何执行分支逻辑。
-    """
+def _draft_fingerprint(state):
+    from app.agent.context_builder import _stable_hash
+    # WHY: 调度状态在任务提交时改变，不属于正文验证输入；证据和授权改变则必须重验。
+    return _stable_hash({key: state.get(key) for key in (
+        "review", "paper_cards", "paper_details", "claim_plans", "writing_plans",
+        "citation_map", "citation_registry", "required_reference_count", "start_year",
+        "end_year", "quality_gate", "claim_verification", "core_deliverables",
+    )})
+
+
+def _run_autonomous_pipeline(
+    state: ResearchAgentState,
+    *,
+    should_cancel: Callable[[], bool] | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+    local_verification: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """以五字段主控循环驱动既有研究节点；门禁仍由确定性代码执行。"""
+    from app.agent.main_loop import MainAgentLoop
+
+    normalize_orchestration_mode(state)
     settings = get_settings()
-    intent = state.get("intent")
+    llm = _get_llm()
+    if state.get("agent_operation_mode") == "verification_only" and not state.get("agent_mandatory_actions"):
+        # WHY: 用户/恢复阶梯已选定只重验，模型不能用 finish 或 blocked
+        # 跳过本轮验证；检查点恢复也必须继续履行同一动作。
+        state["agent_mandatory_actions"] = [{"action": "validate_result"}]
+    state.pop("result_status", None)
+    state.pop("clarification", None)
+    from app.services.durable_execution_service import active_runtime
+    runtime = active_runtime()
+    if runtime:
+        runtime.snapshot(state, ledger=state.get("agent_execution_budget") or {})
+    from app.agent.context_builder import _stable_hash
 
-    # 基础步骤：plan + search_and_rank + rank_papers + refine_search
-    #           + expand_search_year + final_answer
-    total = 6
+    # WHY: 局部重验只对同一证据和同一授权成立；主循环若先改了任一依赖，
+    # 验证动作必须自动退回全文验证，不能复用上一稿的句级报告。
+    local_source = _stable_hash({key: state.get(key) for key in (
+        "paper_details", "paper_cards", "claim_plans", "validated_routes",
+    )}) if local_verification else None
 
-    if intent == "search_papers":
-        # 只查论文：检索排序后直接输出，跳过详情补全和之后所有生成步骤。
-        return total
+    def _search(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
+        _search_rank_with_refinement(
+            current,
+            llm=_role_llm(llm, "search"),
+            should_cancel=should_cancel,
+            progress_callback=progress_callback,
+            total_steps=max(1, int(settings.agent_main_max_rounds)),
+        )
 
-    # fetch_detail 在非 search_papers 意图下总会执行。
-    total += 1  # fetch_detail
+    def _targeted_search(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
+        from app.agent.evidence_recovery import targeted_search_kind
+        kind = targeted_search_kind(current)
+        if not kind:
+            raise ValueError("targeted search is unavailable in current state")
+        # WHY: 两种补检索都受现有有界恢复预算约束；这里是单个主控动作，
+        # 内部算法不会再次启动主 Agent 循环。
+        if kind == "citation":
+            previous = copy.deepcopy(current)
+            from app.agent.execution_budget import consume
+            consume("recovery")
+            _repair_citation_gap(current, should_cancel, progress_callback,
+                                 step_idx=0, total_steps=max(1, settings.agent_main_max_rounds))
+            _validate_result(current, {})
+            _retain_better_generation(previous, current)
+            current.pop("_citation_gap_repair_snapshot", None)
+            current.pop("_citation_gap_repair_previous_cited", None)
+        else:
+            dependency_keys = ("paper_cards", "paper_details", "validated_routes", "dynamic_taxonomy")
+            before = copy.deepcopy({key: current.get(key) for key in dependency_keys})
+            _run_route_evidence_recovery(current, should_cancel=should_cancel)
+            if before != {key: current.get(key) for key in dependency_keys} or not current.get("claim_plans"):
+                # WHY: 补搜改变证据或路线后，旧授权/门禁不能继续代表当前证据。
+                # 与既有增量流程一致，在同一复合动作内重建授权、写作并重验；硬约束不变。
+                _reset_generation_products(current)
+                current.pop("autonomous_verified_fingerprint", None)
+                _claims(current, {})
+                _write(current, {})
 
-    if settings.enable_pdf_pipeline:
-        total += 1  # download_pdf
-        # parse_pdf 是否运行取决于 should_parse_pdf(state)，规划阶段无法
-        # 100% 确定；按"预计会解析"乐观计入，最坏情况下总数略偏高，
-        # 不影响进度条单调递增。
-        total += 1  # parse_pdf
+    def _fetch(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
+        fetch_detail_node(current, should_cancel=should_cancel)
+        if settings.enable_pdf_pipeline:
+            download_pdf_node(current, should_cancel=should_cancel)
+            if should_parse_pdf(current):
+                parse_pdf_node(current, should_cancel=should_cancel)
 
-    core_deliverables = state.get("core_deliverables") or []
-    if core_deliverables:
-        total += 1  # extract_paper_cards（乐观估计会检索到论文详情）
+    def _extract(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
+        card_llm = (
+            _role_llm(llm, "analysis") if settings.enable_llm_card_extraction else None
+        )
+        extract_card_node(current, llm=card_llm, should_cancel=should_cancel)
 
-        taxonomy_deliverables = {"research_status", "related_work", "narrative_review"}
-        if taxonomy_deliverables.intersection(core_deliverables):
-            total += 1  # validate_routes（有路线候选时必经的验证检查点）
-            total += 1  # cluster_papers（无证据路线时的回退聚类）
-            if settings.enable_evidence_recovery:
-                total += 1  # evidence_recovery（内部是有界复合步骤）
+    def _validate_routes(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
+        validate_routes_node(current, llm=_role_llm(llm, "analysis"))
+        if not any(route.get("paper_ids") for route in (current.get("validated_routes") or [])):
+            # WHY: 恢复动作可能强制先重验路线；没有可写路线时，仍须在同一
+            # 授权动作内建立证据驱动的回退分类，随后才能重建主张授权。
+            cluster_node(
+                current,
+                llm=_role_llm(llm, "analysis") if settings.enable_llm_clustering else None,
+            )
 
-        total += 1  # global_evidence_gate（paper_details 为空时不实际执行）
-        total += 2  # claim_plan + claim_evidence_gate（两个独立检查点）
-        total += 1  # generate_deliverables
-        total += 1  # claim_alignment（生成成功后的越权检查，乐观计入）
+    def _cluster(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
+        cluster_node(
+            current,
+            llm=_role_llm(llm, "analysis") if settings.enable_llm_clustering else None,
+        )
 
-        if settings.enable_claim_verification:
-            total += 1  # verify_claims
-        total += 1  # citation_check
+    def _claims(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
+        claim_plan_node(current, llm=_role_llm(llm, "analysis"))
+        _run_claim_evidence_gate(current)
+        if current.get("paper_details") and settings.enable_global_evidence_gate:
+            global_evidence_gate_node(current)
 
-    return total
+    def _write(current: ResearchAgentState, arguments: dict[str, Any]) -> None:
+        previous = copy.deepcopy(current)
+        # WHY: 清除上轮就绪/隔离诊断再写；已有草稿仅用于验证后质量比较。
+        for key in ("generation_readiness", "deliverable_readiness", "generation_blocked", "generation_quality",
+                    "writer_section_diagnostics", "writer_diagnostics", "quarantined_draft"):
+            current.pop(key, None)
+        if arguments.get("section_ids"):
+            current["target_section_ids"] = list(arguments["section_ids"])
+        current.pop("autonomous_verified_fingerprint", None)
+        current.pop("quality_gate", None)
+        _generate_deliverables_or_block(current, should_cancel=should_cancel)
+        _validate_result(current, {})
+        _retain_better_generation(previous, current)
+
+    def _retain_better_generation(previous, current):
+        from app.agent.generation_recovery import candidate_is_not_worse
+        if previous.get("review") and not candidate_is_not_worse(previous, current):
+            for key in _GENERATION_PRODUCT_KEYS:
+                current.pop(key, None)
+            current.update(copy.deepcopy(_snapshot_generation_products(previous)))
+            current.setdefault("recovery_candidate_rejections", []).append({
+                "reason": "自主修复候选质量退化，保留已验证版本",
+            })
+            _validate_result(current, {})
+
+    def _validate_result(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
+        verify_kwargs = None
+        if local_verification and local_source == _stable_hash({key: current.get(key) for key in (
+            "paper_details", "paper_cards", "claim_plans", "validated_routes",
+        )}):
+            verify_kwargs = local_verification
+        if verify_kwargs:
+            _verify_generated_draft(current, verify_claims_kwargs=verify_kwargs)
+        else:
+            _verify_generated_draft(current)
+        final_answer_node(current)
+        current["autonomous_verified_fingerprint"] = _draft_fingerprint(current)
+
+    handlers = {
+        "search_and_rank": _search,
+        "targeted_search": _targeted_search,
+        "fetch_metadata": _fetch,
+        "extract_paper_cards": _extract,
+        "validate_routes": _validate_routes,
+        "cluster_papers": _cluster,
+        "plan_claims": _claims,
+        "generate_deliverables": _write,
+        "rewrite_sections": _write,
+        "validate_result": _validate_result,
+    }
+
+    def _finish(current: ResearchAgentState) -> bool:
+        if current.get("intent") == "search_papers":
+            from app.agent.focus_coverage import required_focus_coverage
+            from app.agent.nodes.base import _paper_identity_key
+
+            papers = list(current.get("ranked_papers") or [])
+            actual = len({_paper_identity_key(paper) for paper in papers})
+            requested = int(current.get("required_reference_count") or 0) if current.get("max_papers_explicit") else 0
+            coverage = required_focus_coverage(current.get("research_semantic_frame") or {}, papers)
+            issues = []
+            if not actual:
+                issues.append("未检索到符合当前范围的论文")
+            if requested and actual < requested:
+                issues.append(f"要求返回至少 {requested} 篇，当前只有 {actual} 篇有效论文")
+            missing_focuses = [str(item) for item in coverage.get("missing_focuses") or [] if str(item).strip()]
+            if missing_focuses:
+                issues.append("以下研究重点尚无匹配论文：" + "、".join(missing_focuses))
+            current["search_result_quality"] = {
+                "passed": not issues,
+                "requested": requested,
+                "actual": actual,
+                "issues": issues,
+                "warnings": ["部分检索源失败，结果可能不完整"] if current.get("search_failed") else [],
+            }
+            # WHY: 检索任务没有正文，写作门禁和旧会话草稿状态不能决定论文列表的发布。
+            current.pop("quality_gate", None)
+            current["result_status"] = "blocked" if not actual else "partial" if issues else "completed"
+            if not actual:
+                current.setdefault("errors", []).append({"code": "search_results_empty", "message": ""})
+            final_answer_node(current)
+            return True
+        if not str(current.get("review") or "").strip():
+            return False
+        # 只有当前正文已经过验证时才允许交付；模型不能用 finish 跳过验证。
+        if not current.get("quality_gate"):
+            return False
+        if current.get("autonomous_verified_fingerprint") != _draft_fingerprint(current):
+            return False
+        # WHY: validate_result 已对同一指纹运行最终门禁；再次调用会重复写入
+        # 质量诊断，且可能使恢复轮的事件和计数不再幂等。
+        status = derive_result_status(current)
+        if status == "success":
+            current["result_status"] = "completed"
+            return True
+        quality = current.get("quality_gate") or {}
+        if status == "partial" and quality.get("draft_released"):
+            current["result_status"] = "partial"
+            return True
+        return False
+
+    status = MainAgentLoop(llm).run(
+        state,
+        handlers=handlers,
+        finish_validator=_finish,
+        should_cancel=should_cancel,
+    )
+    state["result_status"] = status
+    if status == "waiting_user":
+        state["answer"] = (state.get("clarification") or {}).get("question", "请补充研究范围。")
+    if (state.get("active_quality_recovery") and not state.get("agent_mandatory_actions")
+            and status in {"completed", "partial", "blocked", "failed", "cancelled"}):
+        from app.agent.generation_recovery import complete_recovery_action
+
+        complete_recovery_action(state)
+    if progress_callback:
+        progress_callback(status, 1, 1)
+    return _build_output(state)
 
 
+def _run_search_subagent(
+    state: ResearchAgentState,
+    *,
+    objective: str,
+    llm,
+    should_cancel=None,
+    progress_callback=None,
+    total_steps: int,
+) -> None:
+    AgentController().execute(
+        role=AgentRole.SEARCH,
+        operation="search_and_rank",
+        objective=objective,
+        state=state,
+        handler=lambda current: _search_rank_with_refinement(
+            current,
+            llm=llm,
+            should_cancel=should_cancel,
+            progress_callback=progress_callback,
+            total_steps=total_steps,
+        ),
+        constraints={
+            "start_year": state.get("start_year"),
+            "end_year": state.get("end_year"),
+            "required_reference_count": state.get("required_reference_count"),
+        },
+        expected_output=["candidate_papers", "ranked_papers", "source_diagnostics"],
+        budget={"remaining_recovery_actions": max(
+            0,
+            int(get_settings().recovery_total_action_budget)
+            - int(state.get("recovery_action_count") or 0),
+        )},
+        should_cancel=should_cancel,
+    )
+
+
+def _run_search_stage(
+    state: ResearchAgentState,
+    *,
+    operation: str,
+    objective: str,
+    handler: Callable[[ResearchAgentState], Any],
+    expected_output: list[str],
+    should_cancel=None,
+) -> None:
+    AgentController().execute(
+        role=AgentRole.SEARCH,
+        operation=operation,
+        objective=objective,
+        state=state,
+        handler=handler,
+        expected_output=expected_output,
+        should_cancel=should_cancel,
+    )
+
+
+def _run_analysis_subagent(
+    state: ResearchAgentState,
+    *,
+    operation: str,
+    objective: str,
+    handler: Callable[[ResearchAgentState], Any],
+    expected_output: list[str],
+    should_cancel=None,
+) -> None:
+    AgentController().execute(
+        role=AgentRole.ANALYSIS,
+        operation=operation,
+        objective=objective,
+        state=state,
+        handler=handler,
+        expected_output=expected_output,
+        input_artifact_refs=[
+            f"state://paper/{paper.get('paper_id')}"
+            for paper in (state.get("paper_details") or [])
+            if paper.get("paper_id")
+        ],
+        should_cancel=should_cancel,
+    )
+
+
+@research_budget
 def run_research_agent(
     user_query: str,
     current_year: Optional[int] = None,
@@ -176,9 +434,8 @@ def run_research_agent(
         if raw_progress_callback:
             raw_progress_callback(step, current, total)
 
-    # plan 节点执行前，intent/core_deliverables 未知，先给一个保守估计；
-    # plan 成功后会重新计算更准确的总数（见下方）。
-    total_steps = _compute_total_steps(state)
+    # WHY: 主 Agent 的动作序列由模型决定，进度分母只能按决策轮预算估计。
+    total_steps = max(1, int(get_settings().agent_main_max_rounds))
 
     # 取消优先级高于任何能力判断或节点执行。
     if should_cancel and should_cancel():
@@ -210,7 +467,8 @@ def run_research_agent(
 
     # ---------- 1. 规划 ----------
     _checkpoint(state, "plan", 0, total_steps, should_cancel, progress_callback)
-    plan_node(state, llm=_get_llm(), current_year=current_year)
+    # WHY: 原始需求解析属于检索规划适配器；主决策角色仅在五字段循环调用。
+    plan_node(state, llm=_role_llm(_get_llm(), "search"), current_year=current_year)
     if state.get("planning_failed"):
         state["answer"] = (
             "## 检索规划失败\n\n"
@@ -227,10 +485,6 @@ def run_research_agent(
         return _build_output(state)
     if not state.get("canonical_topic"):
         state["canonical_topic"] = state.get("topic")
-
-    # plan 完成后 intent/core_deliverables 已知，重新计算总步骤数，
-    # 让进度条分母更准确（仅影响展示，不影响执行分支）。
-    total_steps = _compute_total_steps(state)
 
     # ---------- 1.5. 搜索前概念规划（Provisional Routes）----------
     # 在检索之前生成候选研究路线框架，引导后续定向检索。
@@ -258,307 +512,14 @@ def run_research_agent(
             final_answer_node(state)
             return _build_output(state)
 
-    # ---------- 2-7. ReAct 检索 → 排序 → 关键词修正 ----------
-    _checkpoint(state, "search_and_rank", 1, total_steps, should_cancel, progress_callback)
-    _search_rank_with_refinement(
+    normalize_orchestration_mode(state)
+    state["agent_operation_mode"] = "initial"
+    return _run_autonomous_pipeline(
         state,
-        llm=_get_llm(),
         should_cancel=should_cancel,
         progress_callback=progress_callback,
-        total_steps=total_steps,
     )
-    if state.get("search_failed") and not state.get("candidate_papers"):
-        state["answer"] = (
-            "## 论文检索失败\n\n"
-            "所有论文数据源均未返回结果，可能发生接口限流或网络异常。"
-            "本次请求已停止，未据此判断相关论文数量，请稍后重试。"
-        )
-        append_step(
-            state,
-            "final_answer",
-            "failed",
-            error="paper_search_sources_unavailable",
-            duration_ms=0,
-        )
-        return _build_output(state)
-    # 检索精化循环内部已用了 0-3 号步骤位（plan/search_and_rank/rank_papers/
-    # refine_search），expand_search_year 固定占第 4 号；后续步骤位不再硬编码
-    # 绝对序号，改用递增计数器，避免 total_steps 动态变化后与固定索引脱节
-    # （例如 search_papers 分支下 total_steps 远小于 14，若仍写死 13 会导致
-    # current > total，进度条超过 100%）。
-    step_idx = 4
-    _checkpoint(state, "expand_search_year", step_idx, total_steps, should_cancel, progress_callback)
-    expand_search_year_node(state, should_cancel=should_cancel)
-    step_idx += 1
 
-    # 只查论文：检索和排序后即可返回
-    if state.get("intent") == "search_papers":
-        _checkpoint(state, "final_answer", step_idx, total_steps, should_cancel, progress_callback)
-        final_answer_node(state)
-        return _build_output(state)
-
-    _checkpoint(state, "fetch_detail", step_idx, total_steps, should_cancel, progress_callback)
-    fetch_detail_node(state, should_cancel=should_cancel)
-    step_idx += 1
-
-    # ---------- 8-9. PDF 分支 ----------
-    if get_settings().enable_pdf_pipeline:
-        _checkpoint(state, "download_pdf", step_idx, total_steps, should_cancel, progress_callback)
-        download_pdf_node(state, should_cancel=should_cancel)
-        step_idx += 1
-        if should_parse_pdf(state):
-            _checkpoint(state, "parse_pdf", step_idx, total_steps, should_cancel, progress_callback)
-            parse_pdf_node(state, should_cancel=should_cancel)
-            step_idx += 1
-    else:
-        append_step(
-            state,
-            "download_pdf",
-            "success",
-            tool_name="download_pdf",
-            input_data={
-                "paper_details": len(state.get("paper_details") or []),
-                "enable_pdf_pipeline": get_settings().enable_pdf_pipeline,
-            },
-            output_data={"skipped": True, "reason": "pdf_pipeline_explicitly_disabled"},
-            duration_ms=0,
-        )
-
-    # ---------- 10. Evidence Card 与路线验证 ----------
-    if state.get("paper_details"):
-        _checkpoint(state, "extract_paper_cards", step_idx, total_steps, should_cancel, progress_callback)
-        card_llm = _get_llm() if get_settings().enable_llm_card_extraction else None
-        extract_card_node(state, llm=card_llm, should_cancel=should_cancel)
-        step_idx += 1
-        taxonomy_deliverables = {"research_status", "related_work", "narrative_review"}
-        if taxonomy_deliverables.intersection(state.get("core_deliverables") or []):
-            _checkpoint(state, "validate_routes", step_idx, total_steps, should_cancel, progress_callback)
-            # 当有候选路线时走验证路径（KEEP/MERGE/SPLIT/DROP）；
-            # 否则回退到原始无约束聚类
-            validate_routes_node(state, llm=_get_llm())
-            step_idx += 1
-            # 候选路线验证后先执行有界证据恢复；不能先聚类回退，否则被 DROP
-            # 的路线已经失去补搜机会。
-            if state.get("provisional_framework") and get_settings().enable_evidence_recovery:
-                _checkpoint(
-                    state,
-                    "evidence_recovery",
-                    step_idx,
-                    total_steps,
-                    should_cancel,
-                    progress_callback,
-                )
-                _run_route_evidence_recovery(
-                    state,
-                    should_cancel=should_cancel,
-                )
-                step_idx += 1
-            # WEAK 路线会被保留给 Recovery，但没有任何已匹配证据时不能直接
-            # 编译成正式写作结构；恢复耗尽后才回退到证据驱动分类。
-            evidence_backed_routes = [
-                route for route in (state.get("validated_routes") or [])
-                if route.get("paper_ids")
-            ]
-            if not evidence_backed_routes:
-                _checkpoint(state, "cluster_papers", step_idx, total_steps, should_cancel, progress_callback)
-                cluster_llm = _get_llm() if get_settings().enable_llm_clustering else None
-                cluster_node(state, llm=cluster_llm)
-                step_idx += 1
-        else:
-            state["clusters"] = []
-            state["dynamic_taxonomy"] = {}
-            state["taxonomy_validation"] = {}
-            state["validated_routes"] = []
-            state["route_decisions"] = []
-
-    # ---------- 10.4. Claim-Evidence Planning ----------
-    # 必须早于 Global Evidence Gate：门禁的主张强度指标读 ``claim_plans``，
-    # 反序会让它每次都落到路线体量回退值（实测 claim_support_proxy 恒为
-    # 1.0，而同一次运行里 claim_plan 统计的是 141/149 条主张仅有单篇证据）。
-    if (
-        any(route.get("paper_ids") for route in (state.get("validated_routes") or []))
-        or state.get("dynamic_taxonomy")
-    ):
-        _checkpoint(state, "claim_plan", step_idx, total_steps, should_cancel, progress_callback)
-        claim_plan_node(state, llm=_get_llm())
-        step_idx += 1
-        _checkpoint(
-            state,
-            "claim_evidence_gate",
-            step_idx,
-            total_steps,
-            should_cancel,
-            progress_callback,
-        )
-        _run_claim_evidence_gate(state)
-        step_idx += 1
-
-    # ---------- 10.5. Global Evidence Gate（综述级证据充分性，只评估与推荐）----------
-    if state.get("paper_details") and get_settings().enable_global_evidence_gate:
-        _checkpoint(
-            state,
-            "global_evidence_gate",
-            step_idx,
-            total_steps,
-            should_cancel,
-            progress_callback,
-        )
-        global_evidence_gate_node(state)
-        step_idx += 1
-
-    # ---------- 11-13. 四交付物统一写作分支 ----------
-    papers = state.get("paper_details") or []
-    if state.get("core_deliverables"):
-        if not papers:
-            retrieval_shortfall_node(state)
-        else:
-            _checkpoint(state, "generate_deliverables", step_idx, total_steps, should_cancel, progress_callback)
-            _generate_deliverables_or_block(state, should_cancel=should_cancel)
-            step_idx += 1
-
-            def _advance_verification(stage: str) -> None:
-                nonlocal step_idx
-                _checkpoint(state, stage, step_idx, total_steps, should_cancel, progress_callback)
-                step_idx += 1
-
-            # 引用授权一致性推迟到引用缺口修复之后：留在正文里的必须是最终草稿。
-            _verify_generated_draft(
-                state,
-                checkpoint=_advance_verification,
-                check_citation_authorization=False,
-            )
-            # ---------- 13.5. 引用缺口修复：成文引用数低于用户硬性要求时定向扩召回 ----------
-            # “不少于 N 篇”是显式硬约束，不能只靠横幅提示兜底：以增量检索
-            # 模式补一轮检索（refine 反馈携带缺口数量）并重新生成，修复后
-            # 若引用数反而变少则回滚到修复前草稿。
-            if _should_repair_citation_gap(state):
-                # 在修复前建立授权基线。引用数量增加只有在不引入更多
-                # 主张—引用错配时才算真实进展；否则会把错误引用扩散到正文。
-                _check_claim_citation_consistency(state)
-                cited_before = int(state.get("unique_cited_paper_count") or 0)
-                required_refs = int(state.get("required_reference_count") or 0)
-                support_before = float(
-                    (state.get("claim_verification") or {}).get("support_rate") or 0.0
-                )
-                consistency_before = int(
-                    (state.get("claim_citation_consistency") or {}).get(
-                        "inconsistent_sentences", 0
-                    )
-                )
-                logger.info(
-                    "Citation gap repair: cited=%d < required=%d, running incremental retrieval",
-                    cited_before, required_refs,
-                )
-                repair_failed = False
-                try:
-                    _repair_citation_gap(
-                        state, should_cancel, progress_callback, step_idx, total_steps
-                    )
-                except AgentCancelledError:
-                    raise
-                except Exception as repair_exc:  # noqa: BLE001
-                    # 修复轮失败不能让整个任务崩掉：此时原稿已被 pop、快照还在，
-                    # 必须恢复修复前草稿并正常收尾，否则连回滚分支都到不了。
-                    repair_failed = True
-                    state.setdefault("errors", []).append(
-                        f"citation_gap_repair: {repair_exc}"
-                    )
-                    logger.warning(
-                        "Citation gap repair failed; restoring pre-repair draft: %s",
-                        repair_exc,
-                    )
-                    _restore_pre_repair_snapshot(state, clear_incremental=True)
-                if repair_failed:
-                    append_step(
-                        state,
-                        "citation_gap_repair",
-                        "failed",
-                        input_data={"required_reference_count": required_refs, "cited_before": cited_before},
-                        output_data={"restored_pre_repair_draft": True},
-                        error="citation_gap_repair_failed_restored_draft",
-                        duration_ms=0,
-                    )
-                else:
-                    # 修复产生的新草稿需要重新走写作后验证链。
-                    def _mark_repair_verification(stage: str) -> None:
-                        # 修复轮沿用原步骤位并钳制在分母内，也不为对齐步骤单独
-                        # 报进度：进度条只前进不回跳，索引语义与首轮保持一致。
-                        if stage == "claim_alignment":
-                            return
-                        _checkpoint(
-                            state, stage, min(step_idx, max(total_steps - 1, 0)),
-                            total_steps, should_cancel, progress_callback,
-                        )
-
-                    _verify_generated_draft(
-                        state,
-                        checkpoint=_mark_repair_verification,
-                        check_citation_authorization=False,
-                    )
-                    _check_claim_citation_consistency(state)
-                    cited_after = int(state.get("unique_cited_paper_count") or 0)
-                    support_after = float(
-                        (state.get("claim_verification") or {}).get("support_rate") or 0.0
-                    )
-                    consistency_after = int(
-                        (state.get("claim_citation_consistency") or {}).get(
-                            "inconsistent_sentences", 0
-                        )
-                    )
-                    append_step(
-                        state,
-                        "citation_gap_repair",
-                        "success" if cited_after >= required_refs else "partial",
-                        input_data={"required_reference_count": required_refs, "cited_before": cited_before},
-                        output_data={"cited_after": cited_after, "repaired": cited_after > cited_before},
-                        duration_ms=0,
-                    )
-                    # 回滚采用带授权安全边界的帕累托规则：引用增加不能以
-                    # 新增错配为代价；引用略减但支持率明显提升的版本仍可保留。
-                    if (
-                        consistency_after > consistency_before
-                        or (cited_after < cited_before and support_after <= support_before)
-                    ):
-                        _restore_pre_repair_snapshot(state)
-                        logger.info(
-                            "Citation gap repair regressed (cited %d -> %d, support %.1f%% -> %.1f%%, mismatches %d -> %d); rolled back draft",
-                            cited_before, cited_after, support_before * 100, support_after * 100,
-                            consistency_before, consistency_after,
-                        )
-                    else:
-                        state.pop("_citation_gap_repair_snapshot", None)
-                        logger.info(
-                            "Citation gap repair kept (cited %d -> %d, support %.1f%% -> %.1f%%, mismatches %d -> %d)",
-                            cited_before, cited_after, support_before * 100, support_after * 100,
-                            consistency_before, consistency_after,
-                        )
-            # Claim-Citation Consistency: 引用的论文是否在 claim 的允许证据中
-            _check_claim_citation_consistency(state)
-
-    # ---------- 14. 最终输出 ----------
-    _checkpoint(state, "final_answer", min(step_idx, total_steps - 1) if total_steps > 0 else step_idx, total_steps, should_cancel, progress_callback)
-    final_answer_node(state)
-    if progress_callback:
-        progress_callback("completed", total_steps, total_steps)
-
-    # 标准化诊断输出 + 自动导出 Evaluation Bundle
-    try:
-        from app.agent.diagnostics import format_diagnostics, export_evaluation_bundle
-        diag_text = format_diagnostics(state)
-        logger.info("Diagnostics:\n%s", diag_text)
-        from datetime import datetime as _dt
-        ts = _dt.now().strftime("%Y%m%d_%H%M%S")
-        bundle_path = export_evaluation_bundle(
-            state, output_dir=os.path.join("data", "eval_bundles", f"eval_bundle_{ts}")
-        )
-        logger.info("Evaluation bundle exported: %s", bundle_path)
-    except Exception as exc:
-        logger.debug("Diagnostics/export skipped: %s", exc)
-
-    logger.info("Agent finished: %d steps, %d errors",
-                len(state.get("steps", [])), len(state.get("errors", [])))
-
-    return _build_output(state)
 
 
 def _run_claim_evidence_gate(state: ResearchAgentState) -> None:
@@ -793,6 +754,55 @@ def _build_regeneration_recovery_plan(state: ResearchAgentState) -> Dict[str, An
     }
 
 
+def _prepare_autonomous_regeneration(
+    state: ResearchAgentState,
+    *,
+    should_cancel: Callable[[], bool] | None,
+    progress_callback: Callable[[str, int, int], None] | None,
+) -> Dict[str, Any]:
+    """履行已选定的恢复准备，并交回唯一主控循环。"""
+    recovery_plan = _build_regeneration_recovery_plan(state)
+    append_step(
+        state, "regeneration_recovery_plan", "success",
+        input_data={"blocking_issue_codes": recovery_plan["issue_codes"]},
+        output_data=recovery_plan, duration_ms=0,
+    )
+    state["target_section_ids"] = recovery_plan["target_section_ids"]
+    state.pop("autonomous_verified_fingerprint", None)
+    if state.pop("refresh_existing_evidence", False):
+        # WHY: REFRESH_EVIDENCE 只允许刷新已选论文；原始候选池可能含已筛掉的
+        # 论文，不能在恢复轮意外把它们重新送入详情和证据抽取。
+        selected = list(state.get("paper_details") or state.get("candidate_papers") or [])
+        state["candidate_papers"] = selected
+        state["ranked_papers"] = selected
+        _checkpoint(state, "refresh_existing_evidence", 0, 1, should_cancel, progress_callback)
+        _run_search_stage(
+            state, operation="fetch_metadata", objective="刷新现有论文的元数据与可访问证据",
+            handler=lambda current: fetch_detail_node(current, should_cancel=should_cancel),
+            expected_output=["paper_details", "source_diagnostics"], should_cancel=should_cancel,
+        )
+        card_llm = _role_llm(_get_llm(), "analysis") if get_settings().enable_llm_card_extraction else None
+        _run_analysis_subagent(
+            state, operation="extract_paper_cards", objective="刷新现有论文的证据卡",
+            handler=lambda current: extract_card_node(current, llm=card_llm, should_cancel=should_cancel),
+            expected_output=["paper_cards"], should_cancel=should_cancel,
+        )
+        recovery_plan["mode"] = "full_rebuild"
+        recovery_plan["reuse_routes"] = False
+        recovery_plan["reuse_claim_plans"] = False
+    if not recovery_plan["reuse_routes"]:
+        for key in ("validated_routes", "route_decisions", "route_validation_report",
+                    "clusters", "dynamic_taxonomy", "taxonomy_validation"):
+            state.pop(key, None)
+    if not recovery_plan["reuse_claim_plans"]:
+        # WHY: 全文重建可能来自证据刷新或论文排除。旧正文、引用表和授权
+        # 同属上一证据版本，不能在候选失败时被写作回滚重新带入公开输出。
+        _reset_generation_products(state)
+        state.pop("global_evidence_gate", None)
+    # 局部重写仍保留同证据旧稿供质量比较；finish 指纹已失效。
+    return recovery_plan
+
+
 def _snapshot_generation_products(state: ResearchAgentState) -> Dict[str, Any]:
     """保存当前写作产物快照（仅非 None 键），供修复退化时回滚。"""
     return {
@@ -832,6 +842,7 @@ def _reset_generation_products(state: ResearchAgentState) -> None:
 def _generate_deliverables_or_block(
     state: ResearchAgentState,
     should_cancel=None,
+    llm=None,
 ) -> None:
     """三入口统一的写作调用：异常降级为 quality_gate 阻断而非任务崩溃。
 
@@ -857,7 +868,11 @@ def _generate_deliverables_or_block(
         return
 
     try:
-        generate_deliverables_node(state, llm=_get_llm(), should_cancel=should_cancel)
+        generate_deliverables_node(
+            state,
+            llm=llm or _role_llm(_get_llm(), "writing"),
+            should_cancel=should_cancel,
+        )
     except AgentCancelledError:
         raise
     except Exception as deliverables_exc:  # noqa: BLE001 - 不让异常逃逸，走质量门禁
@@ -945,30 +960,6 @@ def _verify_generated_draft(
         _check_claim_citation_consistency(state)
 
 
-def _should_repair_citation_gap(state: ResearchAgentState) -> bool:
-    """判断是否需要为引用缺口补一轮定向检索。
-
-    仅当用户显式要求了引用数量、成文后实际引用数严格低于要求（且已有
-    部分引用）、且尚未尝试过修复时触发；被阻断的生成或无证据池可补的
-    会话不进入修复。
-    """
-    if state.get("generation_blocked"):
-        return False
-    if state.get("citation_gap_repair_attempted"):
-        return False
-    if not state.get("max_papers_explicit", False):
-        return False
-    required = int(state.get("required_reference_count") or 0)
-    if required <= 0:
-        return False
-    cited = int(state.get("unique_cited_paper_count") or 0)
-    if not (0 < cited < required):
-        return False
-    if not (state.get("candidate_papers") or state.get("paper_details")):
-        return False
-    return True
-
-
 def _repair_citation_gap(
     state: ResearchAgentState,
     should_cancel: Callable[[], bool] | None,
@@ -1041,7 +1032,7 @@ def _repair_citation_gap(
         state.get("core_deliverables") or []
     ):
         def _revalidate_routes() -> None:
-            route_llm = _get_llm()
+            route_llm = _role_llm(_get_llm(), "analysis")
             validate_routes_node(state, llm=route_llm)
             # 修复场景不再嵌套证据恢复轮：主流程已跑过恢复，且 refine
             # 已压缩，再加一轮检索只拖长修复时长、边际收益极低。
@@ -1059,7 +1050,9 @@ def _repair_citation_gap(
         or state.get("dynamic_taxonomy")
     ):
         def _rebuild_claims() -> None:
-            claim_plan_node(state, llm=_get_llm())
+            claim_plan_node(
+                state, llm=_role_llm(_get_llm(), "analysis")
+            )
             _run_claim_evidence_gate(state)
 
         _run("repair_claim_plan", _rebuild_claims)
@@ -1077,6 +1070,9 @@ def _repair_citation_gap(
 
 def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
     """构造给调用方的输出字典，并执行最终草稿发布边界。"""
+    from app.agent.context_builder import refresh_main_agent_context
+
+    refresh_main_agent_context(state)
     output_status = derive_result_status(state)
     quality_gate = state.get("quality_gate") or {}
     draft_is_public = (
@@ -1101,8 +1097,22 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
                 public_related_work = public_answer
             if public_introduction:
                 public_introduction = public_answer
+    if state.get("result_status") in {"waiting_user", "blocked", "failed", "cancelled"}:
+        public_body, public_related_work, public_introduction = "", None, None
+        if state.get("result_status") == "waiting_user":
+            public_answer = (state.get("clarification") or {}).get("question") or "请补充研究要求。"
+        else:
+            from app.agent.public_errors import public_stop_reason
+            base = {
+                "blocked": "当前研究未满足交付要求。",
+                "failed": "研究执行失败，未交付正文。",
+                "cancelled": "研究已取消，未交付正文。",
+            }[state["result_status"]]
+            reason = public_stop_reason(state.get("errors") or [])
+            public_answer = base + ("原因：" + reason + "。" if reason else "")
     output = {
         "status": output_status,
+        "clarification": state.get("clarification"),
         "answer": public_answer,
         "body": public_body,
         # 类型稳定为标量：始终取主交付物（首个），无交付物时为 None；
@@ -1140,6 +1150,7 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
         "core_deliverables": state.get("core_deliverables", []),
         "user_paper_profile": state.get("user_paper_profile"),
         "search_report": state.get("search_report"),
+        "search_result_quality": state.get("search_result_quality"),
         "theme_synthesis": state.get("theme_synthesis", []),
         "deliverable_readiness": state.get("deliverable_readiness", []),
         "writing_plans": state.get("writing_plans", []),
@@ -1188,14 +1199,14 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
             "user_query", "intent", "topic", "canonical_topic", "keywords", "core_keywords", "expanded_keywords", "keyword_batches", "scope_search_queries", "scope_query_roles", "required_concepts",
             "start_year", "end_year", "max_papers",
             "required_reference_count", "retrieval_target", "generation_limit",
-            "max_papers_explicit",
+            "max_papers_explicit", "year_range_explicit", "strict_year_range",
             "evidence_pool_target", "evidence_yield",
             "requested_sections", "language", "citation_style", "workflow",
-            "core_deliverables", "user_paper_profile", "search_report",
+            "core_deliverables", "user_paper_profile", "search_report", "search_result_quality",
             "research_request", "research_plan", "research_semantic_frame", "search_branches",
             "topic_interpretations", "selected_scope", "screening_protocol", "screening_report",
             "candidate_papers", "ranked_papers", "searched_keywords", "searched_query_windows",
-            "source_diagnostics", "paper_details", "paper_cards", "pdf_paths",
+            "source_diagnostics", "paper_details", "paper_cards", "pdf_paths", "parsed_papers",
             "clusters", "dynamic_taxonomy",
             "taxonomy_validation", "taxonomy_remediation", "theme_synthesis", "deliverable_readiness",
             "writing_plans", "citation_allocation_plan", "citation_allocation_plans", "deliverable_validation",
@@ -1211,6 +1222,14 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
             "existing_limitations", "verified_results", "target_length",
             "unsupported_task_guard",
             "state_schema_version",
+            "main_agent_context", "main_context_snapshot",
+            "main_context_artifact_ref", "context_snapshot_version",
+            "agent_task_results",
+            "agent_orchestration_mode", "agent_operation_mode", "state_revision",
+            "agent_mandatory_actions",
+            "agent_execution_budget", "result_status", "clarification", "user_clarifications",
+            "main_agent_decisions", "main_agent_rejections", "autonomous_verified_fingerprint",
+            "session_id", "user_operation_sequence", "artifact_manifest",
             "generation_readiness", "quality_gate", "generation_blocked",
             "quality_recovery_attempts",
             "recovery_action_count", "quality_recovery_history",
@@ -1256,6 +1275,13 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
 
 def derive_result_status(state: Dict[str, Any]) -> str:
     """从实际执行状态集中推导公开结果状态，避免各入口各自误判。"""
+    terminal = state.get("result_status")
+    if terminal == "waiting_user":
+        return "needs_clarification"
+    if terminal == "partial":
+        return "partial"
+    if terminal in {"cancelled", "failed", "blocked"}:
+        return terminal
     if state.get("planning_failed"):
         return "failed"
     if state.get("search_failed") and not state.get("candidate_papers"):
@@ -1306,6 +1332,7 @@ def _restore_explicit_constraint_markers(state: ResearchAgentState) -> None:
                 state[key] = request[key]
 
 
+@research_budget
 def continue_research_agent(
     research_state: Dict[str, Any],
     should_cancel: Callable[[], bool] | None = None,
@@ -1335,99 +1362,27 @@ def continue_research_agent(
     # 上一轮的失效授权会残留进 writer（见 _GENERATION_PRODUCT_KEYS 注释）。
     _reset_generation_products(state)
 
-    settings = get_settings()
-    total = 13 + (2 if settings.enable_pdf_pipeline else 0)
-    step_idx = 0
-    _checkpoint(state, "incremental_search", step_idx, total, should_cancel, progress_callback)
-    _search_rank_with_refinement(
+    normalize_orchestration_mode(state)
+    state["agent_operation_mode"] = "incremental"
+    from app.agent.generation_recovery import active_focus_recovery_targets
+
+    if active_focus_recovery_targets(state):
+        # WHY: 质量恢复阶梯已决定执行重点补检索；主 Agent 的路线检索动作
+        # 不生成重点查询。先履行已选定动作，再交回主 Agent 决策。
+        _run_search_subagent(
+            state,
+            objective="针对缺失的用户研究重点执行增量检索与重新排序",
+            llm=_role_llm(_get_llm(), "search"),
+            should_cancel=should_cancel,
+            progress_callback=progress_callback,
+            total_steps=max(1, int(get_settings().agent_main_max_rounds)),
+        )
+    return _run_autonomous_pipeline(
         state,
-        llm=_get_llm(),
         should_cancel=should_cancel,
         progress_callback=progress_callback,
-        total_steps=total,
     )
-    # 检索闭环内部使用 1-3 号进度位；后续从 4 继续，保持进度单调。
-    step_idx = 4
-    if state.get("search_failed") and not state.get("candidate_papers"):
-        state["answer"] = (
-            "## 增量检索失败\n\n新增检索范围的数据源均未返回结果；"
-            "已保存的前轮论文和证据未被删除。"
-        )
-        return _build_output(state)
 
-    _checkpoint(state, "incremental_fetch_detail", step_idx, total, should_cancel, progress_callback)
-    fetch_detail_node(state, should_cancel=should_cancel)
-    step_idx += 1
-
-    if settings.enable_pdf_pipeline:
-        _checkpoint(state, "incremental_download_pdf", step_idx, total, should_cancel, progress_callback)
-        download_pdf_node(state, should_cancel=should_cancel)
-        step_idx += 1
-        if should_parse_pdf(state):
-            _checkpoint(state, "incremental_parse_pdf", step_idx, total, should_cancel, progress_callback)
-            parse_pdf_node(state, should_cancel=should_cancel)
-            step_idx += 1
-
-    _checkpoint(state, "incremental_extract_cards", step_idx, total, should_cancel, progress_callback)
-    card_llm = _get_llm() if settings.enable_llm_card_extraction else None
-    extract_card_node(state, llm=card_llm, should_cancel=should_cancel)
-    step_idx += 1
-
-    if {"research_status", "related_work", "narrative_review"}.intersection(
-        state.get("core_deliverables") or []
-    ):
-        _checkpoint(state, "revalidate_routes", step_idx, total, should_cancel, progress_callback)
-        route_llm = _get_llm()
-        validate_routes_node(state, llm=route_llm)
-        if state.get("provisional_framework") and settings.enable_evidence_recovery:
-            _run_route_evidence_recovery(state, should_cancel=should_cancel)
-        if not any(
-            route.get("paper_ids") for route in (state.get("validated_routes") or [])
-        ):
-            cluster_llm = route_llm if settings.enable_llm_clustering else None
-            cluster_node(state, llm=cluster_llm)
-        step_idx += 1
-
-    if (
-        any(route.get("paper_ids") for route in (state.get("validated_routes") or []))
-        or state.get("dynamic_taxonomy")
-    ):
-        _checkpoint(state, "claim_plan", step_idx, total, should_cancel, progress_callback)
-        claim_plan_node(state, llm=_get_llm())
-        _run_claim_evidence_gate(state)
-        step_idx += 1
-
-    # 增量恢复后重新评估综述级证据充分性（覆盖前轮结果）。
-    # 排在 claim_plan 之后：门禁的主张强度指标读 claim_plans。
-    if state.get("paper_details") and settings.enable_global_evidence_gate:
-        _checkpoint(state, "global_evidence_gate", step_idx, total, should_cancel, progress_callback)
-        global_evidence_gate_node(state)
-        step_idx += 1
-
-    _checkpoint(state, "regenerate_content", step_idx, total, should_cancel, progress_callback)
-    _generate_deliverables_or_block(state, should_cancel=should_cancel)
-    step_idx += 1
-
-    def _advance_verification(stage: str) -> None:
-        nonlocal step_idx
-        # 增量路径此前不为对齐步骤单独报进度，保持既有进度分母不变。
-        if stage == "claim_alignment":
-            return
-        _checkpoint(state, stage, step_idx, total, should_cancel, progress_callback)
-        step_idx += 1
-
-    _verify_generated_draft(state, checkpoint=_advance_verification)
-    _checkpoint(state, "final_answer", step_idx, total, should_cancel, progress_callback)
-    final_answer_node(state)
-    if state.get("active_quality_recovery"):
-        from app.agent.generation_recovery import complete_recovery_action
-
-        complete_recovery_action(state)
-    state.pop("incremental_retrieval", None)
-    state.pop("incremental_search_window", None)
-    if progress_callback:
-        progress_callback("completed", total, total)
-    return _build_output(state)
 
 
 def _build_literature_matrix(state: ResearchAgentState) -> List[Dict[str, Any]]:
@@ -1452,6 +1407,7 @@ def _build_literature_matrix(state: ResearchAgentState) -> List[Dict[str, Any]]:
     ]
 
 
+@research_budget
 def regenerate_research_agent(
     research_state: Dict[str, Any],
     should_cancel: Callable[[], bool] | None = None,
@@ -1476,125 +1432,17 @@ def regenerate_research_agent(
     state["errors"] = []
     _restore_explicit_constraint_markers(state)
     verification_only_recovery = bool(state.pop("verification_only_recovery", False))
-    if verification_only_recovery:
-        # WHY: 语义核验未完成不说明正文或证据错误。保留正文、写作计划与引用
-        # 映射，只重跑统一验证链；成功缓存继续复用，遗漏项会重新请求验证。
-        total = 3
-        _checkpoint(state, "verify_claims", 0, total, should_cancel, progress_callback)
-        _verify_generated_draft(state)
-        _checkpoint(state, "final_answer", 2, total, should_cancel, progress_callback)
-        final_answer_node(state)
-        if state.get("active_quality_recovery"):
-            from app.agent.generation_recovery import complete_recovery_action
-
-            complete_recovery_action(state)
-        state.pop("target_section_ids", None)
-        state.pop("target_claim_ids", None)
-        if progress_callback:
-            progress_callback("completed", total, total)
-        return _build_output(state)
-    recovery_llm_calls_before = None
-    try:
-        from app.core.metrics import get_metrics_collector
-        recovery_llm_calls_before = get_metrics_collector().get_token_report().get("total_calls", 0)
-    except Exception:
-        recovery_llm_calls_before = None
-    recovery_plan = _build_regeneration_recovery_plan(state)
-    previous_generation_state = dict(state)
-    previous_generation_snapshot = _snapshot_generation_products(state)
-    reusable_products = {
-        key: state.get(key)
-        for key in (
-            "theme_synthesis", "claim_plans", "claim_evidence_gate",
-            "global_evidence_gate",
-        )
-        if state.get(key) is not None
-    }
-    # 与 run/continue 共用同一清理清单：旧版列表缺 claim_plans/writing_plans、
-    # related_work/introduction 等，上一轮产物会残留进输出与 writer。
-    _reset_generation_products(state)
-    state["target_section_ids"] = list(recovery_plan.get("target_section_ids") or [])
-    if recovery_plan["reuse_claim_plans"]:
-        # WHY: 这里仅复用同一证据池上的授权计划；写作计划、引用分配、正文和
-        # 验证结果仍全部重建。证据池编辑或检索缺口会落入 full_rebuild。
-        state.update(reusable_products)
-    total = 5
-
-    refreshed_existing_evidence = bool(state.pop("refresh_existing_evidence", False))
-    if refreshed_existing_evidence:
-        # WHY: 元数据/证据刷新只重新获取当前论文，不执行检索或改变范围；随后
-        # 路线、主张和全部写作验证仍按刷新后的证据重建。
-        refresh_papers = list(
-            state.get("paper_details") or state.get("candidate_papers") or []
-        )
-        state["candidate_papers"] = refresh_papers
-        state["ranked_papers"] = refresh_papers
-        _checkpoint(
-            state, "refresh_existing_evidence", 0, total,
-            should_cancel, progress_callback,
-        )
-        fetch_detail_node(state, should_cancel=should_cancel)
-        card_llm = _get_llm() if get_settings().enable_llm_card_extraction else None
-        extract_card_node(state, llm=card_llm, should_cancel=should_cancel)
-
-    append_step(
-        state,
-        "regeneration_recovery_plan",
-        "success",
-        input_data={"blocking_issue_codes": recovery_plan["issue_codes"]},
-        output_data=recovery_plan,
-        duration_ms=0,
+    normalize_orchestration_mode(state)
+    state["agent_operation_mode"] = (
+        "verification_only" if verification_only_recovery else "regeneration"
     )
-
-    _checkpoint(state, "rebuild_routes", 0, total, should_cancel, progress_callback)
-    if not recovery_plan["reuse_routes"] and {"research_status", "related_work", "narrative_review"}.intersection(
-        state.get("core_deliverables") or []
-    ):
-        route_llm = _get_llm()
-        validate_routes_node(state, llm=route_llm)
-        if not any(
-            route.get("paper_ids") for route in (state.get("validated_routes") or [])
-        ):
-            cluster_llm = route_llm if get_settings().enable_llm_clustering else None
-            cluster_node(state, llm=cluster_llm)
-    papers = state.get("paper_details") or []
-    if not papers:
-        raise ValueError("删除后没有剩余论文，无法重新生成")
-
-    if not recovery_plan["reuse_claim_plans"] and (
-        any(route.get("paper_ids") for route in (state.get("validated_routes") or []))
-        or state.get("dynamic_taxonomy")
-    ):
-        claim_plan_node(state, llm=_get_llm())
-        _run_claim_evidence_gate(state)
-
-    # 基于编辑后的论文池重新评估综述级证据充分性（覆盖前轮结果）。
-    # 排在 claim_plan 之后：门禁的主张强度指标读 claim_plans。
-    if (
-        state.get("paper_details")
-        and get_settings().enable_global_evidence_gate
-        and not recovery_plan["reuse_global_evidence_gate"]
-    ):
-        global_evidence_gate_node(state)
-
-    _checkpoint(state, "regenerate_content", 1, total, should_cancel, progress_callback)
-    _generate_deliverables_or_block(state, should_cancel=should_cancel)
-
-    # 重生成入口的步骤位固定（总步数恒为 5），因此按阶段名查表而不是递增。
-    _REGENERATION_STEP_INDEX = {"verify_claims": 2, "citation_check": 3}
-
-    def _mark_verification(stage: str) -> None:
-        index = _REGENERATION_STEP_INDEX.get(stage)
-        if index is None:
-            return
-        _checkpoint(state, stage, index, total, should_cancel, progress_callback)
-
-    _verify_generated_draft(
-        state,
-        checkpoint=_mark_verification,
-        # 局部重写只重算受影响主张，其余句子由上一轮报告与指纹缓存复用。
-        verify_claims_kwargs=(
-            {
+    local_verification = None
+    if not verification_only_recovery:
+        recovery_plan = _prepare_autonomous_regeneration(
+            state, should_cancel=should_cancel, progress_callback=progress_callback,
+        )
+        if recovery_plan["mode"] == "local_rewrite":
+            local_verification = {
                 "target_sentence_indices": recovery_plan["target_sentence_indices"],
                 "target_claim_ids": recovery_plan["target_claim_ids"],
                 "verification_scope": {
@@ -1602,48 +1450,33 @@ def regenerate_research_agent(
                     "previous_report": recovery_plan["previous_claim_verification"],
                 },
             }
-            if recovery_plan["mode"] == "local_rewrite"
-            else None
-        ),
-    )
-    _checkpoint(state, "final_answer", 4, total, should_cancel, progress_callback)
-    final_answer_node(state)
-    if (
-        previous_generation_snapshot
-        and previous_generation_state.get("review")
-        and not refreshed_existing_evidence
-    ):
-        from app.agent.generation_recovery import candidate_is_not_worse
-
-        if not candidate_is_not_worse(previous_generation_state, state):
-            for key in _GENERATION_PRODUCT_KEYS:
-                state.pop(key, None)
-            state.update(previous_generation_snapshot)
-            state.setdefault("recovery_candidate_rejections", []).append({
-                "writing_version": state.get("writing_version"),
-                "reason": "候选版本新增硬错误或完整质量向量退化",
-            })
-            final_answer_node(state)
-    if state.get("active_quality_recovery"):
-        from app.agent.generation_recovery import complete_recovery_action
-
-        complete_recovery_action(state)
-    state.pop("target_section_ids", None)
-    state.pop("target_claim_ids", None)
-    state.pop("force_claim_plan_rebuild", None)
-    state.pop("force_taxonomy_remediation", None)
-    state.pop("force_section_rewrite", None)
-    _record_recovery_statistics(
+        if (state.get("active_quality_recovery") or state.get("best_effort_generation")
+                or state.get("force_taxonomy_remediation")):
+            # WHY: 质量恢复阶梯或用户已选定重写/最佳努力，主 Agent 不能先
+            # 报告终止而跳过该动作。必做步骤仍由同一 MainAgentLoop 的注册
+            # 动作、任务权限、预算和提交版本校验执行。
+            mandatory: list[dict[str, Any]] = []
+            if recovery_plan["mode"] == "full_rebuild" and state.get("paper_cards"):
+                if state.get("force_taxonomy_remediation"):
+                    # WHY: 用户已选“重新分类”时旧分类已被清除，必须先真实运行
+                    # cluster_papers；模型直接结束会让本轮修复成为空动作。
+                    mandatory.append({"action": "cluster_papers"})
+                elif {"research_status", "related_work", "narrative_review"}.intersection(
+                    state.get("core_deliverables") or []
+                ):
+                    mandatory.append({"action": "validate_routes"})
+                mandatory.append({"action": "plan_claims"})
+            if state.get("claim_plans") or any(item["action"] == "plan_claims" for item in mandatory):
+                targets = list(state.get("target_section_ids") or [])
+                if recovery_plan["mode"] == "local_rewrite" and targets and state.get("writing_plans") and state.get("review"):
+                    mandatory.append({"action": "rewrite_sections", "arguments": {"section_ids": targets}})
+                else:
+                    mandatory.append({"action": "generate_deliverables"})
+            if mandatory:
+                state["agent_mandatory_actions"] = mandatory
+    return _run_autonomous_pipeline(
         state,
-        reused_claims=(
-            sum(int(plan.get("total_claims") or 0) for plan in (state.get("claim_plans") or []))
-            if recovery_plan["reuse_claim_plans"] else 0
-        ),
-        recomputed_claims=0 if recovery_plan["reuse_claim_plans"] else sum(
-            int(plan.get("total_claims") or 0) for plan in (state.get("claim_plans") or [])
-        ),
-        llm_calls_before=recovery_llm_calls_before,
+        should_cancel=should_cancel,
+        progress_callback=progress_callback,
+        local_verification=local_verification,
     )
-    if progress_callback:
-        progress_callback("completed", total, total)
-    return _build_output(state)

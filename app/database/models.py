@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List
 
-from sqlalchemy import DateTime, Integer, String, Text
+from sqlalchemy import DateTime, Integer, String, Text, Float, Boolean, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from app.core.logger import get_logger
@@ -128,6 +128,21 @@ class ResearchSessionModel(Base):
     )
 
 
+class ResearchArtifactModel(Base):
+    """会话范围内可寻址的研究资料和上下文快照。"""
+
+    __tablename__ = "research_artifacts"
+
+    artifact_id: Mapped[str] = mapped_column(String(64), primary_key=True, index=True)
+    session_id: Mapped[str] = mapped_column(String(128), index=True)
+    artifact_type: Mapped[str] = mapped_column(String(64), index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    provenance_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class ResearchJobModel(Base):
     """后台研究任务及其可取消执行状态。"""
 
@@ -150,3 +165,63 @@ class ResearchJobModel(Base):
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
     )
+
+
+class ResearchRuntimeModel(Base):
+    """执行租约、当前检查点和消耗；与公开会话快照分离。"""
+    __tablename__ = "research_runtime"
+    session_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, default=0)
+    owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_until: Mapped[float] = mapped_column(Float, default=0)
+    cancelled: Mapped[bool] = mapped_column(Boolean, default=False)
+    budget_json: Mapped[str] = mapped_column(Text, default="{}")
+    state_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class ResearchTaskModel(Base):
+    __tablename__ = "research_tasks"
+    __table_args__ = (UniqueConstraint("session_id", "idempotency_key"),)
+    task_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(128), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    operation: Mapped[str] = mapped_column(String(64))
+    expected_version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(32), default="running")
+    result_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class ResearchAttemptModel(Base):
+    __tablename__ = "research_attempts"
+    attempt_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(128), index=True)
+    task_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="running")
+    reserved_tokens: Mapped[int] = mapped_column(Integer)
+    usage_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class ResearchCheckpointModel(Base):
+    __tablename__ = "research_checkpoints"
+    session_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    state_json: Mapped[str] = mapped_column(Text)
+    task_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class ResearchEventModel(Base):
+    __tablename__ = "research_events"
+    __table_args__ = (UniqueConstraint("session_id", "event_key"),)
+    event_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(String(128), index=True)
+    event_key: Mapped[str] = mapped_column(String(128))
+    event_type: Mapped[str] = mapped_column(String(64))
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class ResearchMemoryModel(Base):
+    __tablename__ = "research_memory_cursors"
+    session_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    cursor: Mapped[int] = mapped_column(Integer, default=0)
+    summary_json: Mapped[str] = mapped_column(Text, default="{}")
+    summary_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)

@@ -3,6 +3,43 @@
 The workflow is implemented by app/agent/graph.py::run_research_agent and the
 stage nodes under app/agent/nodes/.
 
+The graph supplies node adapters to the single autonomous scheduler. The main Agent receives a five-field context
+view (`goal`, `state`, `key_evidence`, `decisions`, and `open_questions`) and proposes
+one registered action per round. Search, evidence extraction, and writing execute
+through versioned Search/Analysis/Writing Agent task contracts on isolated input
+projections. Each operation has explicit read/write allowlists and typed patch checks.
+The underlying nodes and all quality gates remain the same. A stale task
+fingerprint or state version prevents an old specialist result from being committed
+after scope or evidence changes.
+
+New and resumed sessions use autonomous orchestration. Persisted `legacy` or absent
+mode markers from older sessions are normalized before execution. A main-Agent clarification
+pauses as `needs_clarification`, persists the question, and resumes the same evidence
+pool with updated user constraints. Deterministic verification controls publication;
+failed/cancelled/waiting runs do not publish a body. See
+[context architecture](agent-context-architecture.md) for artifact storage, budget
+accounting and compatibility boundaries; see the
+[validation report](validation/2026-09-22-runtime-cache.md) for the successful real
+commit/recovery smoke and the budget-blocked 40-reference scenario.
+
+Quality recovery and best-effort requests can preselect a short list of registered
+actions. The same main loop executes them before requesting a fresh model decision;
+unfinished actions remain in the checkpoint. A full rebuild discards the old draft
+and its citation authorization before writing against changed evidence. A local
+rewrite retains the old draft only while its evidence and claim authorization match.
+
+Conversation-service execution persists a lease and cumulative budget. Successful
+actions atomically commit their result, artifacts and checkpoint through database CAS;
+cancelled or stale results cannot overwrite newer state. Real provider attempts retain
+their charges independently of task success. Display history is archived before
+truncation, and summaries advance by event cursor.
+
+An explicit `resume_from_checkpoint=true` request resumes an interrupted session from
+its last committed research state, preserving hard constraints and cumulative usage.
+Uncertain external requests are not automatically replayed; crash takeover waits for
+lease expiry. This is separate from answering clarification or revising a completed
+review. See [runtime boundaries](agent-runtime-and-cache.md) for the API and migration.
+
 ## Stages
 
 1. **Capability guard**: unsupported_task_guard rejects tasks outside the four
@@ -85,8 +122,11 @@ enough to release a draft. If the user specified existing evidence only, no
 retrieval action is executed.
 
 Each section checkpoint stores text, writing version, local validation state, and an
-input fingerprint that covers its plan, allocation, evidence content/access, and
-screening state. During local recovery, matching validated sections bypass the LLM
+input fingerprint that covers its plan, allocation, evidence content/access, screening,
+actual authorized card projection, deterministic draft, claim constraints, topic/scope/
+focus, citation policy and cross-route synthesis obligation. The authorized survey list
+is included because every section receives it; unrelated global papers do not invalidate
+all sections merely by changing the global snapshot. During local recovery, matching validated sections bypass the LLM
 section writer and only failed sections are generated. The merged document always
 runs the complete claim, citation, metadata, structure, and final-integrity chain
 again. Checkpoint text and quarantined drafts remain private until the final gate

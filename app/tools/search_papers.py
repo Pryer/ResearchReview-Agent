@@ -10,6 +10,7 @@ import math
 import re
 from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from app.agent.execution_budget import submit_with_context
 from typing import Any, Callable, List, Optional
 
 import requests
@@ -237,7 +238,7 @@ def search_papers(
         future_to_meta = {}
         for source, fn, sort_by, quota in valid_tasks:
             task_key = f"{source}:{sort_by}"
-            future = executor.submit(_invoke_client, fn, query, start_year, end_year, quota, sort_by)
+            future = submit_with_context(executor, _invoke_client, fn, query, start_year, end_year, quota, sort_by)
             future_to_meta[future] = (source, sort_by, task_key)
 
         for future in as_completed(future_to_meta):
@@ -441,4 +442,3 @@ def _search_cnki(
     if cleaned_query != str(query or "").strip():
         logger.info("[cnki] generic suffix stripped: %s -> %s", query, cleaned_query)
     return search_cnki(cleaned_query, start_year, end_year, max_results)
-
