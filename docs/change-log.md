@@ -3,6 +3,14 @@
 This file is an append-only record of completed Agent changes. Each entry records
 what changed and how it was validated; it is not a replacement for Git history.
 
+## 2026-09-30 17:30:00 +08:00
+
+- **Modified files:** `README.md`, `README.en.md`, `docs/change-log.md`
+- **Root cause/reason:** 项目只有中文 README，英文使用者没有可直接选择的文档入口。
+- **Behavior change:** 保留 `README.md` 为中文默认文档，新增完整英文 `README.en.md`，两份 README 顶部互相提供语言切换链接；英文版覆盖安装、启动、API、测试、配置、架构与合规说明。
+- **Tests/validation:** 两份 README 的本地 Markdown 链接检查通过；`git diff --check` 通过（仅有 Windows 换行符提示）。
+- **Known limitations:** 两份文档不会自动同步；新增配置或 API 时需要同时更新中英文版本。
+
 ## 2026-09-30 16:30:57 +08:00
 
 - **Modified files:** `.env`, `docs/change-log.md`
