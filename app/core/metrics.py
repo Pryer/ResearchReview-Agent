@@ -49,6 +49,10 @@ class MetricsCollector:
             }
         )
         self._llm_durations: Deque[int] = deque(maxlen=self._max_samples)
+        self._reasoning_by_operation: Dict[str, Dict[str, int]] = defaultdict(
+            lambda: {"sent_enabled": 0, "sent_disabled": 0, "sent_unknown": 0,
+                     "reasoning_tokens_reported": 0, "reasoning_tokens_total": 0}
+        )
 
     def record_step(
         self,
@@ -87,6 +91,8 @@ class MetricsCollector:
         provider: str = "",
         prompt_cache_hit_tokens: int = 0,
         prompt_cache_miss_tokens: int = 0,
+        reasoning_sent: bool | None = None,
+        reasoning_tokens: int | None = None,
     ) -> None:
         """记录一次 LLM 调用的 Token 使用情况与耗时。
 
@@ -125,6 +131,15 @@ class MetricsCollector:
             o_stat["cache_hit_tokens"] += cache_hit_tokens
             o_stat["cache_miss_tokens"] += cache_miss_tokens
             o_stat["calls"] += 1
+            reasoning_stat = self._reasoning_by_operation[op_key]
+            mode_key = (
+                "sent_unknown" if reasoning_sent is None
+                else "sent_enabled" if reasoning_sent else "sent_disabled"
+            )
+            reasoning_stat[mode_key] += 1
+            if reasoning_tokens is not None:
+                reasoning_stat["reasoning_tokens_reported"] += 1
+                reasoning_stat["reasoning_tokens_total"] += max(0, int(reasoning_tokens))
 
     def get_token_report(self) -> Dict[str, Any]:
         """获取 Token 消耗明细快照。"""
@@ -147,6 +162,7 @@ class MetricsCollector:
                 "avg_llm_duration_ms": round(statistics.mean(durations), 1) if durations else None,
                 "by_model": {k: dict(v) for k, v in self._llm_usage_by_model.items()},
                 "by_operation": {k: dict(v) for k, v in self._llm_usage_by_operation.items()},
+                "reasoning_by_operation": {k: dict(v) for k, v in self._reasoning_by_operation.items()},
             }
 
     def get_report(self) -> Dict[str, Any]:
@@ -220,6 +236,7 @@ class MetricsCollector:
             self._cache_miss_tokens_total = 0
             self._llm_usage_by_model.clear()
             self._llm_usage_by_operation.clear()
+            self._reasoning_by_operation.clear()
             self._llm_durations.clear()
 
 

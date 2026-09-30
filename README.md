@@ -286,6 +286,7 @@ ResearchReview-Agent/
 | `LLM_BASE_URL` | API 地址 | DeepSeek |
 | `LLM_MODEL` | 模型名称 | `deepseek-v4-flash` |
 | `LLM_THINKING_ENABLED` | DeepSeek V4 思考模式；关闭时显式发送 `thinking.type=disabled` | `false` |
+| `LLM_REASONING_MODE` | `static` 遵守全局思考开关，写作不额外开启；`auto` 按操作选择思考模式，适用于普通补全和主 Agent 工具决策 | `static` |
 | `LLM_THINKING_EFFORT` | 最终写作开启思考时的推理强度 | `low` |
 | `LLM_THINKING_MAX_TOKENS` | 最终思考写作的单次输出预算 | `32768` |
 | `LLM_MAX_TOKENS` | 最终成文输出预算 | `8192` |
@@ -294,26 +295,35 @@ ResearchReview-Agent/
 | `LLM_FAILOVER_TOTAL_TIMEOUT` | 单个逻辑请求跨主/备用模型的总超时（秒） | `180` |
 | `AGENT_MAIN_MAX_ROUNDS` | 单次主 Agent 循环最大决策轮数 | `24` |
 | `AGENT_EXECUTION_ACTION_BUDGET` | 会话累计专业动作预留上限 | `64` |
-| `AGENT_MAIN_TOKEN_BUDGET` | 主决策、解析、专业任务、重试及备用共享累计 token 上限 | `1000000` |
+| `AGENT_MAIN_TOKEN_BUDGET` | 主决策、解析、专业任务、重试及备用共享累计 token 上限 | `10000000` |
 | `AGENT_RETRIEVAL_BUDGET` | 累计检索轮次上限 | `64` |
+| `RETRIEVAL_RANKING_MODE` | `rules`、`hybrid_shadow` 或 `hybrid`；已有会话沿用其检索 profile | `rules` |
+| `DASHSCOPE_API_KEY` | hybrid 使用的独立百炼密钥 | 空 |
+| `RETRIEVAL_EMBEDDING_MODEL` / `RETRIEVAL_RERANK_MODEL` | 专用向量及相关性重排模型 | `qwen3.7-text-embedding` / `qwen3.7-text-rerank` |
+| `RETRIEVAL_EMBEDDING_URL` / `RETRIEVAL_RERANK_URL` | 百炼工作空间原生 HTTPS 端点 | 空 |
 | `AGENT_EXECUTION_DEADLINE_SECONDS` | 当前执行期限及执行租约时长（秒） | `1800` |
 | `DATABASE_URL` | 数据库地址 | SQLite |
 | `SEMANTIC_SCHOLAR_API_KEY` | S2 可选密钥 | 空 |
 | `APP_API_KEY` | 共享部署时保护业务接口的可选密钥 | 空（仅建议本地） |
 | `CORS_ALLOWED_ORIGINS` | 允许访问API的前端来源，逗号分隔 | 本机8501端口 |
 | `RECOVERY_TOTAL_ACTION_BUDGET` | 路线补证、结构修复、引用重分配和章节重写共享的任务级动作预算 | `6` |
-| `ENABLE_REFERENCE_COVERAGE_BEST_EFFORT_RELEASE` | 恢复预算耗尽且仅剩引用篇数缺口时，是否允许发布明确标注的部分完成草稿 | `true` |
-| `REFERENCE_COVERAGE_BEST_EFFORT_RATIO` | 上述部分完成草稿所需的最低有效引用覆盖率；原始篇数要求不会被改写 | `0.85` |
+| `ENABLE_REFERENCE_COVERAGE_BEST_EFFORT_RELEASE` | 仅剩篇数缺口且已授权论文和最终有效引用达到比例时，允许生成并发布明确标注的部分完成草稿 | `true` |
+| `REFERENCE_COVERAGE_BEST_EFFORT_RATIO` | 部分完成草稿的最低有效引用覆盖率；原始篇数要求不会被改写 | `0.85` |
 | `ENABLE_RECOVERY_EXHAUSTED_BEST_EFFORT_GENERATION` | 有界恢复耗尽后，是否基于当前可用证据执行一次最终草稿生成并以 `partial` 发布 | `true` |
 | `ROUTE_SECTION_MIN_PLAIN_CHARS` | 正式研究路线小节的最低正文字符数；章节引用下限仍由 WritingPlan 单独给出 | `80` |
+
+使用 hybrid 前执行 `python -m pip install -r requirements-retrieval.txt`，并在本地 `.env` 中配置密钥与两个端点。注意真实环境变量的优先级高于 `.env`：若终端里残留旧的 `DASHSCOPE_API_KEY`（如曾 `$env:DASHSCOPE_API_KEY=...` 赋值），请求会带旧密钥并返回 `403 Endpoint.AccessDenied`；启动前用 `Remove-Item Env:DASHSCOPE_API_KEY -ErrorAction SilentlyContinue` 清除，或重开终端/重启服务进程。候选论文使用标题、摘要和关键词构建 BM25 与 dense 检索视图，再用 RRF 融合和专用 reranker 排序。分数只决定筛选顺序；现有 LLM 逐篇确认研究范围和交付物资格，详情变化时重新核验。向量与专用重排分数缓存在 `data/retrieval_cache/`，可重建。`hybrid_shadow` 会调用远程模型并产生费用，但研究输出仍走规则模式。
 
 写作门禁失败后，系统会依据实际缺口在预算内自动重算状态、重建主张授权、
 调整引用或只重写失败章节。只有缺少访问条件、用户材料，或必须改变显式范围/
 篇数约束时才请求用户决定；“仅用现有证据”会禁止自动补检索。
 语义主张核验未完成时，系统会保留正文并只重试核验，不重新检索或整篇改写；
 报告会分别显示证据不支持数量与尚未完成核验数量。
+例如要求 40 篇时，至少 34 篇去重、相关、可核验且获主张授权的论文可进入正文写作；
+最终正文也须实际有效引用至少 34 篇，并通过其他质量检查，才以 `partial` 发布。
+40 篇仍是正式完成要求；不必等恢复预算耗尽才发布这份部分完成草稿。
 有界恢复耗尽且仍有可归属证据时，默认再生成一次明确标注限制的 `partial`
-草稿。API 调用方可在 `AgentRequest` 顶层传入
+草稿；显式篇数要求低于上述 85% 时不会自动生成或发布。API 调用方可在 `AgentRequest` 顶层传入
 `"best_effort_on_failure": false` 保持严格阻断；该开关不会降低原始篇数、
 时间或主题要求。blocked 会话可直接输入“生成可用草稿”复用已保存证据。
 

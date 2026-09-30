@@ -47,6 +47,20 @@ def _target() -> SemanticItem:
     )
 
 
+def test_system_suggested_focus_is_not_promoted_to_user_requirement():
+    from app.agent.semantic_consistency import ground_semantic_frame
+
+    frame = ResearchSemanticFrame(
+        canonical_topic="课堂行为分析",
+        required_focuses=["课堂行为编码与分析", "智能技术自动识别"],
+    )
+    grounded = ground_semantic_frame(
+        frame, "教育技术视角下的课堂行为编码与分析",
+    )
+    assert grounded.required_focuses == ["课堂行为编码与分析"]
+    assert "dropped_ungrounded_focus:智能技术自动识别" in grounded.validation_issues
+
+
 def test_requirement_provenance_is_derived_from_grounded_source_entities():
     frame = ResearchSemanticFrame(
         canonical_topic="研究主题",
@@ -559,7 +573,8 @@ def test_temporal_shell_requirement_dropped_by_entity_mapping_not_verb_list():
         "method:action_recognition"
     ]
     assert "近五年文献梳理证据" not in frame.required_focuses
-    assert frame.required_focuses == ["少样本学习", "动作识别"]
+    assert frame.required_focuses == ["动作识别"]
+    assert "dropped_ungrounded_focus:少样本学习" in frame.validation_issues
 
     # few_shot_learning 方法无原文依据被 grounding 移除后，其 requirement
     # 随源实体一并清理，不再留下匹配不到论文的孤儿假门禁

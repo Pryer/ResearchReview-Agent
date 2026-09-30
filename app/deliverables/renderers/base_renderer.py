@@ -8,9 +8,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from app.agent.execution import AgentCancelledError
 from app.agent.execution_budget import (
-    AgentBudgetExceeded,
+    is_control_exception,
     submit_with_context,
 )
 from app.core.citation_syntax import (
@@ -183,18 +182,16 @@ def _write_sections_in_chinese(
                     temperature=0.05,
                     # 统一使用 LLM_MAX_TOKENS，避免章节级小预算导致正文截断。
                     retry_empty=True,
-                    thinking_enabled=True,
                     operation=(
                         f"write_section:{plan.deliverable_type.value}:"
                         f"{section.id}:attempt_{attempt + 1}"
                     ),
                 )
                 attempts_made = attempt + 1
-            except (AgentBudgetExceeded, AgentCancelledError):
-                # WHY: 预算耗尽与取消属于执行边界；当作可重试的模型失败会在章节
-                # 内部静默重试三次，再把取消伪装成正文降级。
-                raise
             except Exception as exc:
+                # WHY: 包括裸账本冲突在内的执行停止不能进入章节重试或旧文回退。
+                if is_control_exception(exc):
+                    raise
                 last_errors = [f"模型调用失败：{exc}"]
                 continue
             candidate = _strip_agent_process_clauses(
@@ -239,7 +236,6 @@ def _write_sections_in_chinese(
                     localized_prompt,
                     temperature=0.0,
                     retry_empty=True,
-                    thinking_enabled=True,
                     operation=(
                         f"repair_english_fragments:{plan.deliverable_type.value}:"
                         f"{section.id}"
@@ -281,9 +277,9 @@ def _write_sections_in_chinese(
                     best_candidate = localized
                     best_score = localized_score
                     last_errors = localized_errors
-            except (AgentBudgetExceeded, AgentCancelledError):
-                raise
             except Exception as exc:
+                if is_control_exception(exc):
+                    raise
                 last_errors = [*last_errors, f"英文残留局部修复失败：{exc}"]
         if _is_safe_partial_section(
             best_candidate, section.title, required_ids, section.heading_level or 2
@@ -331,11 +327,9 @@ def _write_sections_in_chinese(
             section_id = futures[future]
             try:
                 result_id, text, diagnostic = future.result()
-            except (AgentBudgetExceeded, AgentCancelledError):
-                # WHY: 取消与预算边界必须穿透章节 fallback，否则会被记为降级
-                # 并继续合成正文。
-                raise
             except Exception as exc:
+                if is_control_exception(exc):
+                    raise
                 result_id = section_id
                 text = sections[section_id]
                 diagnostic = {
@@ -1722,7 +1716,6 @@ class BaseRenderer:
                     writer_prompt,
                     temperature=0.1,
                     operation=f"write_deliverable:{plan.deliverable_type.value}",
-                    thinking_enabled=True,
                 )
                 llm_responded = bool(text)
                 if text and all(_section_heading(section) in text for section in plan.sections):
@@ -1766,7 +1759,6 @@ class BaseRenderer:
                         repair_prompt,
                         temperature=0.05,
                         operation=f"repair_deliverable:{plan.deliverable_type.value}",
-                        thinking_enabled=True,
                     )
                     llm_responded = llm_responded or bool(repaired)
                     if repaired and all(
@@ -1813,7 +1805,6 @@ class BaseRenderer:
                         polish_prompt,
                         temperature=0.05,
                         operation=f"polish_fallback:{plan.deliverable_type.value}",
-                        thinking_enabled=True,
                     )
                     if polished and all(
                         _section_heading(section) in polished for section in plan.sections

@@ -9,6 +9,32 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 
+class ResearchQuerySourceAnchor(BaseModel):
+    role: str
+    turn: str
+    text: str
+
+
+class ResearchQueryConstraint(BaseModel):
+    field: str
+    value: Any
+    source_turn: str
+    source_text: str
+
+
+class ResearchQueryRewrite(BaseModel):
+    rewritten_query: str
+    source: str
+    source_anchors: list[ResearchQuerySourceAnchor]
+    preserved_constraints: list[ResearchQueryConstraint] = Field(default_factory=list)
+    suggested_expansions: list[str] = Field(default_factory=list)
+    unresolved_ambiguities: list[str] = Field(default_factory=list)
+    input_fingerprint: str
+    version: int = 1
+    attempts: int = 0
+    validation_issues: list[str] = Field(default_factory=list)
+
+
 class TurnType(str, Enum):
     NEW_REQUEST = "new_request"
     MODIFICATION = "modification"

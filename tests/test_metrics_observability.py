@@ -85,6 +85,23 @@ def test_cache_hit_rate_is_none_when_provider_reports_no_cache_fields():
     assert report["total_cache_miss_tokens"] == 0
 
 
+def test_reasoning_observation_distinguishes_unknown_from_zero_tokens():
+    collector = MetricsCollector()
+    collector.record_llm_call(
+        model="deepseek-v4-flash", prompt_tokens=100, completion_tokens=30,
+        operation="main_agent_decision", reasoning_sent=True, reasoning_tokens=12,
+    )
+    collector.record_llm_call(
+        model="other", prompt_tokens=100, completion_tokens=20,
+        operation="main_agent_decision", reasoning_sent=None, reasoning_tokens=None,
+    )
+    observed = collector.get_token_report()["reasoning_by_operation"]["main_agent_decision"]
+    assert observed["sent_enabled"] == 1
+    assert observed["sent_unknown"] == 1
+    assert observed["reasoning_tokens_reported"] == 1
+    assert observed["reasoning_tokens_total"] == 12
+
+
 def test_reset_clears_cache_token_totals():
     """reset 必须一并清空缓存累计，否则全局单例会跨测试/跨会话串味。"""
     collector = MetricsCollector()

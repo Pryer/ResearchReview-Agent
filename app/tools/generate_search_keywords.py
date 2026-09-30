@@ -314,7 +314,6 @@ def generate_search_keywords(
             prompt,
             temperature=0.0,
             retry_empty=True,
-            thinking_enabled=False,
             operation="generate_search_keywords",
         )
 

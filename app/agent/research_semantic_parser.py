@@ -32,6 +32,7 @@ def parse_research_semantics(
     topic: str,
     deliverables: Iterable[str] | None = None,
     llm=None,
+    grounding_query: str | None = None,
 ) -> ResearchSemanticFrame:
     """调用 LLM 解析语义；失败时不猜测领域、对象或方法。"""
     deliverables = list(deliverables or [])
@@ -70,9 +71,10 @@ def parse_research_semantics(
 
     from app.agent.semantic_consistency import ground_semantic_frame, validate_semantic_relations
 
+    authority = grounding_query if grounding_query is not None else user_query
     frame = _clamp_ungrounded_minimums(
-        _drop_orphan_requirements(ground_semantic_frame(frame, user_query)),
-        user_query,
+        _drop_orphan_requirements(ground_semantic_frame(frame, authority)),
+        authority,
     )
     frame = derive_research_semantics(frame)
     return validate_semantic_relations(frame)

@@ -186,10 +186,12 @@ def _finish_job(job: dict) -> None:
     elif status == "cancelled":
         add_message(session_id, "assistant", "⏹ 任务已取消，后续步骤未再执行。")
     else:
+        from app.agent.public_errors import public_result_failure_reason
+        reason = job.get("error") or public_result_failure_reason(job.get("result"))
         add_message(
             session_id,
             "assistant",
-            f"❌ 任务失败：{job.get('error') or '未知错误'}",
+            f"❌ 任务失败：{reason}",
         )
     st.session_state.active_job = None
 

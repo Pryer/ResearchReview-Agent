@@ -111,6 +111,8 @@ class Settings(BaseSettings):
     # DeepSeek V4 是混合推理模型且默认开启思考。综述写作需要稳定产出正文，
     # 因此默认显式关闭 thinking，避免输出预算被 reasoning_content 消耗。
     llm_thinking_enabled: bool = False
+    # auto 根据操作复杂度决定思考模式；static 保持调用方和全局开关现有语义。
+    llm_reasoning_mode: Literal["static", "auto"] = "static"
     # 最终正文单次覆盖为 thinking=True 时使用低强度推理，并直接提供足够
     # 的 completion 预算，避免先以 8K 把 token 全耗在 reasoning 后再重试。
     llm_thinking_effort: Literal["low", "high", "max"] = "low"
@@ -141,7 +143,7 @@ class Settings(BaseSettings):
     agent_execution_action_budget: int = 64
     agent_main_max_rounds: int = 24
     agent_main_no_progress_limit: int = 3
-    agent_main_token_budget: int = 1000000
+    agent_main_token_budget: int = 10000000
     agent_retrieval_budget: int = 64
     agent_execution_deadline_seconds: int = 1800
     # 备用 LLM 提供商：主用失败后自动切换，各 120s。
@@ -234,6 +236,28 @@ class Settings(BaseSettings):
     rerank_candidate_min: int = 60
     rerank_candidate_max: int = 120
     rerank_batch_size: int = 12
+    # 旧会话无 profile 时沿用 rules；新会话可显式选择 hybrid/shadow。
+    retrieval_ranking_mode: Literal["rules", "hybrid_shadow", "hybrid"] = "rules"
+    retrieval_provider: str = "dashscope"
+    dashscope_api_key: str = ""
+    retrieval_embedding_model: str = "qwen3.7-text-embedding"
+    retrieval_embedding_url: str = ""
+    retrieval_embedding_dimension: int = Field(default=1024, ge=1)
+    retrieval_embedding_batch_size: int = Field(default=20, ge=1, le=20)
+    retrieval_rerank_model: str = "qwen3.7-text-rerank"
+    retrieval_rerank_url: str = ""
+    retrieval_rerank_batch_size: int = Field(default=32, ge=1)
+    retrieval_request_timeout: float = Field(default=60, gt=0)
+    retrieval_max_retries: int = Field(default=2, ge=0, le=5)
+    retrieval_model_request_limit: int = Field(default=128, ge=1)
+    retrieval_query_max: int = Field(default=6, ge=1)
+    retrieval_bm25_top_k: int = Field(default=80, ge=1)
+    retrieval_dense_top_k: int = Field(default=80, ge=1)
+    retrieval_rrf_k: int = Field(default=60, ge=1)
+    retrieval_cross_encoder_initial_k: int = Field(default=120, ge=1)
+    retrieval_cross_encoder_max_k: int = Field(default=240, ge=1)
+    retrieval_cache_dir: str = "./data/retrieval_cache"
+    retrieval_cache_version: str = "v1"
     search_source_max_workers: int = 4
     # 关键词级并发派发限额（与源级并发叠加时注意 API 限速）。
     search_keyword_max_workers: int = 4
@@ -278,8 +302,8 @@ class Settings(BaseSettings):
     evidence_recovery_scope_gap_ratio: float = 0.75
     # 路线补证与写作恢复共同消耗此预算，避免两层循环分别重置次数。
     recovery_total_action_budget: int = 6
-    # 自动恢复耗尽后，若唯一硬缺口只是有效引用篇数，可发布明确标注的
-    # best-effort 草稿；原始篇数约束仍保留，结果状态为 partial。
+    # 已授权证据及最终有效引用达到此比例且仅剩篇数缺口时，可生成/发布
+    # 明确标注的 partial 草稿；原始篇数约束仍保留。
     enable_reference_coverage_best_effort_release: bool = True
     reference_coverage_best_effort_ratio: float = 0.85
     # 所有有界恢复动作耗尽后，允许基于当前可用证据执行一次最终草稿生成。

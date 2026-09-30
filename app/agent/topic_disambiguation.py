@@ -276,6 +276,16 @@ def resolve_scope_conversational(
                 for scope_id in (data.get("matched_scope_ids") or [])
                 if str(scope_id) in valid
             ]
+            custom_scope = str(data.get("custom_scope") or "").strip()
+            if custom_scope and not data.get("needs_clarification"):
+                return {
+                    "selected_scope": {
+                        "scope_id": "user_clarification", "label": custom_scope,
+                        "description": "", "include_terms": [],
+                        "exclude_terms": [], "seed_queries": [],
+                    },
+                    "needs_clarification": False, "question": None,
+                }
             if matched_ids and not data.get("needs_clarification"):
                 selected_scopes = [valid[scope_id] for scope_id in matched_ids]
                 selected = (

@@ -18,6 +18,7 @@ from app.agent.context_builder import (
 from app.agent.execution_budget import (
     AgentBudgetExceeded,
     AgentExecutionCancelled,
+    AgentExecutionStale,
     commit_action,
     reserve_action,
     check_execution,
@@ -75,6 +76,13 @@ class AgentController:
         should_cancel: Callable[[], bool] | None = None,
         consume_mandatory_action: bool = False,
     ) -> AgentTaskResult:
+        if operation in {"rewrite_sections", "generate_deliverables"}:
+            from app.agent.generation_recovery import rewrite_attempt_exhausted
+
+            # WHY: 直接调用 Controller 同样受恢复限制，在创建任务、预留预算和
+            # 幂等缓存复用前拦截；不能仅靠可用动作列表约束模型决策。
+            if rewrite_attempt_exhausted(state):
+                raise ValueError("rewrite attempts exhausted for current research input")
         if consume_mandatory_action:
             pending = list(state.get("agent_mandatory_actions") or [])
             if not pending or pending[0].get("action") != operation:
@@ -222,7 +230,13 @@ class AgentController:
             refresh_main_agent_context(state)
             return result
         except (AgentBudgetExceeded, AgentExecutionCancelled) as exc:
-            terminal = "blocked" if isinstance(exc, AgentBudgetExceeded) else "cancelled"
+            # WHY: 租约失效复用取消透传，但任务账本状态记 stale（非用户取消）。
+            if isinstance(exc, AgentExecutionStale):
+                terminal = "stale"
+            elif isinstance(exc, AgentBudgetExceeded):
+                terminal = "blocked"
+            else:
+                terminal = "cancelled"
             if runtime:
                 runtime.fail_task(task.task_id, terminal, state.get("agent_execution_budget") or {})
             _update_plan_status(state, operation, "failed")

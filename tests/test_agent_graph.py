@@ -338,7 +338,6 @@ def test_plan_logs_explicit_multistage_task_chain_and_required_focuses():
         "教师与学生行为自动识别",
         "自动行为编码",
         "S-T分析法或滞后序列分析法",
-        "教学结构与师生互动解释",
     ]
 
 
@@ -1806,7 +1805,7 @@ def test_selected_best_effort_generation_cannot_be_skipped_by_main_agent(monkeyp
     assert result["status"] == "partial"
     assert result["body"] == "有限证据的草稿。"
     assert [item["action"] for item in result["research_state"]["main_agent_decisions"]] == [
-        "plan_claims", "generate_deliverables", "request_finish",
+        "plan_claims", "generate_deliverables",
     ]
     assert result["quality_gate"]["passed"] is False
 
@@ -1863,7 +1862,8 @@ def test_selected_taxonomy_repair_runs_clustering_before_claims_and_writing(monk
     ]
 
 
-def test_verification_only_recovery_preserves_draft_and_skips_writer(monkeypatch):
+@pytest.mark.parametrize("has_previous_report", [False, True])
+def test_verification_only_recovery_preserves_draft_and_skips_writer(monkeypatch, has_previous_report):
     from app.agent.graph import regenerate_research_agent
 
     calls = []
@@ -1872,8 +1872,11 @@ def test_verification_only_recovery_preserves_draft_and_skips_writer(monkeypatch
     def unexpected_generate(*args, **kwargs):
         raise AssertionError("verification-only recovery must not regenerate text")
 
+    received_kwargs = []
+
     def fake_verify(state, **kwargs):
         calls.append("verify")
+        received_kwargs.append(kwargs)
         state["claim_verification"] = {"unsupported": 0, "unverified": 0}
         state["generation_quality"] = {"passed": True, "support_rate": 1.0}
 
@@ -1893,6 +1896,12 @@ def test_verification_only_recovery_preserves_draft_and_skips_writer(monkeypatch
         "writing_plans": [{"sections": [{"id": "theme_a", "title": "研究现状"}]}],
         "paper_cards": [_paper(paper_id="p1")],
         "verification_only_recovery": True,
+        "agent_mandatory_actions": [{"action": "targeted_search"}],
+        "target_claim_ids": ["c001"],
+        "claim_verification": (
+            {"claims": [{"claim_id": "c001", "sentence": "保留的当前正文[p1]。"}]}
+            if has_previous_report else {}
+        ),
         "steps": [],
         "errors": [],
     }
@@ -1902,6 +1911,13 @@ def test_verification_only_recovery_preserves_draft_and_skips_writer(monkeypatch
     assert calls == ["verify", "final"]
     assert result["answer"] == state["review"]
     assert result["research_state"].get("verification_only_recovery") is None
+    assert not result["research_state"].get("agent_mandatory_actions")
+    if has_previous_report:
+        assert received_kwargs[0]["verify_claims_kwargs"]["target_claim_ids"] == ["c001"]
+        assert received_kwargs[0]["verify_claims_kwargs"]["target_sentence_indices"] == [1]
+        assert received_kwargs[0]["verify_claims_kwargs"]["verification_scope"]["mode"] == "local"
+    else:
+        assert "verify_claims_kwargs" not in received_kwargs[0]
 
 
 def test_local_rewrite_targets_derive_from_repairs_ccc_and_section_diagnostics():

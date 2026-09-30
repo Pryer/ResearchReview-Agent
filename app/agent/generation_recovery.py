@@ -185,6 +185,15 @@ def input_fingerprint(state: dict[str, Any]) -> str:
         ),
         "scope": state.get("selected_scope") or {},
         "semantic_frame": state.get("research_semantic_frame") or {},
+        # WHY: 相同论文池上的新正文与引用映射需要重新验证，不能复用旧稿的无进展记录。
+        "review": (
+            state.get("citation_source_text")
+            if state.get("citation_source_text")
+            and (state.get("review") or state.get("related_work") or state.get("introduction")) == state.get("citation_rendered_text")
+            else state.get("review") or state.get("related_work") or state.get("introduction") or ""
+        ),
+        "citation_map": state.get("citation_map") or {},
+        "claim_plans": state.get("claim_plans") or [],
         "required_reference_count": _ints(state.get("required_reference_count")),
         "allow_evidence_expansion": state.get("allow_evidence_expansion", True),
     }
@@ -266,7 +275,10 @@ def diagnose_generation_issues(state: dict[str, Any]) -> list[GenerationRecovery
 def _missing_allocation_sections(state: dict[str, Any]) -> list[str]:
     from app.core.citation_syntax import extract_citation_ids
 
-    cited = set(extract_citation_ids(str(state.get("review") or "")))
+    text = str(state.get("review") or "")
+    if text == state.get("citation_rendered_text") and state.get("citation_source_text"):
+        text = str(state["citation_source_text"])
+    cited = set(extract_citation_ids(text))
     section_ids: list[str] = []
     for allocation in state.get("citation_allocation_plans") or []:
         for section in allocation.get("sections") or []:
@@ -277,12 +289,108 @@ def _missing_allocation_sections(state: dict[str, Any]) -> list[str]:
 
 
 def _used_actions_for_same_input(state: dict[str, Any], fingerprint: str) -> list[str]:
-    return [
+    used = [
         str(item.get("action") or "")
         for item in state.get("quality_recovery_history") or []
         if str(item.get("input_fingerprint") or "") == fingerprint
-        and str(item.get("outcome") or "") in {"started", "no_progress", "failed"}
+        and str(item.get("outcome") or "") in {"no_progress", "failed"}
     ]
+    if any(
+        item.get("operation") in {"rewrite_sections", "generate_deliverables"}
+        and item.get("input_fingerprint") == fingerprint
+        for item in state.get("recovery_candidate_rejections") or []
+    ):
+        used.append(RecoveryAction.REWRITE_SECTIONS.value)
+    return used
+
+
+def draft_has_unsafe_quality(state: dict[str, Any], issues=None) -> bool:
+    """降级授权不能放行未经核验、无支持或引用不一致的事实正文。"""
+    codes = {str(item.get("code") or "") for item in (
+        issues if issues is not None else (state.get("quality_gate") or {}).get("blocking_issues") or []
+    )}
+    hard = {"claim_verification_incomplete", "claim_evidence_quality_not_met",
+            "citation_verification_incomplete", "citation_scope_not_met",
+            "citation_metadata_not_verified", "claim_citation_consistency_not_met",
+            "invalid_citations", "final_text_integrity_not_met", "deliverable_structure_invalid",
+            "section_generation_failed"}
+    quality = state.get("generation_quality") or {}
+    claims = state.get("claim_verification") or {}
+    return bool(codes & hard or any(int(value or 0) > 0 for value in (
+        quality.get("unsupported_claims"), quality.get("unverified_claims"),
+        claims.get("unsupported"), claims.get("unverified"),
+    )))
+
+
+def rewrite_attempt_exhausted(state: dict[str, Any]) -> bool:
+    """生成与章节改写共用持久化的同输入无效写作限制。"""
+    # WHY: task 幂等键含决策措辞，不能替代恢复资格；改变 objective 或重启
+    # 不会让相同正文/证据/授权重新获得已拒绝的重写机会。
+    return RecoveryAction.REWRITE_SECTIONS.value in _used_actions_for_same_input(state, input_fingerprint(state))
+
+
+def reverify_eligible_claim_ids(state: dict[str, Any]) -> list[str]:
+    """返回真正可能靠重验补齐语义判定的主张 ID。
+
+    WHY: 只有"满足验证前提（有引用且有证据片段）但 provider 未返回有效判定"
+    的 not_completed 主张才可能被重验补齐。无引用/引用无效/缺片段/访问不足的
+    结构性失败重验永远 submitted=0，必须在直接执行入口排除，否则恢复链会反复
+    跑空重验、烧预算却不减少未完成数。
+    """
+    report = state.get("claim_verification") or {}
+    eligible: list[str] = []
+    from app.tools.verify_claims import has_semantic_verification_evidence
+
+    for claim in report.get("claims") or []:
+        if not isinstance(claim, dict):
+            continue
+        if claim.get("verification_status") != "not_completed":
+            continue
+        if not has_semantic_verification_evidence(claim):
+            continue
+        claim_id = str(claim.get("claim_id") or "")
+        if claim_id:
+            eligible.append(claim_id)
+    return list(dict.fromkeys(eligible))
+
+
+def has_reverify_eligible_claims(state: dict[str, Any]) -> bool:
+    """判断是否存在可靠重验补齐的主张，用于避免调度空重验。
+
+    WHY: 有逐句报告时按 not_completed 且有引用且有证据片段精确判定（旧会话里
+    结构性失败曾被误记 not_completed，这里据实排除）；没有逐句报告时信任
+    claim_verification_incomplete 码——结构性失败改判 verified 后，该码只在
+    确有语义待验主张时才产生。
+    """
+    claims = (state.get("claim_verification") or {}).get("claims")
+    if not (isinstance(claims, list) and claims):
+        return True
+    return bool(reverify_eligible_claim_ids(state))
+
+
+def reverify_ineligible_claim_ids(state: dict[str, Any]) -> set[str]:
+    """返回报告中明确不可重验的主张 ID：已核验完成，或缺引用/缺片段的结构性失败。
+
+    WHY: 直接执行入口据此过滤重验目标，避免把永远 submitted=0 的结构性主张
+    送进重验。状态字段缺失（旧数据或诊断派生目标）时不在此列，交由验证器按
+    当前证据自行判定，防止误删合法目标。
+    """
+    report = state.get("claim_verification") or {}
+    ineligible: set[str] = set()
+    from app.tools.verify_claims import has_semantic_verification_evidence
+
+    for claim in report.get("claims") or []:
+        if not isinstance(claim, dict):
+            continue
+        claim_id = str(claim.get("claim_id") or "")
+        if not claim_id:
+            continue
+        status = claim.get("verification_status")
+        if status == "verified":
+            ineligible.add(claim_id)
+        elif status == "not_completed" and not has_semantic_verification_evidence(claim):
+            ineligible.add(claim_id)
+    return ineligible
 
 
 def decide_generation_recovery(
@@ -356,12 +464,13 @@ def decide_generation_recovery(
     elif codes & _INTERNAL_STATE_CODES:
         action = RecoveryAction.RECOMPUTE_STATE
         reason = "重算与当前证据版本不一致的派生状态"
-    elif codes & _VERIFICATION_CODES and RecoveryAction.REVERIFY_CLAIMS.value not in used:
+    elif (
+        codes & _VERIFICATION_CODES
+        and RecoveryAction.REVERIFY_CLAIMS.value not in used
+        and has_reverify_eligible_claims(state)
+    ):
         action = RecoveryAction.REVERIFY_CLAIMS
         reason = "保留当前正文与已完成判定，仅重试未完成的语义主张验证"
-    elif codes & _VERIFICATION_CODES:
-        action = RecoveryAction.DEGRADE
-        reason = "相同正文与证据上的语义主张重验未取得进展"
     elif codes & _STRUCTURE_CODES and RecoveryAction.REBUILD_STRUCTURE.value not in used:
         action = RecoveryAction.REBUILD_STRUCTURE
         reason = "基于现有证据重建无效或碎片化的研究结构"
@@ -444,6 +553,9 @@ def decide_generation_recovery(
         else:
             action = RecoveryAction.REQUEST_USER_INPUT
             reason = "现有证据内的写作修复已无可验证进展"
+    elif codes & _VERIFICATION_CODES:
+        action = RecoveryAction.DEGRADE
+        reason = "相同正文与证据上的语义主张重验未取得进展，且无其他可执行修复"
     elif search_viable and RecoveryAction.TARGETED_SEARCH.value not in used:
         action = RecoveryAction.TARGETED_SEARCH
         reason = "未知质量问题先按原始范围补足可验证证据"
@@ -484,6 +596,7 @@ def start_recovery_action(
     decision: GenerationRecoveryDecision,
 ) -> dict[str, Any]:
     from app.agent.execution_budget import reserve_recovery
+    from app.agent.graph import _draft_fingerprint
     reserve_recovery(state)
     entry = GenerationRecoveryHistoryEntry(
         action=decision.action,
@@ -492,6 +605,7 @@ def start_recovery_action(
         target_section_ids=decision.target_section_ids,
         progress_before=decision.progress,
         input_fingerprint=input_fingerprint(state),
+        verification_fingerprint_before=_draft_fingerprint(state),
     ).model_dump(mode="json")
     state.setdefault("quality_recovery_history", []).append(entry)
     state["recovery_action_count"] = recovery_action_count(state) + 1
@@ -505,6 +619,39 @@ def complete_recovery_action(state: dict[str, Any]) -> None:
         return
     entry = history[-1]
     before = RecoveryProgressVector.model_validate(entry.get("progress_before") or {})
+    verified = False
+    gate = state.get("quality_gate") or {}
+    phase = gate.get("phase")
+    changed_input = input_fingerprint(state) != entry.get("input_fingerprint")
+    readiness_codes = {"minimum_references_not_met", "minimum_planned_references_not_met",
+                       "required_focus_evidence_not_met"}
+    frame = state.get("research_semantic_frame") or {}
+    can_recheck_focus = ("required_focus_evidence_not_met" not in before.hard_issue_codes
+                         or bool(frame.get("evidence_requirements") or frame.get("required_focuses")))
+    if (changed_input and phase == "pre_generation" and state.get("core_deliverables")
+            and state.get("paper_cards") is not None
+            and set(before.hard_issue_codes) <= readiness_codes and can_recheck_focus):
+        from app.agent.deliverable_router import check_generation_readiness
+
+        # WHY: 写作前缺口由当前卡片和主张重新计算；旧 gate 被清空不算复验。
+        readiness = check_generation_readiness(state)
+        state["generation_readiness"] = readiness.model_dump(mode="json")
+        state["quality_gate"] = {**gate, "passed": False,
+                                 "blocking_issues": readiness.blocking_issues}
+        verified = True
+    elif phase != "pre_generation" and gate:
+        from app.agent.graph import _draft_fingerprint
+
+        # WHY: 纯重验不改变恢复输入，但新判定会改变正文验证版本。旧报告重放
+        # 或仅清空 gate 都不能证明本次复验；旧历史没有版本时仍沿用 changed_input。
+        previous_verification = entry.get("verification_fingerprint_before")
+        fresh_verification = (
+            _draft_fingerprint(state) != previous_verification
+            if previous_verification else changed_input
+        )
+        verified = bool(state.get("autonomous_verified_fingerprint")
+                        and state["autonomous_verified_fingerprint"] == _draft_fingerprint(state)
+                        and fresh_verification)
     after = quality_progress_vector(state)
     before_tuple = (
         before.missing_required_sections, before.unsupported_claims,
@@ -526,13 +673,16 @@ def complete_recovery_action(state: dict[str, Any]) -> None:
     # WHY: 重点缺口等硬问题没有独立数值维度；代码消失本身就是可验证进展。
     # 新增其他硬问题不能被引用数等改善抵消。
     non_worse = all(new <= old for old, new in zip(before_tuple, after_tuple)) and new_codes <= old_codes
-    improved = non_worse and (
+    improved = verified and non_worse and (
         any(new < old for old, new in zip(before_tuple, after_tuple))
         or bool(old_codes - new_codes)
     )
     entry["outcome"] = "improved" if improved else "no_progress"
     if entry["outcome"] == "no_progress":
-        entry["stop_reason"] = "恢复后完整质量向量未改善"
+        entry["stop_reason"] = (
+            "恢复后缺少当前证据版本的质量复验" if not verified
+            else "恢复后完整质量向量未改善"
+        )
     state.pop("active_quality_recovery", None)
 
 

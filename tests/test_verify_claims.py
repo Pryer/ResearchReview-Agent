@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from app.tools.extract_paper_card import extract_paper_card
 from app.tools.training_data import (
     build_controlled_training_records,
@@ -55,6 +57,75 @@ def _second_card() -> dict:
         ),
     }
     return extract_paper_card(paper, llm=None, topic="RAG hallucination").model_dump()
+
+
+def test_rendered_citations_keep_the_same_evidence_on_repeated_checks():
+    """首次出现编号不得在重验时变成证据卡片顺序。"""
+    from app.agent.nodes.verification import citation_check_node, verify_claims_node
+
+    first, second = _card(), _second_card()
+    state = {
+        "review": "## 研究现状\n\n该方法在 FEVER 数据集上达到 80% accuracy [p1]。",
+        "paper_cards": [second, first],
+        "paper_details": [second, first],
+        "writing_plans": [],
+        "citation_style": "gbt7714",
+        "required_reference_count": 1,
+        "steps": [],
+        "errors": [],
+    }
+    citation_check_node(state)
+    first_reference = state["reference_papers"][0]["paper_id"]
+    assert first_reference == "p1"
+    assert state["review"].endswith("[1]。")
+    citation_check_node(state)
+    assert state["reference_papers"][0]["paper_id"] == first_reference
+    state["writing_plans"] = [{}]
+    verify_claims_node(state, llm=None)
+    claim = next(item for item in state["claim_verification"]["claims"] if item["factual"])
+    assert claim["citations"] == ["p1"]
+    assert claim["evidence_snippets"]
+    assert "citation_not_found" not in claim["issues"]
+
+
+def test_serialized_rendered_citations_survive_card_reordering():
+    import json
+    from app.agent.nodes.verification import citation_check_node, verify_claims_node
+
+    first, second = _card(), _second_card()
+    state = {
+        "review": "## 研究现状\n\n该方法在 FEVER 数据集上达到 80% accuracy [p1]。",
+        "paper_cards": [second, first], "paper_details": [second, first],
+        "writing_plans": [], "citation_style": "gbt7714",
+        "required_reference_count": 1, "steps": [], "errors": [],
+    }
+    citation_check_node(state)
+    resumed = json.loads(json.dumps(state, ensure_ascii=False))
+    resumed["paper_cards"].reverse()
+    resumed["paper_details"].reverse()
+    citation_check_node(resumed)
+    verify_claims_node(resumed, llm=None)
+    assert resumed["reference_papers"][0]["paper_id"] == "p1"
+    assert resumed["claim_verification"]["claims"][0]["citations"] == ["p1"]
+
+
+def test_legacy_numeric_draft_without_trusted_source_fails_closed():
+    from app.agent.nodes.verification import citation_check_node, verify_claims_node
+
+    state = {
+        "review": "## 研究现状\n\n该方法达到 80% accuracy [1]。",
+        "paper_cards": [_card(), _second_card()],
+        "paper_details": [_card(), _second_card()],
+        "writing_plans": [], "citation_style": "gbt7714",
+        "required_reference_count": 1, "steps": [], "errors": [],
+        "claim_verification": {"valid": True, "supported": 1},
+    }
+    citation_check_node(state)
+    verify_claims_node(state, llm=None)
+    assert state["citation_validation"]["reason"] == "citation_identity_unverified"
+    assert state["citation_map"] == {}
+    assert state["generation_quality"]["reason"] == "citation_identity_unverified"
+    assert state["claim_verification"]["prior_report"]["supported"] == 1
 
 
 def test_numbers_from_two_papers_cannot_be_unioned_into_support():
@@ -797,3 +868,261 @@ def test_number_tokens_do_not_truncate_unit_suffixes():
     assert "2023" in _numbers("2023年提出")
     # URL/时间戳里的数字不抽出
     assert "12345" not in _numbers("https://arxiv.org/abs/2401.12345")
+
+
+def _numbered_cards(count: int) -> list[dict]:
+    """构造 count 张各自独立、含可匹配数值的证据卡，用于跨批次蕴含测试。"""
+    cards: list[dict] = []
+    for index in range(count):
+        paper = {
+            "paper_id": f"p{index}",
+            "title": f"Verification Study {index}",
+            "authors": ["Alice"],
+            "year": 2024,
+            "venue": "ACL",
+            "abstract": (
+                f"We propose method {index}. "
+                f"The method achieves {80 + index}% accuracy on the FEVER dataset."
+            ),
+        }
+        cards.append(extract_paper_card(paper, llm=None, topic="RAG").model_dump())
+    return cards
+
+
+def _numbered_text(count: int) -> str:
+    return "".join(
+        f"方法{index}在 FEVER 数据集上达到 {80 + index}% accuracy [p{index}]。"
+        for index in range(count)
+    )
+
+
+def test_entailment_control_exception_propagates_and_stops_later_batches():
+    """T01：蕴含批处理遇预算停止信号立即传播，后续批次调用数为 0。"""
+    from app.agent.execution_budget import AgentBudgetExceeded
+
+    calls = {"n": 0}
+
+    class BudgetStopLLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            calls["n"] += 1
+            raise AgentBudgetExceeded("token reservation exceeds remaining budget")
+
+    # 13 条事实主张 => 2 个批次（12 + 1）；第一批即触发停止信号。
+    with pytest.raises(AgentBudgetExceeded):
+        verify_review_claims(_numbered_text(13), _numbered_cards(13), llm=BudgetStopLLM())
+    assert calls["n"] == 1
+
+
+def test_entailment_lease_stale_signal_propagates():
+    """T01：租约失权（AgentExecutionStale）同样不得被蕴含批处理吞掉。"""
+    from app.agent.execution_budget import AgentExecutionStale
+
+    class StaleLLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            raise AgentExecutionStale("execution lease expired")
+
+    with pytest.raises(AgentExecutionStale):
+        verify_review_claims(_numbered_text(13), _numbered_cards(13), llm=StaleLLM())
+
+
+def test_entailment_ordinary_provider_failure_is_recoverable_and_recorded():
+    """T02：普通 provider 失败记为未完成、保留原因，不伪造否定判定。"""
+    from app.core.exceptions import LLMInvocationError
+
+    class TimeoutLLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            raise LLMInvocationError("LLM 调用失败: request timed out")
+
+    report = verify_review_claims(
+        "该方法在 FEVER 数据集上达到 80% accuracy [p1]。", [_card()], llm=TimeoutLLM(),
+    )
+    claim = report["claims"][0]
+    assert claim["verification_status"] == "not_completed"
+    assert "entailment_not_verified" in claim["issues"]
+    assert "claim_contradicted_by_evidence" not in claim["issues"]
+    stats = report["entailment_llm_batch_stats"]
+    assert stats["failed"] == 1
+    assert stats["claims_submitted"] == 1
+    assert stats.get("failure_reasons")
+
+
+def test_verify_claims_node_propagates_budget_stop_instead_of_degrading():
+    """T01：验证节点遇预算停止信号必须传播，不得降级成 skip_verification。"""
+    from app.agent.execution_budget import AgentBudgetExceeded
+    from app.agent.nodes.verification import verify_claims_node
+
+    class StopLLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            raise AgentBudgetExceeded("token reservation exceeds remaining budget")
+
+    state = {
+        "review": "该方法在 FEVER 数据集上达到 80% accuracy [p1]。",
+        "paper_cards": [_card()],
+        "writing_plans": [{"section": "related_work"}],
+    }
+    with pytest.raises(AgentBudgetExceeded):
+        verify_claims_node(state, llm=StopLLM())
+    # 停止信号不得被写成普通验证失败/降级标记。
+    assert not any("verify_claims" in str(e) for e in state.get("errors") or [])
+
+
+def test_uncited_structural_failure_is_verified_unsupported_not_reverify_eligible():
+    """T03：无引用主张是确定性结构失败，不再标 not_completed，也不送进蕴含。"""
+    class NoopLLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            raise AssertionError("structural failure must not be submitted for entailment")
+
+    report = verify_review_claims(
+        "该方法在 FEVER 数据集上达到 80% accuracy。",  # 无引用
+        [_card()],
+        llm=NoopLLM(),
+    )
+    claim = report["claims"][0]
+    assert claim["support_status"] == "unsupported"
+    assert claim["verification_status"] == "verified"
+    assert claim["verification_method"] == "deterministic"
+    assert "entailment_not_verified" not in claim["issues"]
+    assert report["unverified"] == 0
+    semantic = report["semantic_verification"]
+    assert semantic["structural_failures"] == 1
+    assert semantic["not_completed"] == 0
+    assert semantic["llm_claims_submitted"] == 0
+
+
+def test_mixed_batch_submits_only_semantically_verifiable_claims():
+    """T04：混合批次只提交有引用有片段的主张，结构性失败不进入蕴含请求。"""
+    import json
+    import re
+
+    submitted: list[str] = []
+
+    class RecordingLLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            match = re.search(r"待验证项目：(\[.*?\])\n", prompt, re.S)
+            payload = json.loads(match.group(1)) if match else []
+            submitted.extend(str(item["claim_id"]) for item in payload)
+            return json.dumps({"results": [
+                {"claim_id": item["claim_id"], "label": "entailed", "confidence": 0.95}
+                for item in payload
+            ]})
+
+    text = (
+        "该方法在 FEVER 数据集上达到 80% accuracy [p1]。"
+        "另一项方法在 SciFact 数据集上达到 95% accuracy。"  # 无引用，结构性失败
+    )
+    report = verify_review_claims(text, [_card()], llm=RecordingLLM())
+    semantic = report["semantic_verification"]
+    assert semantic["llm_claims_submitted"] == 1
+    assert semantic["structural_failures"] == 1
+    assert len(submitted) == 1 and submitted[0].startswith("c001")
+    claims = {c["claim_id"]: c for c in report["claims"]}
+    assert claims["c002"]["verification_status"] == "verified"
+    assert claims["c002"]["support_status"] == "unsupported"
+
+
+def test_cached_negative_verdict_is_reused_and_not_auto_cleared():
+    """T04：已缓存的 contradicted 判定按指纹复用，重试不自动清除也不重复提交。"""
+    import json
+    import re
+
+    calls = {"n": 0}
+
+    class ContradictLLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            calls["n"] += 1
+            payload = json.loads(re.search(r"待验证项目：(\[.*?\])\n", prompt, re.S).group(1))
+            return json.dumps({"results": [
+                {"claim_id": item["claim_id"], "label": "contradicted", "confidence": 0.9}
+                for item in payload
+            ]})
+
+    cache: dict = {}
+    text = "该方法在 FEVER 数据集上达到 80% accuracy [p1]。"
+    first = verify_review_claims(text, [_card()], llm=ContradictLLM(), entailment_cache=cache)
+    second = verify_review_claims(text, [_card()], llm=ContradictLLM(), entailment_cache=cache)
+    assert calls["n"] == 1  # 第二次复用缓存，不再提交
+    assert first["claims"][0]["support_status"] == "unsupported"
+    assert second["claims"][0]["support_status"] == "unsupported"
+    assert "claim_contradicted_by_evidence" in second["claims"][0]["issues"]
+    assert second["entailment_cache_stats"]["reused"] == 1
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_access_failure_never_requests_entailment_or_becomes_pending(legacy):
+    from app.tools.verify_claims import _verify_review_claims_legacy
+    from app.agent.generation_recovery import reverify_eligible_claim_ids
+
+    calls = []
+
+    class LLM:
+        def complete(self, *args, **kwargs):
+            calls.append(kwargs)
+            return '{"results": []}'
+
+    verifier = _verify_review_claims_legacy if legacy else verify_review_claims
+    report = verifier(
+        "消融实验表明该模块在所有基线上均贡献了性能提升 [p1]。",
+        [_card()], llm=LLM(),
+    )
+    assert calls == []
+    assert report["unverified"] == 0
+    claim = report["claims"][0]
+    assert claim["verification_status"] == "verified"
+    assert claim["verification_method"] == "deterministic"
+    assert claim["support_status"] == "unsupported"
+    assert "access_level_too_weak_for_claim" in claim["issues"]
+    assert reverify_eligible_claim_ids({"claim_verification": report}) == []
+
+
+@pytest.mark.parametrize("label", [None, "invalid"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_invalid_entailment_label_is_pending_and_not_cached(label, legacy):
+    import json
+    import re
+    from app.tools.verify_claims import _verify_review_claims_legacy
+
+    class LLM:
+        def complete(self, prompt, **kwargs):
+            payload = json.loads(re.search(r"待验证项目：(\[.*?\])\n", prompt, re.S).group(1))
+            return json.dumps({"results": [
+                dict({"claim_id": item["claim_id"], "confidence": 0.95},
+                     **({} if label is None else {"label": label}))
+                for item in payload
+            ]})
+
+    cache = {}
+    verifier = _verify_review_claims_legacy if legacy else verify_review_claims
+    kwargs = {} if legacy else {"entailment_cache": cache}
+    report = verifier(
+        "该方法在 FEVER 数据集上达到 80% accuracy [p1]。", [_card()], llm=LLM(), **kwargs,
+    )
+    claim = report["claims"][0]
+    assert claim["verification_status"] == "not_completed"
+    assert "entailment_not_verified" in claim["issues"]
+    assert "claim_not_entailed_by_evidence" not in claim["issues"]
+    assert report["unverified"] == 1
+    assert cache == {}
+    if not legacy:
+        assert report["semantic_verification"]["completed"] == 0
+        assert report["entailment_llm_batch_stats"]["failure_reasons"]
+
+
+def test_malformed_result_does_not_discard_other_valid_verdicts():
+    import json
+    import re
+
+    class LLM:
+        def complete(self, prompt, **kwargs):
+            payload = json.loads(re.search(r"待验证项目：(\[.*?\])\n", prompt, re.S).group(1))
+            return json.dumps({"results": [
+                {"claim_id": payload[0]["claim_id"], "confidence": 0.95},
+                {"claim_id": payload[1]["claim_id"], "label": "contradicted", "confidence": 0.95},
+            ]})
+    cache = {}
+    report = verify_review_claims(_numbered_text(2), _numbered_cards(2), llm=LLM(), entailment_cache=cache)
+    assert report["claims"][0]["verification_status"] == "not_completed"
+    assert report["claims"][1]["verification_status"] == "verified"
+    assert "claim_contradicted_by_evidence" in report["claims"][1]["issues"]
+    assert report["semantic_verification"]["completed"] == 1
+    assert report["semantic_verification"]["not_completed"] == 1
+    assert len(cache) == 1

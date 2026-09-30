@@ -1,0 +1,4 @@
+# Optional dependencies for RETRIEVAL_RANKING_MODE=hybrid or hybrid_shadow.
+-r requirements.txt
+jieba==0.42.1
+rank-bm25==0.2.2

@@ -1236,6 +1236,12 @@ def cluster_claims_into_theses(
         data = parse_json_object(response if isinstance(response, str) else str(response))
         theses = data.get("theses") or []
     except Exception as exc:  # noqa: BLE001
+        # WHY: 预算/取消/失权是停止信号，必须传播到执行边界；吞掉它会在已
+        # 停止的会话里继续聚类降级并触发后续覆盖补建。普通失败保留字面合并。
+        from app.agent.execution_budget import is_control_exception
+
+        if is_control_exception(exc):
+            raise
         logger.info("Claim thesis clustering skipped (%s); keeping literal merge", exc)
         return merged_claims
 
@@ -1549,6 +1555,11 @@ def _llm_refine_claims(
                 if str(ref.get("claim_text") or "").strip():
                     claims[i]["claim_text"] = str(ref["claim_text"]).strip()
     except Exception as exc:
+        # WHY: 停止信号（预算/取消/失权）必须传播；表述优化失败可降级保留原主张。
+        from app.agent.execution_budget import is_control_exception
+
+        if is_control_exception(exc):
+            raise
         logger.debug("LLM claim refinement skipped: %s", exc)
 
     return claims

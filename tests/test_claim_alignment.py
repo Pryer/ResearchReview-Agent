@@ -298,3 +298,30 @@ def test_reference_coverage_plan_adds_only_missing_evidence_backed_cards():
     )
     assert plan is not None
     assert [claim["evidence_ids"] for claim in plan["claims"]] == [["p2:e1"]]
+
+
+def test_same_authorized_paper_cited_twice_counts_once() -> None:
+    """T12/规则#10：同一论文被多句引用只计一次去重授权，不按引用次数累加。"""
+    plans = [{
+        "route_id": "R1",
+        "route_name": "路线一",
+        "claims": [{
+            "claim_id": "R1:c1",
+            "claim_text": "课堂行为编码用于分析师生互动模式",
+            "claim_type": "problem",
+            "evidence_ids": ["p1:e001"],
+            "evidence_count": 1,
+            "support_level": "single",
+            "allowed_language": "可陈述",
+        }],
+    }]
+    review = (
+        "课堂行为编码用于分析师生互动模式[1]。"
+        "课堂行为编码用于分析师生互动模式[1]。"
+    )
+
+    result = validate_claim_citation_consistency(review, plans, citation_map={"p1": 1})
+
+    # 正文出现两次引用，但去重后的有效授权论文仅 1 篇——40 篇要求按去重计。
+    assert result["validly_authorized_paper_ids"] == ["p1"]
+    assert result["inconsistent_sentences"] == 0

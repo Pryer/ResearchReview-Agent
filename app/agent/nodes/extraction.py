@@ -177,16 +177,27 @@ def extract_card_node(
     try:
         from app.tools.extract_paper_card import batch_extract_paper_cards
 
-        existing_cards = (
-            list(state.get("paper_cards") or [])
-            if state.get("incremental_retrieval") else []
-        )
+        details = list(state.get("paper_details") or [])
+        detail_by_key = {_paper_identity_key(paper): paper for paper in details
+                         if _paper_identity_key(paper)}
+        refreshed_ids = set(state.get("incremental_new_paper_ids") or [])
+        # WHY: 增量详情可能重新确认同一篇论文；旧卡的关系与交付物资格
+        # 属于上一版详情，不能仅凭 paper_id 继续复用。
+        hybrid_mode = (state.get("retrieval_profile") or {}).get("mode") == "hybrid"
+        existing_cards = [card for card in (state.get("paper_cards") or [])
+                          if state.get("incremental_retrieval")
+                          and _paper_identity_key(card) in detail_by_key
+                          and str(card.get("paper_id") or "") not in refreshed_ids
+                          and (not hybrid_mode or (
+                              card.get("relation_type") == detail_by_key[_paper_identity_key(card)].get("_topic_relation")
+                              and set(card.get("eligible_deliverables") or []) == set(
+                                  detail_by_key[_paper_identity_key(card)].get("_eligible_deliverables") or [])))]
         existing_keys = {
             _paper_identity_key(card) for card in existing_cards
             if _paper_identity_key(card)
         }
         papers_to_extract = [
-            paper for paper in (state.get("paper_details") or [])
+            paper for paper in details
             if _paper_identity_key(paper) not in existing_keys
         ]
         cards = batch_extract_paper_cards(

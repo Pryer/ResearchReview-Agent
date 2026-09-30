@@ -182,17 +182,23 @@ class ResearchArtifactService:
             return value
         stored = structured(copy.deepcopy(state))
         manifest = dict(stored.get("artifact_manifest") or {})
+        # WHY: 运行态是已 hydrate 的权威快照。字段被显式清理后，其旧
+        # manifest 若继续保留，下次 hydrate 会复活失效的主张或正文。
+        for field in (*STATE_ARTIFACT_FIELDS, "parsed_papers"):
+            if field not in stored:
+                manifest.pop(field, None)
         for field, kind in STATE_ARTIFACT_FIELDS.items():
             if field not in stored:
                 continue
             value = stored.pop(field)
             is_text = isinstance(value, str)
             shape = "text" if is_text else "list"
-            if field == "agent_task_results":
-                # WHY: 单个任务补丁可能覆盖数百篇论文，不能把完整补丁硬塞进 256 KiB 单条资料。
+            if field in {"agent_task_results", "quarantined_generation_snapshot"}:
+                # WHY: 任务补丁和隔离候选可能超过单条资料上限，统一 JSON 分片
+                # 保存；候选使用仅 service 可读的独立类型，不能混入当前任务授权。
                 self.validate_payload(value, max_bytes=8 * 1024 * 1024)
                 value = json.dumps(value, ensure_ascii=False)
-                shape = "json_list"
+                shape = "json_list" if field == "agent_task_results" else "json_object"
             values = [value[i:i + 16000] for i in range(0, len(value), 16000)] if shape != "list" else value
             if not isinstance(values, list):
                 raise ValueError(f"invalid state artifact field: {field}")
@@ -235,6 +241,8 @@ class ResearchArtifactService:
         for field, manifest in (state.get("artifact_manifest") or {}).items():
             expected_type = "document_fragment" if field == "parsed_papers" else STATE_ARTIFACT_FIELDS.get(field)
             expected_shape = "documents" if field == "parsed_papers" else "text" if field == "review" else "list"
+            if field == "quarantined_generation_snapshot":
+                expected_shape = "json_object"
             allowed_shapes = {expected_shape} | ({"json_list"} if field == "agent_task_results" else set())
             if expected_type is None or manifest.get("shape") not in allowed_shapes:
                 raise ValueError("artifact manifest field or shape is invalid")
@@ -249,10 +257,11 @@ class ResearchArtifactService:
                 for entry, text in zip(entries, values):
                     docs[entry["paper_id"]] = docs.get(entry["paper_id"], "") + text
                 hydrated[field] = {key: json.loads(value) for key, value in docs.items()}
-            elif manifest["shape"] == "json_list":
+            elif manifest["shape"] in {"json_list", "json_object"}:
                 hydrated[field] = json.loads("".join(values))
-                if not isinstance(hydrated[field], list):
-                    raise ValueError("task result fragments must restore a list")
+                expected_value_type = list if manifest["shape"] == "json_list" else dict
+                if not isinstance(hydrated[field], expected_value_type):
+                    raise ValueError("JSON fragments must restore the registered field type")
             else:
                 hydrated[field] = "".join(values) if manifest["shape"] == "text" else values
         if state.get("controlled_pdf_files"):

@@ -1,0 +1,32 @@
+{
+  "dataset_kind": "synthetic_algorithm_fixture_not_real_papers",
+  "tasks": [
+    {
+      "task_id": "synthetic_classroom",
+      "topic": "课堂师生互动研究",
+      "candidate_papers": [
+        {"paper_id": "synthetic:c1", "title": "课堂师生对话观察", "abstract": "记录课堂交流与反馈方式。", "year": 2025},
+        {"paper_id": "synthetic:c2", "title": "Teacher pupil dialogue", "abstract": "Observation of talk during lessons.", "year": 2025},
+        {"paper_id": "synthetic:c3", "title": "海洋环流模拟", "abstract": "研究近岸水流。", "year": 2025}
+      ]
+    },
+    {
+      "task_id": "synthetic_battery",
+      "topic": "锂电池回收工艺研究",
+      "candidate_papers": [
+        {"paper_id": "synthetic:b1", "title": "废旧锂电池材料回收", "abstract": "比较金属回收流程。", "year": 2025},
+        {"paper_id": "synthetic:b2", "title": "Lithium cell recycling", "abstract": "Recovery of metals from spent cells.", "year": 2025},
+        {"paper_id": "synthetic:b3", "title": "课堂互动研究", "abstract": "比较教学行为。", "year": 2025}
+      ]
+    },
+    {
+      "task_id": "synthetic_marine",
+      "topic": "海洋微塑料迁移研究",
+      "candidate_papers": [
+        {"paper_id": "synthetic:m1", "title": "海洋微塑料输运", "abstract": "分析颗粒在水体中的迁移。", "year": 2025},
+        {"paper_id": "synthetic:m2", "title": "Plastic particles in ocean currents", "abstract": "Tracking particle movement across sea water.", "year": 2025},
+        {"paper_id": "synthetic:m3", "title": "废旧电池回收", "abstract": "研究金属再利用。", "year": 2025}
+      ]
+    }
+  ]
+}

@@ -4,13 +4,52 @@ import json
 import pytest
 
 from app.agent import graph, recovery_loop
-from app.agent.action_registry import allowed_actions
+from app.agent.action_registry import allowed_actions, recovery_handoff_action
 from app.agent.context_builder import build_main_agent_context
 from app.agent.evidence_recovery import targeted_search_kind
 from app.agent.main_loop import _progress_fingerprint
 from app.agent.nodes.verification import claim_plan_node, claim_evidence_gate_node
 from app.agent.deliverable_router import check_generation_readiness
 from app.core.config import get_settings
+
+
+def test_pending_hybrid_candidates_do_not_offer_empty_fetch():
+    from app.agent.nodes.retrieval import fetch_detail_node
+
+    state = _state()
+    state.update(retrieval_profile={"mode": "hybrid"},
+                 ranked_papers=[{"paper_id": "pending", "_screening_decision": "pending_semantic_check"}],
+                 active_quality_recovery={"action": "TARGETED_SEARCH"})
+    assert "fetch_metadata" not in allowed_actions(state)
+    assert recovery_handoff_action(state) == ""
+    fetch_detail_node(state, llm=None)
+    assert state["paper_details"] == []
+    assert state["steps"][-1]["output_data"]["reason"] == "pending_semantic_admission"
+
+
+def test_admitted_recovery_candidates_force_evidence_handoff_before_more_search():
+    from app.services.retrieval_ranking_service import _document, admission_scope_fingerprint
+
+    state = _state()
+    state.update(retrieval_profile={"mode": "hybrid"},
+                 active_quality_recovery={"action": "TARGETED_SEARCH"})
+    paper = {"paper_id": "fresh", "title": "A verified study", "year": 2025,
+             "abstract": "Research methods and evidence", "_screening_decision": "include",
+             "_topic_relation": "direct", "_eligible_deliverables": ["research_background"],
+             "_semantic_conditions_confirmed": True, "_semantic_contract_complete": True,
+             "_screening_confidence": 0.95, "_pending_semantic_check": False}
+    paper["_screened_content_fingerprint"] = _document(paper).content_fingerprint
+    paper["_screened_scope_fingerprint"] = admission_scope_fingerprint(state)
+    state["ranked_papers"] = [paper]
+    assert recovery_handoff_action(state) == "fetch_metadata"
+    state["paper_details"] = [paper]
+    assert recovery_handoff_action(state) == "extract_paper_cards"
+    state["paper_cards"] = [{**_card(0), "paper_id": "fresh", "title": paper["title"]}]
+    assert recovery_handoff_action(state) == "validate_routes"
+    state["validated_routes"] = [{"route_id": "r", "paper_ids": ["fresh"]}]
+    assert recovery_handoff_action(state) == "plan_claims"
+    state["claim_plans"] = [{"claim_id": "c"}]
+    assert recovery_handoff_action(state) == ""
 
 
 def _state():
@@ -99,12 +138,35 @@ def test_exhausted_route_search_is_removed_and_direct_execution_makes_no_model_c
 
 def test_route_exhaustion_does_not_disable_unattempted_citation_repair():
     state = _state()
-    state.update(generation_blocked=False, review='已生成正文', unique_cited_paper_count=23,
+    state.update(generation_blocked=False, review='已生成正文 [p1]', unique_cited_paper_count=23,
                  candidate_papers=[{'paper_id': 'p1'}], evidence_recovery_status='EXHAUSTED')
     assert targeted_search_kind(state) == 'citation'
     assert 'targeted_search' in allowed_actions(state)
     state['citation_gap_repair_attempted'] = True
     assert 'targeted_search' not in allowed_actions(state)
+
+
+def test_blocked_draft_can_repair_real_citation_gap_without_route_gap():
+    state = _state()
+    state.update(
+        generation_blocked=True, review='已有正文 [p1]',
+        unique_cited_paper_count=23,
+        candidate_papers=[{'paper_id': 'p1'}],
+        evidence_gap_report={'needs_recovery': False, 'status': 'NOT_REQUIRED'},
+    )
+    assert targeted_search_kind(state) == 'citation'
+    state['citation_gap_repair_attempted'] = True
+    assert targeted_search_kind(state) == ''
+
+
+def test_blocking_notice_without_body_citations_cannot_start_citation_search():
+    state = _state()
+    state.update(
+        generation_blocked=True, review='当前研究未满足交付要求',
+        unique_cited_paper_count=23, candidate_papers=[{'paper_id': 'p1'}],
+        evidence_gap_report={'needs_recovery': False, 'status': 'NOT_REQUIRED'},
+    )
+    assert targeted_search_kind(state) == ''
 
 
 class Decisions:
@@ -198,3 +260,17 @@ def test_terminal_recovery_does_not_remain_started(monkeypatch, terminal):
     assert 'active_quality_recovery' not in state
     assert state['quality_recovery_history'][-1]['outcome'] != 'started'
     assert 'progress_after' in state['quality_recovery_history'][-1]
+
+
+def test_blocked_recovery_with_pending_mandatory_action_is_closed(monkeypatch):
+    from app.agent.main_loop import MainAgentLoop
+    state = _state()
+    state['active_quality_recovery'] = {'action': 'TARGETED_SEARCH'}
+    state['quality_recovery_history'] = [{'action': 'TARGETED_SEARCH', 'outcome': 'started',
+                                         'progress_before': {'valid_reference_shortfall': 40}}]
+    state['agent_mandatory_actions'] = [{'action': 'targeted_search'}]
+    monkeypatch.setattr(graph, '_get_llm', lambda: object())
+    monkeypatch.setattr(MainAgentLoop, 'run', lambda *args, **kwargs: 'blocked')
+    graph._run_autonomous_pipeline(state)
+    assert 'active_quality_recovery' not in state
+    assert state['quality_recovery_history'][-1]['outcome'] == 'failed'

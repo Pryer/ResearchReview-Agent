@@ -252,7 +252,6 @@ def check_generation_readiness(state: dict[str, Any]) -> GenerationReadinessResu
 
     from app.agent.claim_plan import claim_authorized_paper_ids
 
-    has_claim_plans = bool(state.get("claim_plans"))
     authorized_ids = claim_authorized_paper_ids(state.get("claim_plans") or [])
     authorized_ids &= eligible_ids
     # 写作计划尚未建立时，Claim Plan 是最后一个可审计的真实覆盖集合；已有
@@ -297,9 +296,12 @@ def check_generation_readiness(state: dict[str, Any]) -> GenerationReadinessResu
     elif (
         state.get("max_papers_explicit", False)
         and requested
-        and has_claim_plans
         and len(authorized_ids) < requested
     ):
+        # WHY: 写作入口不能因 claim_plans 为空（过期授权被清理或规划失败）就
+        # 绕过授权检查、继承 ready=true。本函数只在 generate_deliverables 入口
+        # 与恢复重算处调用，此时主张授权是写作的硬前提；authorized 不足一律
+        # 阻断，由恢复链回到重建主张授权（待规划阶段），而不是无授权写作。
         issues.append({
             "code": "minimum_planned_references_not_met",
             "message": (
@@ -345,4 +347,41 @@ def check_generation_readiness(state: dict[str, Any]) -> GenerationReadinessResu
         reference_coverage_stats=coverage_stats,
         blocking_issues=issues,
         recovery_options=list(dict.fromkeys(recovery)),
+    )
+
+
+def permits_reference_coverage_writing(
+    state: dict[str, Any], readiness: GenerationReadinessResult,
+) -> bool:
+    """Allow writing a partial draft when only the reference target is short."""
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    requested = int(readiness.requested_minimum_references or 0)
+    issue_codes = {
+        str(issue.get("code") or "")
+        for issue in readiness.blocking_issues
+        if isinstance(issue, dict)
+    }
+    if (
+        readiness.ready
+        or not state.get("max_papers_explicit")
+        or state.get("best_effort_on_failure") is False
+        or not settings.enable_reference_coverage_best_effort_release
+        or requested <= 0
+        or not issue_codes
+        or not issue_codes <= {
+            "minimum_references_not_met", "minimum_planned_references_not_met",
+        }
+    ):
+        return False
+    # WHY: 卡片总量不足以支撑正文；只有同一批已确认、具证据且获主张授权的
+    # 去重论文达到比例，才允许 Writer 重新制定引用计划并产出待核验草稿。
+    # 旧 allocation plan 属于上一稿，不能阻止本轮重新分配。
+    available = min(
+        int(readiness.usable_reference_count or 0),
+        int(readiness.authorized_reference_count or 0),
+    )
+    return available > 0 and available / requested >= float(
+        settings.reference_coverage_best_effort_ratio
     )

@@ -69,7 +69,7 @@ def test_new_default_entry_reaches_autonomous_loop(monkeypatch):
 
 def test_autonomous_citation_repair_passes_all_required_arguments(monkeypatch):
     current = state()
-    current.update(review="old", required_reference_count=40, unique_cited_paper_count=1,
+    current.update(review="old [p1]", required_reference_count=40, unique_cited_paper_count=1,
                    candidate_papers=[{"paper_id": "p1"}], max_papers_explicit=True)
     llm = Decisions("targeted_search", ("report_blocked", {"reason": "证据仍不足"}))
     monkeypatch.setattr(graph, "_get_llm", lambda: llm)
@@ -288,7 +288,9 @@ def test_autonomous_rewrite_rolls_back_a_worse_candidate(monkeypatch):
     current = state()
     current.update(review="原有正文", paper_cards=[{"paper_id": "p1"}],
                    claim_plans=[{"route_id": "r1"}], writing_plans=[{"section_id": "s1"}],
-                   quality_gate={"passed": True})
+                   quality_gate={"passed": True}, agent_orchestration_mode="autonomous",
+                   answer="原有正文")
+    current["autonomous_verified_fingerprint"] = graph._draft_fingerprint(current)
     llm = Decisions("generate_deliverables", "request_finish")
     monkeypatch.setattr(graph, "_get_llm", lambda: llm)
     monkeypatch.setattr(graph, "_generate_deliverables_or_block", lambda s, **kw: s.update(review="更差的正文"))
@@ -300,6 +302,138 @@ def test_autonomous_rewrite_rolls_back_a_worse_candidate(monkeypatch):
     assert output["status"] == "success"
     assert output["answer"] == "原有正文"
     assert current["recovery_candidate_rejections"]
+
+
+def test_rejected_rewrite_history_blocks_availability_and_direct_controller():
+    from app.agent.action_registry import allowed_actions
+    from app.agent.controller import AgentController
+    from app.agent.generation_recovery import input_fingerprint
+    from app.schemas.recovery_schema import RecoveryAction
+
+    current = state()
+    current.update(review="原稿", writing_plans=[{"section_id": "s1"}])
+    current["quality_recovery_history"] = [{
+        "action": RecoveryAction.REWRITE_SECTIONS.value, "outcome": "no_progress",
+        "input_fingerprint": input_fingerprint(current),
+    }]
+    assert "rewrite_sections" not in allowed_actions(current)
+    calls = []
+    with pytest.raises(ValueError, match="rewrite.*exhausted"):
+        AgentController().execute(
+            role=AgentRole.WRITING, operation="rewrite_sections", objective="重新措辞也不能重试",
+            state=current, handler=lambda working: calls.append(1),
+            constraints={"section_ids": ["s1"]},
+        )
+    assert calls == []
+    assert not current.get("agent_task_results")
+
+
+def test_autonomous_rewrite_rejection_survives_restart_and_new_objective(monkeypatch):
+    import copy
+    from app.agent.action_registry import allowed_actions
+
+    current = state()
+    current.update(review="原稿", paper_cards=[{"paper_id": "p1"}],
+                   claim_plans=[{"route_id": "r1"}], writing_plans=[{"section_id": "s1"}],
+                   quality_gate={"passed": False, "phase": "post_generation",
+                                 "blocking_issues": [{"code": "claim_evidence_quality_not_met"}]})
+    calls = []
+    monkeypatch.setattr(graph, "_get_llm", lambda: Decisions(
+        ("rewrite_sections", {"section_ids": ["s1"]}),
+        ("report_blocked", {"reason": "缺口仍存在"}),
+    ))
+    def generate(working, **kwargs):
+        calls.append(1)
+        working["review"] = "退化候选"
+    def verify(working):
+        working["quality_gate"] = {"passed": False, "phase": "post_generation", "blocking_issues": [
+            {"code": "claim_evidence_quality_not_met"},
+            *([{"code": "reference_metadata_not_met"}] if working["review"] == "退化候选" else []),
+        ]}
+    monkeypatch.setattr(graph, "_generate_deliverables_or_block", generate)
+    monkeypatch.setattr(graph, "_verify_generated_draft", verify)
+    monkeypatch.setattr(graph, "final_answer_node", lambda working: None)
+    graph._run_autonomous_pipeline(current)
+    restored = copy.deepcopy(current)
+    assert restored["review"] == "原稿"
+    assert calls == [1]
+    assert "rewrite_sections" not in allowed_actions(restored)
+    restored["paper_cards"].append({"paper_id": "p2"})
+    assert "rewrite_sections" in allowed_actions(restored)
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_direct_reverification_filters_both_claim_ids_and_sentence_indices(monkeypatch, mixed):
+    current = state()
+    current.update(review="无引用的事实句。具证据的事实句[p1]。", verification_only_recovery=True,
+                   required_reference_count=40,
+                   quality_gate={"passed": False, "phase": "post_generation", "blocking_issues": [{
+                       "code": "claim_verification_incomplete", "details": {"claim_ids": ["c001", "c002"]},
+                   }]})
+    claims = [{"claim_id": "c001", "verification_status": "verified", "support_status": "unsupported",
+               "citations": [], "evidence_snippets": [], "issues": ["factual_claim_without_citation"]}]
+    if mixed:
+        claims.append({"claim_id": "c002", "verification_status": "not_completed",
+                       "citations": ["p1"], "evidence_snippets": [{"text": "evidence"}],
+                       "issues": ["entailment_not_verified"]})
+    else:
+        current["quality_gate"]["blocking_issues"][0]["details"]["claim_ids"] = ["c001"]
+    current["claim_verification"] = {"claims": claims}
+    calls = []
+    def inspect(working, **kwargs):
+        calls.append(kwargs["local_verification"])
+        return {"status": "blocked"}
+    monkeypatch.setattr(graph, "_run_autonomous_pipeline", inspect)
+    result = graph.regenerate_research_agent(current)
+    if mixed:
+        assert calls[0]["target_claim_ids"] == ["c002"]
+        assert calls[0]["target_sentence_indices"] == [2]
+    else:
+        assert calls == []
+        assert result["status"] == "blocked"
+        assert result["research_state"]["required_reference_count"] == 40
+
+
+def test_mixed_reverification_runs_real_validator_without_releasing_structural_failure(monkeypatch):
+    import re
+    from app.tools.extract_paper_card import extract_paper_card
+    from app.tools.verify_claims import verify_review_claims
+
+    card = extract_paper_card({
+        "paper_id": "p1", "title": "Evidence Verification", "authors": ["Alice"],
+        "year": 2024, "venue": "ACL", "abstract": "The method achieves 80% accuracy on FEVER.",
+    }, llm=None).model_dump()
+    text = "另一方法在 SciFact 数据集上达到 95% accuracy。该方法在 FEVER 数据集上达到 80% accuracy [p1]。"
+    class PendingLLM:
+        def complete(self, *args, **kwargs):
+            return '{"results": []}'
+    prior = verify_review_claims(text, [card], llm=PendingLLM())
+    submitted = []
+    class VerifierLLM(Decisions):
+        def complete(self, prompt, **kwargs):
+            payload = json.loads(re.search(r"待验证项目：(\[.*?\])\n", prompt, re.S).group(1))
+            submitted.extend(item["claim_id"] for item in payload)
+            return json.dumps({"results": [
+                {"claim_id": item["claim_id"], "label": "entailed", "confidence": 0.95}
+                for item in payload
+            ]})
+    llm = VerifierLLM(("report_blocked", {"reason": "保留结构性失败门禁"}))
+    monkeypatch.setattr(graph, "_get_llm", lambda: llm)
+    monkeypatch.setattr(graph, "_generate_deliverables_or_block",
+                        lambda *args, **kwargs: pytest.fail("reverification must not call Writer"))
+    current = state()
+    current.update(review=text, paper_cards=[card], claim_verification=prior,
+                   verification_only_recovery=True,
+                   writing_plans=[{"sections": [{"id": "s1", "title": "研究背景"}]}],
+                   quality_gate={"passed": False, "phase": "post_generation", "blocking_issues": [{
+                       "code": "claim_verification_incomplete", "details": {"claim_ids": ["c001", "c002"]},
+                   }]})
+    output = graph.regenerate_research_agent(current)
+    assert len(submitted) == 1 and re.fullmatch(r"c002(?:u\d+)?", submitted[0])
+    assert output["claim_verification"]["unverified"] == 0
+    assert output["claim_verification"]["claims"][0]["support_status"] == "unsupported"
+    assert not output["quality_gate"]["passed"]
+    assert output["status"] == "blocked"
 
 
 def test_native_unsupported_falls_back_to_strict_five_field_json(monkeypatch):

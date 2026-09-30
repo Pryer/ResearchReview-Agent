@@ -21,6 +21,7 @@ ARTIFACT_TYPES = {
     "claim_plan": ArtifactSpec(frozenset({"analysis", "writing", "service"})),
     "writing_plan": ArtifactSpec(frozenset({"analysis", "writing", "service"})),
     "draft": ArtifactSpec(frozenset({"analysis", "writing", "service"})),
+    "quarantined_generation": ArtifactSpec(frozenset({"service"})),
     "task_result": ArtifactSpec(ALL),
     "evidence_bundle": ArtifactSpec(ALL),
 }
@@ -31,4 +32,5 @@ STATE_ARTIFACT_FIELDS = {
     "paper_details": "paper_metadata", "paper_cards": "paper_card",
     "claim_plans": "claim_plan", "writing_plans": "writing_plan",
     "review": "draft", "agent_task_results": "task_result",
+    "quarantined_generation_snapshot": "quarantined_generation",
 }

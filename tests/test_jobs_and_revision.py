@@ -20,6 +20,26 @@ def _db_session():
     return sessionmaker(bind=engine)()
 
 
+def test_returned_failed_result_persists_public_error_without_raw_provider_trace(monkeypatch):
+    engine = create_engine('sqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    maker = sessionmaker(bind=engine)
+    with maker() as db:
+        ResearchJobRepository(db).create('failure-job', 'failure-session', {'user_query': '测试研究'})
+        db.commit()
+    monkeypatch.setattr('app.services.research_job_service.SessionLocal', maker)
+    monkeypatch.setattr(ResearchConversationService, 'handle', lambda *args, **kwargs: {
+        'status': 'failed', 'errors': [{'code': 'LLMProviderUnavailableError', 'message': 'private provider trace'}],
+    })
+    ResearchJobService._run_job('failure-job')
+    with maker() as db:
+        job = ResearchJobRepository(db).get('failure-job')
+        assert job['status'] == 'failed'
+        assert '余额不足' in job['error']
+        assert 'private' not in job['error']
+    engine.dispose()
+
+
 def test_agent_honors_cancel_before_first_node():
     with pytest.raises(AgentCancelledError):
         run_research_agent("任意研究主题", should_cancel=lambda: True)

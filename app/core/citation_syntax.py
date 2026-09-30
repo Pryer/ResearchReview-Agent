@@ -14,6 +14,7 @@ from collections.abc import Iterable
 _ASCII_GROUP_RE = re.compile(r"\[([^\]\r\n]+)\]")
 _FULLWIDTH_GROUP_RE = re.compile(r"〔([^〕\r\n]+)〕")
 _GROUP_SPLIT_RE = re.compile(r"[;；,，、\s]+")
+_NUMBER_RANGE_RE = re.compile(r"^(\d+)[-–—~](\d+)$")
 _CODE_FENCE_LANGUAGE_RE = re.compile(
     r"\[(?:cn|zh|zh-cn|en|markdown|md)\s*$",
     re.I | re.M,
@@ -33,9 +34,34 @@ def split_citation_group(raw: str) -> list[str]:
     result: list[str] = []
     for value in _GROUP_SPLIT_RE.split(str(raw or "")):
         value = value.strip()
-        if value and value not in result:
-            result.append(value)
+        match = _NUMBER_RANGE_RE.fullmatch(value)
+        if match and 0 < int(match.group(2)) - int(match.group(1)) <= 49:
+            # WHY: 引用区间需要按实际编号展开；过长或倒序范围保留原样供门禁报告。
+            values = [str(number) for number in range(int(match.group(1)), int(match.group(2)) + 1)]
+        else:
+            values = [value]
+        for item in values:
+            if item and item not in result:
+                result.append(item)
     return result
+
+
+def resolve_numbered_citations(text: str, citation_map: dict[str, int]) -> str:
+    """用已发布的编号映射还原内部论文标识；未知编号保持原样供门禁报告。"""
+    number_to_id: dict[str, str] = {}
+    for paper_id, number in citation_map.items():
+        if not str(paper_id).strip() or not str(number).isdigit() or int(number) <= 0:
+            raise ValueError("invalid citation mapping")
+        key = str(int(number))
+        if key in number_to_id and number_to_id[key] != str(paper_id):
+            raise ValueError("conflicting citation numbers")
+        number_to_id[key] = str(paper_id)
+
+    def replace(match: re.Match[str]) -> str:
+        values = split_citation_group(match.group(1))
+        return "[" + "; ".join(number_to_id.get(value, value) for value in values) + "]"
+
+    return _ASCII_GROUP_RE.sub(replace, str(text or ""))
 
 
 def normalize_citation_syntax(

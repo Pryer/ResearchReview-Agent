@@ -1,0 +1,9 @@
+{"task_id":"synthetic_classroom","paper_id":"synthetic:c1","relevance":3,"language":"zh"}
+{"task_id":"synthetic_classroom","paper_id":"synthetic:c2","relevance":2,"language":"en"}
+{"task_id":"synthetic_classroom","paper_id":"synthetic:c3","relevance":0,"language":"zh"}
+{"task_id":"synthetic_battery","paper_id":"synthetic:b1","relevance":3,"language":"zh"}
+{"task_id":"synthetic_battery","paper_id":"synthetic:b2","relevance":2,"language":"en"}
+{"task_id":"synthetic_battery","paper_id":"synthetic:b3","relevance":0,"language":"zh"}
+{"task_id":"synthetic_marine","paper_id":"synthetic:m1","relevance":3,"language":"zh"}
+{"task_id":"synthetic_marine","paper_id":"synthetic:m2","relevance":2,"language":"en"}
+{"task_id":"synthetic_marine","paper_id":"synthetic:m3","relevance":0,"language":"zh"}

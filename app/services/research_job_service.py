@@ -11,7 +11,8 @@ from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.agent.graph import AgentCancelledError
-from app.agent.public_errors import public_stop_reason
+from app.agent.execution_budget import AgentExecutionStale
+from app.agent.public_errors import public_stop_reason, public_result_failure_reason
 from app.core.logger import get_logger
 from app.core.config import get_settings
 from app.database.db import SessionLocal
@@ -259,6 +260,8 @@ class ResearchJobService:
                     {"running"},
                     status=final_status,
                     result=result,
+                    error=public_result_failure_reason(result)
+                    if final_status == "failed" else None,
                     current_step=final_status,
                     progress_current=(
                         int(latest_job.get("progress_total") or 14)
@@ -274,6 +277,23 @@ class ResearchJobService:
                         current_step="cancelled",
                         error="任务完成前收到取消请求",
                     )
+                db.commit()
+            except AgentExecutionStale as exc:
+                # WHY: 租约失效不是用户取消：不能走 cancelled 分支（该分支
+                # 要求 runtime.cancelled=True 才写会话状态），任务应失败并
+                # 给出可诊断原因，避免前端永久显示"已取消/等待执行"。
+                db.rollback()
+                logger.warning("Research job lost execution lease: %s (%s)", job_id, exc)
+                public_error = public_stop_reason([
+                    {"code": type(exc).__name__, "message": str(exc)},
+                ])
+                repo.update_status_if_in(
+                    job_id,
+                    {"running", "cancel_requested"},
+                    status="failed",
+                    current_step="failed",
+                    error=public_error,
+                )
                 db.commit()
             except AgentCancelledError as exc:
                 db.rollback()

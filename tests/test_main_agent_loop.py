@@ -26,6 +26,25 @@ def _state():
     }
 
 
+def test_available_user_draft_finishes_without_another_model_decision():
+    state = _state()
+    state.update(best_effort_generation=True, quality_gate={'draft_released': True})
+    llm = NativeDecisionLLM([])
+    def finish(current):
+        current['result_status'] = 'partial'
+        return True
+    assert MainAgentLoop(llm).run(state, handlers={}, finish_validator=finish) == 'partial'
+    assert llm.context_messages == []
+
+
+def test_partial_flag_cannot_override_finish_validation():
+    state = _state()
+    state.update(best_effort_generation=True, quality_gate={'draft_released': True, 'partial_success': True})
+    llm = NativeDecisionLLM(['request_finish'] * 3)
+    assert MainAgentLoop(llm).run(state, handlers={}, finish_validator=lambda s: False) == 'blocked'
+    assert len(llm.context_messages) == 3
+
+
 def test_finish_request_is_rejected_until_deterministic_validator_passes():
     state = _state()
     llm = NativeDecisionLLM(["request_finish", "search_and_rank", "request_finish"])
@@ -66,6 +85,44 @@ def test_rank_order_change_does_not_count_as_research_progress():
     second = _state()
     second["candidate_papers"] = list(reversed(first["candidate_papers"]))
     assert _progress_fingerprint(first) == _progress_fingerprint(second)
+
+
+def test_confirmed_hybrid_rank_is_progress_and_forces_detail_before_model_search():
+    from app.services.retrieval_ranking_service import _document, admission_scope_fingerprint
+
+    state = _state()
+    state.update(intent="generate_review", retrieval_profile={"mode": "hybrid"},
+                 active_quality_recovery={"action": "TARGETED_SEARCH"})
+    before = _progress_fingerprint(state)
+    paper = {"paper_id": "p1", "title": "Verified research", "abstract": "Evidence",
+             "year": 2025, "_screening_decision": "include", "_topic_relation": "direct",
+             "_eligible_deliverables": ["research_background"],
+             "_semantic_conditions_confirmed": True, "_semantic_contract_complete": True,
+             "_screening_confidence": 0.95}
+    paper["_screened_content_fingerprint"] = _document(paper).content_fingerprint
+    paper["_screened_scope_fingerprint"] = admission_scope_fingerprint(state)
+    state["ranked_papers"] = [paper]
+    state["paper_details"] = [{"paper_id": "old", "title": "Old material"}]
+    state["paper_cards"] = [{"paper_id": "old", "title": "Old material",
+                             "relation_type": "direct", "eligible_deliverables": ["research_background"]}]
+    assert _progress_fingerprint(state) != before
+    paper["_rank_score"] = 0.01
+    score_changed = _progress_fingerprint(state)
+    paper["_rank_score"] = 0.99
+    assert _progress_fingerprint(state) == score_changed
+
+    llm = NativeDecisionLLM(["request_finish"])
+    status = MainAgentLoop(llm).run(
+        state,
+        handlers={"fetch_metadata": lambda working, args: working.update(paper_details=[dict(paper)])},
+        finish_validator=lambda current: bool(current.get("paper_details")),
+    )
+    assert status == "completed"
+    assert [item["action"] for item in state["main_agent_decisions"]] == [
+        "fetch_metadata", "request_finish",
+    ]
+    assert len(llm.context_messages) == 1
+    assert state["paper_cards"] == []
 
 
 def test_alternating_research_states_stop_before_round_budget():

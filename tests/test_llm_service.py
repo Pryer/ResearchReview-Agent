@@ -87,7 +87,7 @@ def test_control_plane_can_disable_empty_content_retry(monkeypatch):
     monkeypatch.setattr(
         service,
         "_call_with_possible_fallback",
-        lambda kwargs, response_format, client=None, record=None: response,
+        lambda kwargs, response_format, client=None, record=None, operation="": response,
     )
     monkeypatch.setattr(
         service,
@@ -144,6 +144,115 @@ def test_role_bound_native_tool_call_injects_prefix_and_returns_one_call():
     }
     assert captured["tool_choice"] == "required"
     assert captured["messages"][0]["role"] == "system"
+
+
+def test_auto_reasoning_enables_tool_decision_without_required_tool_choice():
+    service = LLMService()
+    service.api_key = "test"
+    service.backup_enabled = False
+    service.provider = "deepseek"
+    service.reasoning_mode = "auto"
+    captured = {}
+    service._client = _fake_client(
+        lambda **kwargs: (captured.update(kwargs) or _tool_resp("search_and_rank", {}))
+    )
+    result = service.complete_tool_call(
+        [{"role": "user", "content": '{"goal":{}}'}],
+        tools=[{"type": "function", "function": {
+            "name": "search_and_rank", "description": "search",
+            "parameters": {"type": "object", "properties": {}},
+        }}],
+        operation="main_agent_decision",
+    )
+    assert result["name"] == "search_and_rank"
+    assert "tool_choice" not in captured
+    assert "temperature" not in captured
+    assert captured["extra_body"] == {
+        "thinking": {"type": "enabled"}, "reasoning_effort": "low",
+    }
+
+
+def test_auto_reasoning_keeps_simple_keyword_call_off():
+    service = LLMService()
+    service.api_key = "test"
+    service.backup_enabled = False
+    service.provider = "deepseek"
+    service.reasoning_mode = "auto"
+    captured = {}
+    service._client = _fake_client(
+        lambda **kwargs: (captured.update(kwargs) or _resp("ok"))
+    )
+    service.complete("keywords", operation="generate_search_keywords")
+    assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+def test_reasoning_policy_respects_static_switch_and_upgrades_auto_retry():
+    from app.services.reasoning_policy import choose_reasoning
+
+    base = {"default_enabled": False, "default_effort": "low"}
+    assert choose_reasoning("write_section:background:attempt_1", mode="static", **base) == (False, "low")
+    assert choose_reasoning("write_section:background:attempt_1", mode="auto", **base) == (True, "low")
+    assert choose_reasoning("write_section:background:attempt_2", mode="auto", **base) == (True, "high")
+    assert choose_reasoning("generate_search_keywords", mode="auto", **base) == (False, "low")
+    assert choose_reasoning("write_section:background:attempt_2", mode="auto",
+                            requested_enabled=False, **base) == (False, "low")
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        choose_reasoning("write_section", mode="auto", requested_effort="ultra", **base)
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_balance_failure_stops_current_execution_and_retries_in_new_execution(native):
+    from app.agent.execution_budget import budget_scope, is_control_exception
+    from app.core.exceptions import LLMProviderUnavailableError
+    service = _new_service()
+    service.backup_enabled = False
+    calls = []
+    def fail(**kwargs):
+        calls.append(kwargs)
+        raise _status_exc(402)
+    service._client = _fake_client(fail)
+    def call():
+        if native:
+            return service.complete_tool_call([{"role": "user", "content": "test"}], tools=[{"type": "function"}])
+        return service.complete("test")
+    with budget_scope({}):
+        for _ in range(2):
+            with pytest.raises(LLMProviderUnavailableError) as raised:
+                call()
+            assert is_control_exception(raised.value)
+    assert len(calls) == 1
+    with budget_scope({}):
+        with pytest.raises(LLMProviderUnavailableError):
+            call()
+    assert len(calls) == 2
+
+
+def test_primary_balance_failure_uses_backup_without_retrying_primary_in_execution():
+    from app.agent.execution_budget import budget_scope
+    service = _new_service()
+    calls = []
+    def primary(**kwargs):
+        calls.append('primary')
+        raise _status_exc(402)
+    service._client = _fake_client(primary)
+    service._backup_client = _fake_client(lambda **kwargs: (calls.append('backup') or _resp('ok')))
+    with budget_scope({}):
+        assert service.complete('test') == 'ok'
+        assert service.complete('test') == 'ok'
+    assert calls == ['primary', 'backup', 'backup']
+
+
+def test_static_writing_does_not_expand_token_limit_when_thinking_disabled():
+    service = _new_service()
+    service.backup_enabled = False
+    service.reasoning_mode = 'static'
+    service.thinking_enabled = False
+    service.provider = 'deepseek'
+    captured = {}
+    service._client = _fake_client(lambda **kwargs: (captured.update(kwargs) or _resp('ok')))
+    service.complete('test', operation='write_section:background:attempt_1')
+    assert captured['max_tokens'] == service.max_tokens
+    assert captured['extra_body']['thinking']['type'] == 'disabled'
 
 
 def test_native_tool_decision_records_usage_and_cache_tokens():

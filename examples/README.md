@@ -10,6 +10,19 @@ mock-based tests. They do not contain API keys and do not require live data sour
   insufficient, existing-evidence-only, and cross-domain reference targets.
 - checkpoint_resume_request.json: explicit recovery of an interrupted session,
   including committed-checkpoint and lease preconditions and retained budgets.
+- clarified_classroom_request.json: merged original request plus clarification,
+  with expected working-query terms and constraints (40 references, two sections).
+
+## Hybrid retrieval evaluation fixtures
+
+`hybrid_retrieval_snapshot.json`, `hybrid_retrieval_qrels.jsonl`, and
+`hybrid_retrieval_profile.json` are a three-topic synthetic algorithm fixture
+(classroom, battery, marine; Chinese, English, and cross-lingual cases). Papers
+are explicitly marked as non-real, so it verifies ranking plumbing and metric
+aggregation only; it is not recall evidence. Run
+`python scripts/evaluate_hybrid_retrieval.py --snapshot ... --qrels ... --profile ... --output <report.json>`.
+Real retrieval quality evaluation requires a separately labeled real-candidate
+snapshot and authorized embedding/rerank endpoints.
 
 Submit only the `request` object to `POST /api/reviews/jobs`; `expected` describes
 validation expectations, not API input. A resume request needs the real prior

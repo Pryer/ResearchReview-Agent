@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 from logging.handlers import RotatingFileHandler
@@ -26,8 +27,10 @@ _configured_loggers: Dict[str, logging.Logger] = {}
 _setup_lock = threading.Lock()
 _root_initialized = False
 
-# 日志根目录
-_LOG_DIR = Path("logs")
+# 日志根目录；默认 logs/，可由 APP_LOG_DIR 覆盖（测试用它把日志隔离到
+# logs/test/，避免 pytest 中直接调用 agent 的用例把"Agent started"等
+# 运行痕迹写进生产 app.log 误导排查）。必须在进程首次 get_logger 前设置。
+_LOG_DIR = Path(os.environ.get("APP_LOG_DIR", "logs"))
 
 
 def _setup_root_logger() -> None:

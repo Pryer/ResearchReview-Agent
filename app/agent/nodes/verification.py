@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from app.agent.decorators import node, optional, provides, requires
+from app.agent.execution_budget import is_control_exception
 from app.agent.nodes.base import (
     _compact_debug_value,
     _latest_step,
@@ -137,6 +138,8 @@ def claim_plan_node(state: "ResearchAgentState", llm=None) -> "ResearchAgentStat
             len(plans), total_claims, strong_plus, single_only,
         )
     except Exception as e:
+        if is_control_exception(e):
+            raise
         logger.warning("claim_plan_node failed: %s", e)
         state["claim_plans"] = []
         append_step(state, "claim_plan", "failed", error=str(e))
@@ -173,11 +176,32 @@ def claim_evidence_gate_node(state: "ResearchAgentState", llm=None) -> "Research
                 unconfirmed_ids=unconfirmed_reference_ids(state),
             )
             if coverage_plan:
-                plans.append(coverage_plan)
-                report["coverage_added"] = len(coverage_plan["claims"])
-                report["retained_claims"] = sum(
-                    len(item.get("claims") or []) for item in plans
+                # WHY: 覆盖补建的新增主张必须经过与路线主张同一门禁（证据绑定、
+                # 单篇限额与真实蕴含核验）才能进入授权池；不能因 coverage_added
+                # 数量回填就放行，否则门禁刚删除的未核验主张会借覆盖计划复活。
+                # 未通过核验的覆盖主张直接丢弃，coverage_added 只计存活主张。
+                gated_coverage, coverage_report = enforce_claim_evidence_gate(
+                    [coverage_plan],
+                    state.get("paper_cards") or [],
+                    llm=llm,
                 )
+                surviving = [
+                    claim for plan in gated_coverage for claim in plan.get("claims") or []
+                ]
+                if surviving:
+                    plans.extend(gated_coverage)
+                    report["coverage_added"] = len(surviving)
+                    report["coverage_dropped"] = int(
+                        coverage_report.get("dropped_claims") or 0
+                    )
+                    report["retained_claims"] = sum(
+                        len(item.get("claims") or []) for item in plans
+                    )
+                else:
+                    report["coverage_added"] = 0
+                    report["coverage_dropped"] = int(
+                        coverage_report.get("dropped_claims") or 0
+                    )
         state["claim_plans"] = plans
         state["claim_evidence_gate"] = report
         append_step(
@@ -190,6 +214,10 @@ def claim_evidence_gate_node(state: "ResearchAgentState", llm=None) -> "Research
             duration_ms=int((time.time() - t0) * 1000),
         )
     except Exception as exc:
+        # WHY: 门禁内 LLM 聚类/覆盖补建遇停止信号必须传播；降级成 passed=False
+        # 会让已停止的会话误报"质量失败"并继续追加覆盖计划。
+        if is_control_exception(exc):
+            raise
         logger.warning("claim_evidence_gate_node failed: %s", exc)
         state["claim_evidence_gate"] = {
             "passed": False,
@@ -252,6 +280,8 @@ def global_evidence_gate_node(state: "ResearchAgentState") -> "ResearchAgentStat
             duration_ms=int((time.time() - t0) * 1000),
         )
     except Exception as exc:
+        if is_control_exception(exc):
+            raise
         logger.warning("global_evidence_gate_node failed: %s", exc)
         # 与 claim_evidence_gate 的失败 dict 不同：不写 passed=False，避免
         # 最终回答误报“证据不足”；derive_result_status 只认 status == EVALUATED。
@@ -320,6 +350,26 @@ def citation_check_node(state: "ResearchAgentState", llm=None) -> "ResearchAgent
             or state.get("introduction")
             or ""
         )
+        # WHY: 内部权威引用来自渲染前正文；数字化正文只有与同版渲染快照
+        # 完全一致时才能复用，不能让下轮校验按卡片顺序重新解释编号。
+        if generated_text == state.get("citation_rendered_text") and state.get("citation_source_text"):
+            generated_text = state["citation_source_text"]
+        from app.core.citation_syntax import extract_citation_ids
+        if any(value.isdigit() for value in extract_citation_ids(generated_text)):
+            # WHY: 旧数字稿若没有同版本原文，当前卡片顺序不能证明编号身份。
+            state.pop("citation_source_text", None)
+            state.pop("citation_rendered_text", None)
+            state["citation_validation"] = {"valid": False, "reason": "citation_identity_unverified"}
+            state["references"] = []
+            state["reference_papers"] = []
+            state["citation_map"] = {}
+            state["citation_registry"] = {}
+            state["unique_cited_paper_count"] = 0
+            state["unique_valid_cited_paper_count"] = 0
+            state["final_requirement_met"] = False
+            state["generation_quality"] = {"passed": False, "reason": "citation_identity_unverified"}
+            append_step(state, "citation_check", "failed", error="citation_identity_unverified")
+            return state
         result = generate_and_validate_citations(
             review_text=generated_text,
             paper_cards=citation_sources,
@@ -327,7 +377,9 @@ def citation_check_node(state: "ResearchAgentState", llm=None) -> "ResearchAgent
             # 本地引用校验已经能判断缺失引用和实际引用篇数。
             # 这里不再额外调用 LLM 生成建议，避免长任务在收尾阶段再次阻塞。
             llm=None,
+            allow_positional_numeric=False,
         )
+        state["citation_source_text"] = generated_text
         state["references"] = result.get("references", [])
         state["citation_validation"] = result.get("validation", {})
         state["reference_papers"] = result.get("reference_papers", [])
@@ -344,6 +396,7 @@ def citation_check_node(state: "ResearchAgentState", llm=None) -> "ResearchAgent
                 state["related_work"] = rendered_text
             elif state.get("introduction"):
                 state["introduction"] = rendered_text
+            state["citation_rendered_text"] = rendered_text
         cited_ids = set(state["citation_validation"].get("cited_ids", []))
         citable_ids = {
             str(paper.get("paper_id") or "")
@@ -387,6 +440,8 @@ def citation_check_node(state: "ResearchAgentState", llm=None) -> "ResearchAgent
             duration_ms=int((time.time() - t0) * 1000),
         )
     except Exception as e:
+        if is_control_exception(e):
+            raise
         from app.agent.exceptions import LLMGenerationError
 
         error = LLMGenerationError(str(e), step="citation_check", original_error=e)
@@ -413,7 +468,7 @@ def verify_claims_node(
     """逐句检查生成主张；可选地只重验证目标句并合并上一轮结果。"""
     t0 = time.time()
     try:
-        from app.core.citation_syntax import normalize_citation_syntax
+        from app.core.citation_syntax import extract_citation_ids, normalize_citation_syntax
         from app.core.config import get_review_threshold_policy
         from app.tools.verify_claims import verify_review_claims
         from app.tools.validate_deliverable import validate_final_review_integrity
@@ -424,6 +479,23 @@ def verify_claims_node(
             or state.get("introduction")
             or ""
         )
+        if generated_text == state.get("citation_rendered_text") and state.get("citation_source_text"):
+            generated_text = state["citation_source_text"]
+        elif any(value.isdigit() for value in extract_citation_ids(generated_text)):
+            # WHY: 旧会话只有数字正文而没有可证实的渲染前版本时，不能按
+            # 当前卡片顺序猜测论文。保持未验证，由质量门禁阻止正式交付。
+            state.pop("citation_source_text", None)
+            prior = state.get("claim_verification")
+            state["claim_verification"] = {
+                "status": "identity_unverified", "valid": False,
+                "prior_report": prior if isinstance(prior, dict) else None,
+            }
+            state["generation_quality"] = {
+                "passed": False, "reason": "citation_identity_unverified",
+                "verification_coverage": 0.0,
+            }
+            append_step(state, "verify_claims", "failed", error="citation_identity_unverified")
+            return state
         citable_ids = {
             str(card.get("paper_id") or "")
             for card in state.get("paper_cards") or []
@@ -749,6 +821,11 @@ def verify_claims_node(
             duration_ms=int((time.time() - t0) * 1000),
         )
     except Exception as e:
+        # WHY: 预算耗尽/取消/租约失权必须传播到执行边界，由主循环判 blocked/
+        # cancelled/stale；若在此降级成 skip_verification，已停止的会话会把
+        # "系统停止"误报成"验证失败"，并让外层恢复继续发起新请求（只烧费）。
+        if is_control_exception(e):
+            raise
         from app.agent.exceptions import DegradableAgentError
 
         error = DegradableAgentError(
@@ -761,6 +838,8 @@ def verify_claims_node(
 
 
 def _update_state_review_text(state: "ResearchAgentState", text: str) -> None:
+    state.pop("citation_source_text", None)
+    state.pop("citation_rendered_text", None)
     if state.get("review"):
         state["review"] = text
     elif state.get("related_work"):
@@ -872,6 +951,9 @@ def _rewrite_and_weaken_unsupported_claims(
                         "method": "llm_rewrite",
                     })
             except Exception as exc:
+                # WHY: 停止信号必须传播；普通改写失败可降级到规则级弱化兜底。
+                if is_control_exception(exc):
+                    raise
                 logger.warning("LLM claim rewrite batch failed: %s", exc)
 
     # 2. 规则级弱化兜底

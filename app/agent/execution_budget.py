@@ -10,6 +10,9 @@ from contextlib import contextmanager
 from functools import wraps
 from typing import Any, Callable
 from app.agent.execution import AgentCancelledError
+from app.core.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class AgentBudgetExceeded(RuntimeError):
@@ -18,6 +21,56 @@ class AgentBudgetExceeded(RuntimeError):
 
 class AgentExecutionCancelled(AgentCancelledError):
     pass
+
+
+class AgentExecutionStale(AgentExecutionCancelled):
+    """持久化租约失效（owner 被接管或租约过期未续约）。
+
+    继承 AgentExecutionCancelled 是为了复用所有已有的取消透传边界；但它
+    语义上不是"用户取消"，主循环必须把结果状态判为 failed 而非 cancelled。
+    一旦抛出，本执行对会话已无所有权，任何节点都不得吞掉它继续跑——
+    否则会继续产生外部调用，最终保存仍会被 CAS 拒绝（只留下烧费空转）。
+    """
+    pass
+
+
+def is_control_exception(exc: BaseException) -> bool:
+    """判断是否为必须立即向执行边界传播的停止信号。
+
+    WHY: 预算耗尽、用户取消、租约失效、账本 CAS 冲突都代表本执行已无权
+    继续。节点若把它们当普通可恢复失败吞掉，会在已停止的会话里继续发起
+    provider 调用、备用切换或覆盖补建（只烧费不产出），并把"系统停止"
+    误报成"质量失败"或"N 条判定失败"。AgentExecutionCancelled/Stale 都是
+    AgentCancelledError 子类，故一并覆盖。
+    """
+    if isinstance(exc, (AgentBudgetExceeded, AgentCancelledError)):
+        return True
+    from app.core.exceptions import LLMProviderUnavailableError
+    if isinstance(exc, LLMProviderUnavailableError):
+        return True
+    from app.database.runtime_repository import RuntimeConflict
+
+    return isinstance(exc, RuntimeConflict)
+
+
+def _runtime_check(runtime):
+    """把账本层 RuntimeConflict 转换为图内统一的"执行失效"终止异常。"""
+    from app.database.runtime_repository import RuntimeConflict
+
+    try:
+        runtime.check()
+    except RuntimeConflict as exc:
+        raise AgentExecutionStale(str(exc)) from exc
+
+
+def _runtime_persist_budget(runtime, ledger):
+    """persist_budget 内部也会 check()；同样转换，避免裸 RuntimeConflict 被降级。"""
+    from app.database.runtime_repository import RuntimeConflict
+
+    try:
+        runtime.persist_budget(ledger)
+    except RuntimeConflict as exc:
+        raise AgentExecutionStale(str(exc)) from exc
 
 
 _ACTIVE = ContextVar("research_budget", default=None)
@@ -58,12 +111,14 @@ def check_execution():
     from app.services.durable_execution_service import active_runtime
     runtime = active_runtime()
     if runtime:
-        runtime.check()
+        _runtime_check(runtime)
     current = _ACTIVE.get()
     if current:
         if current.get("exhausted"):
             raise AgentBudgetExceeded(current["exhausted"])
-        if int(current["ledger"].get("llm_tokens") or 0) > int(current["ledger"]["token_limit"]):
+        if (int(current["ledger"].get("llm_tokens") or 0)
+                + int(current["ledger"].get("retrieval_model_tokens") or 0)
+                > int(current["ledger"]["token_limit"])):
             raise AgentBudgetExceeded("actual token usage exceeded the reserved budget")
         if current["cancel"] and current["cancel"]():
             raise AgentExecutionCancelled("research execution cancelled")
@@ -86,7 +141,49 @@ def consume(kind: str, amount: int = 1):
         from app.services.durable_execution_service import active_runtime
         runtime = active_runtime()
         if runtime:
-            runtime.persist_budget(ledger)
+            _runtime_persist_budget(runtime, ledger)
+
+
+def record_retrieval_request(kind: str):
+    """远程 embedding/rerank 每次 HTTP 尝试均计入同一执行账本。"""
+    check_execution()
+    current = _ACTIVE.get()
+    if current is None:
+        return
+    from app.core.config import get_settings
+
+    with _LOCK:
+        ledger = current["ledger"]
+        used = int(ledger.get("retrieval_model_requests") or 0)
+        if used >= get_settings().retrieval_model_request_limit:
+            current["exhausted"] = "retrieval model request budget exhausted"
+            raise AgentBudgetExceeded(current["exhausted"])
+        ledger["retrieval_model_requests"] = used + 1
+        ledger[f"retrieval_{kind}_requests"] = int(ledger.get(f"retrieval_{kind}_requests") or 0) + 1
+        from app.services.durable_execution_service import active_runtime
+
+        runtime = active_runtime()
+        if runtime:
+            _runtime_persist_budget(runtime, ledger)
+
+
+def record_retrieval_usage(usage):
+    current = _ACTIVE.get()
+    if current is None:
+        return
+    with _LOCK:
+        ledger = current["ledger"]
+        value = usage.get("total_tokens") if isinstance(usage, dict) else None
+        if isinstance(value, (int, float)) and value >= 0:
+            ledger["retrieval_model_tokens"] = int(ledger.get("retrieval_model_tokens") or 0) + int(value)
+        else:
+            ledger["retrieval_usage_unknown_count"] = int(ledger.get("retrieval_usage_unknown_count") or 0) + 1
+        from app.services.durable_execution_service import active_runtime
+
+        runtime = active_runtime()
+        if runtime:
+            _runtime_persist_budget(runtime, ledger)
+    check_execution()
 
 
 def submit_with_context(executor, fn, *args):
@@ -96,7 +193,7 @@ def submit_with_context(executor, fn, *args):
     return executor.submit(copy_context().run, run)
 
 
-def budgeted_create(client, *, on_response=None, **kwargs):
+def budgeted_create(client, *, on_response=None, operation="", **kwargs):
     """真实 provider 请求前预留，返回后结算；重试与备用分别记账。"""
     check_execution()
     current = _ACTIVE.get()
@@ -112,10 +209,20 @@ def budgeted_create(client, *, on_response=None, **kwargs):
                                   ensure_ascii=False).encode("utf-8")) + 128
     reservation = prompt_bound + int(kwargs.get("max_tokens") or 4096)
     with _LOCK:
-        used = int(ledger.get("llm_tokens") or 0)
+        used = int(ledger.get("llm_tokens") or 0) + int(ledger.get("retrieval_model_tokens") or 0)
         reserved = int(ledger.get("tokens_reserved") or 0)
         if used + reserved + reservation > int(ledger["token_limit"]):
             current["exhausted"] = "token reservation exceeds remaining budget"
+            # WHY: 拒绝点记录可核对的结构化诊断（操作/已用/已预留/请求预留/
+            # 剩余/上限/阶段），但绝不含 prompt 或凭据。此次请求尚未调用
+            # provider，故不计入 llm_requests、不占用预留，账面无需回滚。
+            limit = int(ledger["token_limit"])
+            logger.warning(
+                "BUDGET_RESERVATION_REJECTED stage=reservation operation=%s model=%s "
+                "used=%d reserved=%d requested=%d remaining=%d limit=%d",
+                operation or "unknown", str(kwargs.get("model") or ""),
+                used, reserved, reservation, max(0, limit - used - reserved), limit,
+            )
             raise AgentBudgetExceeded("token reservation exceeds remaining budget")
         ledger["tokens_reserved"] = reserved + reservation
         ledger["llm_requests"] = int(ledger.get("llm_requests") or 0) + 1
@@ -130,7 +237,14 @@ def budgeted_create(client, *, on_response=None, **kwargs):
     try:
         if runtime:
             with _LOCK:
-                attempt_id = runtime.reserve_attempt(active_task_id(), reservation, ledger)
+                # reserve_attempt 内部会 check() 租约，失效时统一转成
+                # AgentExecutionStale，避免在发请求前把终止错误降级。
+                from app.database.runtime_repository import RuntimeConflict
+
+                try:
+                    attempt_id = runtime.reserve_attempt(active_task_id(), reservation, ledger)
+                except RuntimeConflict as exc:
+                    raise AgentExecutionStale(str(exc)) from exc
         requested = True
         response = client.chat.completions.create(**kwargs)
         usage = getattr(response, "usage", None)
@@ -143,6 +257,11 @@ def budgeted_create(client, *, on_response=None, **kwargs):
                 value = getattr(usage, field, None)
                 if value is not None:
                     settled_usage[field] = int(value)
+            # WHY: reasoning 是 completion 的子集，只记录明细，不重复加入总量；
+            # 服务未报告时保持缺省，不能把未知思考用量当成零。
+            reasoning = getattr(getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None)
+            if reasoning is not None:
+                settled_usage["reasoning_tokens"] = int(reasoning)
         # WHY: 响应已产生费用，即使随后收到取消/截止，也要记录 usage。
         if on_response:
             on_response(response)

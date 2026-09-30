@@ -1,5 +1,6 @@
 """真实规划、写后验证与 Controller 提交契约的组合回归；外部模型使用替身。"""
 import json
+import copy
 
 import pytest
 
@@ -43,7 +44,7 @@ def _state():
         }],
         'paper_details': [{'paper_id': 'p1', 'title': '测试证据', 'authors': ['测试作者'],
                            'year': 2024, 'venue': '测试期刊'}],
-        'review': claim + '[1]。', 'citation_map': {'p1': 1},
+        'review': claim + '[p1]。', 'citation_map': {'p1': 1},
         'steps': [], 'errors': [],
     }
 
@@ -110,3 +111,78 @@ def test_writing_output_remains_strict(operation):
                   {'unregistered_field': {}}):
         with pytest.raises(ValueError):
             validate_patch(operation, patch, [])
+
+
+@pytest.mark.parametrize('rejected_operation', ['generate_deliverables', 'rewrite_sections'])
+def test_rejected_writing_blocks_both_entrypoints_before_creating_task(rejected_operation):
+    from app.agent.action_registry import allowed_actions
+    from app.agent.controller import AgentController
+    from app.agent.generation_recovery import input_fingerprint
+    state = _state()
+    state['recovery_candidate_rejections'] = [{
+        'operation': rejected_operation, 'input_fingerprint': input_fingerprint(state),
+    }]
+    assert not {'generate_deliverables', 'rewrite_sections'} & set(allowed_actions(state))
+    controller = AgentController()
+    for operation in ('generate_deliverables', 'rewrite_sections'):
+        with pytest.raises(ValueError, match='rewrite attempts exhausted'):
+            controller.execute(role=ACTION_REGISTRY[operation].role, operation=operation,
+                               objective='换个理由仍不得重复写', state=state,
+                               handler=lambda s: pytest.fail('must not write'))
+    state['paper_cards'].append({'paper_id': 'new', 'title': '新增证据'})
+    from app.agent.generation_recovery import rewrite_attempt_exhausted
+    assert not rewrite_attempt_exhausted(state)
+    assert 'generate_deliverables' in allowed_actions(state)
+
+
+@pytest.mark.parametrize('operation', ['generate_deliverables', 'rewrite_sections'])
+def test_rejected_candidate_restores_verified_draft_without_second_mutating_validation(monkeypatch, operation):
+    state = _state()
+    state.update(quality_gate={'passed': False, 'draft_released': False},
+                 agent_orchestration_mode='autonomous',
+                 reference_coverage_stats={'final_valid': 40},
+                 claim_verification={'unsupported': 0},
+                 claim_verification_cache={'original': {'status': 'supported'}},
+                 section_checkpoints={'original': {'text': '旧章节'}}, answer='旧稿说明')
+    state['autonomous_verified_fingerprint'] = graph._draft_fingerprint(state)
+    previous = copy.deepcopy(state)
+    validations = []
+    def generate(current, **kwargs):
+        current['review'] = '候选较差正文'
+        current['section_checkpoints'] = {'candidate': {'text': '新章节'}}
+    def verify(current, **kwargs):
+        validations.append(current['review'])
+        current['review'] += '验证链改写'
+        current['reference_coverage_stats'] = {'final_valid': 38}
+        current['claim_verification_cache'] = {'candidate': {'status': 'unsupported'}}
+    monkeypatch.setattr(graph, '_get_llm', lambda: OutlineLLM())
+    monkeypatch.setattr(graph, '_generate_deliverables_or_block', generate)
+    monkeypatch.setattr(graph, '_verify_generated_draft', verify)
+    monkeypatch.setattr(graph, 'final_answer_node', lambda s: s.update(quality_gate={'passed': False}))
+    monkeypatch.setattr('app.agent.generation_recovery.candidate_is_not_worse', lambda a, b: False)
+    def run(loop, current, *, handlers, **kwargs):
+        loop.controller.execute(role=ACTION_REGISTRY[operation].role, operation=operation,
+            objective='验证候选回滚', state=current,
+            handler=lambda s: handlers[operation](s, {'section_ids': ['s1']} if operation == 'rewrite_sections' else {}))
+        return 'blocked'
+    monkeypatch.setattr(MainAgentLoop, 'run', run)
+    graph._run_autonomous_pipeline(state)
+    assert validations == ['候选较差正文']
+    for key in ('review', 'answer', 'reference_coverage_stats', 'claim_verification_cache',
+                'section_checkpoints', 'autonomous_verified_fingerprint'):
+        assert state[key] == previous[key]
+    assert state['recovery_candidate_rejections'][-1]['operation'] == operation
+
+
+def test_legacy_partial_draft_with_unsupported_claims_cannot_finish(monkeypatch):
+    state = _state()
+    state.update(quality_gate={'passed': False, 'draft_released': True, 'partial_success': True},
+                 agent_orchestration_mode='autonomous',
+                 claim_verification={'unsupported': 32})
+    state['autonomous_verified_fingerprint'] = graph._draft_fingerprint(state)
+    monkeypatch.setattr(graph, '_get_llm', lambda: OutlineLLM())
+    def run(loop, current, *, finish_validator, **kwargs):
+        assert not finish_validator(current)
+        return 'blocked'
+    monkeypatch.setattr(MainAgentLoop, 'run', run)
+    assert graph._run_autonomous_pipeline(state)['status'] == 'blocked'

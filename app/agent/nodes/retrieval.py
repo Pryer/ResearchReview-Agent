@@ -575,6 +575,12 @@ def search_node(
 
         raise AgentCancelledError(str(exc)) from exc
     except Exception as e:
+        from app.agent.execution import AgentCancelledError as _AgentCancelledError
+
+        if isinstance(e, _AgentCancelledError):
+            # WHY: 取消/租约失效必须立即终止，不能标记 search_failed 后继续
+            # 加深——后者会继续触发外部检索调用且最终保存必被 CAS 拒绝。
+            raise
         # 用 ServiceUnavailableError 包装底层异常，保留结构化错误信息；
         # 当前仍保持写入 errors 为字符串，不改变 graph.py 的 search_failed 分支行为。
         from app.agent.exceptions import ServiceUnavailableError
@@ -740,7 +746,7 @@ def _screening_reserve_k(
     "required_reference_count", "search_branches", "research_semantic_frame",
     "screening_protocol", "topic_anchors"
 )
-def rank_node(state: "ResearchAgentState", llm=None) -> "ResearchAgentState":
+def rank_node(state: "ResearchAgentState", llm=None, should_cancel=None) -> "ResearchAgentState":
     """候选论文去重、排序、筛选。
 
     中英文分支独立处理：先按语言拆分 → 各自去重/硬过滤/评分/LLM重排 →
@@ -790,6 +796,57 @@ def rank_node(state: "ResearchAgentState", llm=None) -> "ResearchAgentState":
             excluded_title_terms=excluded_title_terms,
         )
         state["compiled_scope"] = compiled_scope
+        ranking_mode = str((state.get("retrieval_profile") or {}).get("mode")
+                           or settings.retrieval_ranking_mode)
+        if ranking_mode in {"hybrid", "hybrid_shadow"}:
+            from app.services.retrieval_ranking_service import rank_candidates, screen_candidates
+            from app.schemas.retrieval_schema import fingerprint
+
+            config_fingerprint = fingerprint((
+                settings.retrieval_provider, settings.retrieval_embedding_model,
+                settings.retrieval_embedding_url, settings.retrieval_embedding_dimension,
+                settings.retrieval_rerank_model, settings.retrieval_rerank_url,
+                settings.retrieval_cache_version,
+            ))
+            profile = state.setdefault("retrieval_profile", {"mode": ranking_mode,
+                                                               "version": "hybrid.v1"})
+            if profile.get("config_fingerprint") and profile["config_fingerprint"] != config_fingerprint:
+                raise ValueError("当前会话检索模型配置已变化，需显式重建检索快照")
+            profile["config_fingerprint"] = config_fingerprint
+            profile["embedding_model"] = settings.retrieval_embedding_model
+            profile["rerank_model"] = settings.retrieval_rerank_model
+            hybrid_ranked, hybrid_report = rank_candidates(
+                state, settings=settings,
+                include_rerank=llm is not None and ranking_mode == "hybrid",
+                should_cancel=should_cancel,
+            )
+            if ranking_mode == "hybrid":
+                if llm is None:
+                    ranked = hybrid_ranked
+                    hybrid_report["screening"] = {"mode": "pending_until_final_screen"}
+                else:
+                    ranked, screening = screen_candidates(
+                        state, hybrid_ranked, llm, target=int(max_papers),
+                        should_cancel=should_cancel,
+                    )
+                    hybrid_report["screening"] = screening
+                state["ranked_papers"] = ranked
+                state["retrieval_requirement_met"] = bool(llm is not None and len(ranked) >= int(
+                    state.get("required_reference_count") or max_papers
+                ))
+                if not ranked:
+                    state["retrieval_stop_reason"] = {
+                        "no_query_or_text": "混合检索缺少可执行查询或可索引文本",
+                    }.get(str(hybrid_report.get("stop_reason")), "混合检索窗口无候选")
+                state["screening_report"] = {"mode": "hybrid", "hybrid": hybrid_report,
+                                             "compiled_scope": {"version": compiled_scope.get("version"),
+                                                                "fingerprint": compiled_scope.get("fingerprint")}}
+                append_step(state, "rank", "success", tool_name="hybrid_retrieval",
+                            input_data={"candidates": len(candidates), "max_papers": max_papers},
+                            output_data={"ranked": len(ranked), "hybrid": hybrid_report},
+                            duration_ms=int((time.time() - t0) * 1000))
+                return state
+            state["hybrid_shadow_report"] = hybrid_report
         rule_diagnostics: dict[str, Any] = {"compiled_scope_fingerprint": compiled_scope["fingerprint"]}
         rerank_diagnostics: dict[str, Any] = {}
         branch_stats: dict[str, Any] = {}
@@ -1150,13 +1207,18 @@ def rank_node(state: "ResearchAgentState", llm=None) -> "ResearchAgentState":
         from app.agent.graph import AgentCancelledError
 
         raise AgentCancelledError(str(exc)) from exc
-    except Exception as e:
+    except Exception as exc:
+        from app.agent.execution import AgentCancelledError
+        from app.agent.execution_budget import AgentBudgetExceeded
+
+        if isinstance(exc, (AgentCancelledError, AgentBudgetExceeded)):
+            raise
         from app.agent.exceptions import DegradableAgentError
 
-        error = DegradableAgentError(str(e), step="rank", original_error=e)
+        error = DegradableAgentError(str(exc), step="rank", original_error=exc)
         logger.error("rank_node failed: %s", error.message)
-        state.setdefault("errors", []).append(f"rank: {e}")
-        append_step(state, "rank", "failed", error=str(e))
+        state.setdefault("errors", []).append(f"rank: {exc}")
+        append_step(state, "rank", "failed", error=str(exc))
     return state
 
 
@@ -1337,6 +1399,12 @@ def refine_search_node(state: "ResearchAgentState", llm=None) -> "ResearchAgentS
             duration_ms=int((time.time() - t0) * 1000),
         )
     except Exception as e:
+        from app.agent.execution import AgentCancelledError
+
+        if isinstance(e, AgentCancelledError):
+            # WHY: 用户取消或租约失效（AgentExecutionStale）是终止信号，
+            # 不能降级为"继续用旧关键词"，否则会在已失权的执行里继续检索。
+            raise
         # P1 集成：关键词精化失败可降级（继续用旧关键词），非致命。
         from app.agent.exceptions import LLMGenerationError
 
@@ -1637,6 +1705,7 @@ def absolute_evidence_pool_target(
 def fetch_detail_node(
     state: "ResearchAgentState",
     should_cancel=None,
+    llm=None,
 ) -> "ResearchAgentState":
     """补全论文详情。"""
     t0 = time.time()
@@ -1652,7 +1721,48 @@ def fetch_detail_node(
         from app.tools.language_router import detect_paper_language
         from app.core.config import get_settings
 
+        hybrid_mode = (state.get("retrieval_profile") or {}).get("mode") == "hybrid"
+        compiled_scope = compile_scope(
+            selected_scope=state.get("selected_scope") or {},
+            semantic_frame=state.get("research_semantic_frame") or {},
+            screening_protocol=state.get("screening_protocol") or {},
+            required_concepts=state.get("required_concepts") or [],
+            topic_anchors=state.get("topic_anchors") or [],
+            search_branches=state.get("search_branches") or [],
+            excluded_title_terms=state.get("excluded_title_terms") or [],
+            topic=state.get("topic") or "",
+            research_mode=str((state.get("research_semantic_frame") or {}).get("research_mode") or ""),
+        )
+        state["compiled_scope"] = compiled_scope
+        if hybrid_mode:
+            from app.services.retrieval_ranking_service import (
+                admission_scope_fingerprint, is_semantically_admitted,
+            )
+            admission_fingerprint = admission_scope_fingerprint(state)
+            legacy_fingerprint = compiled_scope.get("fingerprint")
+
+            def admitted(paper):
+                return is_semantically_admitted(
+                    paper, scope_fingerprint=admission_fingerprint,
+                    legacy_scope_fingerprint=legacy_fingerprint,
+                )
         ranked_all = state.get("ranked_papers") or []
+        if hybrid_mode:
+            # WHY: ranked_papers 可暂存融合窗口；pending 不进入详情。旧的
+            # include 若合同/指纹缺失可在详情重筛，但重筛通过前不能成为证据。
+            ranked_all = [paper for paper in ranked_all
+                          if paper.get("_screening_decision") == "include"]
+            if not ranked_all:
+                # WHY: 待准入窗口并非“详情数为零”；只保留当前范围已确认的
+                # 历史详情，避免空 fetch 把有效证据池覆盖掉。
+                state["paper_details"] = [paper for paper in state.get("paper_details") or []
+                                          if admitted(paper)]
+                state["retrieval_requirement_met"] = len(state["paper_details"]) >= int(
+                    state.get("required_reference_count") or state.get("max_papers") or 0)
+                append_step(state, "fetch_detail", "skipped",
+                            output_data={"reason": "pending_semantic_admission",
+                                         "retained": len(state["paper_details"])})
+                return state
         incremental = bool(state.get("incremental_retrieval"))
         existing_details = list(state.get("paper_details") or []) if incremental else []
         existing_keys = {
@@ -1668,18 +1778,14 @@ def fetch_detail_node(
         )
         generation_limit = int(state.get("generation_limit") or 0)
         settings = get_settings()
-        compiled_scope = compile_scope(
-            selected_scope=state.get("selected_scope") or {},
-            semantic_frame=state.get("research_semantic_frame") or {},
-            screening_protocol=state.get("screening_protocol") or {},
-            required_concepts=state.get("required_concepts") or [],
-            topic_anchors=state.get("topic_anchors") or [],
-            search_branches=state.get("search_branches") or [],
-            excluded_title_terms=state.get("excluded_title_terms") or [],
-            topic=state.get("topic") or "",
-            research_mode=str((state.get("research_semantic_frame") or {}).get("research_mode") or ""),
-        )
-        state["compiled_scope"] = compiled_scope
+        if hybrid_mode and incremental:
+            # WHY: 检索路线/关键词变化不改变用户确认的准入边界；真实范围或
+            # 逐篇协议变化时旧授权失效，且不能把旧卡片继续算作当前证据。
+            existing_details = [paper for paper in existing_details if admitted(paper)]
+            existing_keys = {_paper_identity_key(paper) for paper in existing_details
+                             if _paper_identity_key(paper)}
+            ranked = [paper for paper in ranked_all
+                      if _paper_identity_key(paper) not in existing_keys]
         usable_before = max(
             len(existing_details),
             int(
@@ -1746,6 +1852,16 @@ def fetch_detail_node(
             )
             screening_protocol = state.get("screening_protocol") or {}
             for paper in batch:
+                if hybrid_mode:
+                    try:
+                        detail_year = int(paper.get("year")) if paper.get("year") is not None else None
+                    except (TypeError, ValueError):
+                        detail_year = None
+                    if detail_year and (
+                        (state.get("start_year") and detail_year < int(state["start_year"]))
+                        or (state.get("end_year") and detail_year > int(state["end_year"]))
+                    ):
+                        continue
                 # WHY: 详情补全会新增摘要、venue 和 DOI；这里必须重放排序阶段
                 # 的完整硬规则。旧分支一旦存在 protocol 就只验 protocol，导致
                 # scope/topic/branch 被绕过，越界论文可重新进入证据池。
@@ -1764,8 +1880,24 @@ def fetch_detail_node(
                     screening_protocol=screening_protocol,
                     language_branch=language_branch,
                     compiled_scope=compiled_scope,
+                    ranking_mode="hybrid" if hybrid_mode else "rules",
                 )
                 if passed:
+                    if hybrid_mode:
+                        from app.services.retrieval_ranking_service import screen_candidates
+
+                        # WHY: 详情新增内容或用户约束变化时旧语义结论失效；
+                        # 内容未变且合同完整时，硬过滤复核不得清空授权字段。
+                        if not admitted(paper):
+                            refreshed, _ = screen_candidates(
+                                state, [paper], llm, target=1, should_cancel=should_cancel,
+                            )
+                            if not refreshed:
+                                continue
+                            paper = refreshed[0]
+                        else:
+                            paper["_pending_semantic_check"] = False
+                            paper["_screened_scope_fingerprint"] = admission_fingerprint
                     validated.append(paper)
                 elif stage == "document_type_filter":
                     thesis_excluded += 1
@@ -1825,6 +1957,10 @@ def fetch_detail_node(
         # 协作式取消必须继续向上传播，不能被当作普通失败吞掉。
         raise
     except Exception as e:
+        from app.agent.execution_budget import AgentBudgetExceeded
+
+        if isinstance(e, AgentBudgetExceeded):
+            raise
         from app.agent.exceptions import ServiceUnavailableError
 
         error = ServiceUnavailableError(str(e), step="fetch_detail", original_error=e)

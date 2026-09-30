@@ -290,7 +290,12 @@ def _induce_background_outline(
             "comparison_dimensions": list(data.get("comparison_dimensions") or []),
             "rationale": str(data.get("rationale") or ""),
         }
-    except Exception:
+    except Exception as exc:
+        from app.agent.execution_budget import is_control_exception
+
+        # WHY: 大纲可在普通模型失败时确定性规划；预算/取消/失权不允许继续写作。
+        if is_control_exception(exc):
+            raise
         return {}
 
 

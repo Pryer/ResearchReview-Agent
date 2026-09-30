@@ -55,12 +55,14 @@ SCOPE_ANSWER_RESOLUTION_PROMPT = """\
 - 可以根据研究对象、数据、方法、目标和学科视角进行语义匹配。
 - 如果用户明确要求同时覆盖多个范围，返回多个 matched_scope_ids。
 - 如果现有信息仍不足以可靠确定范围，needs_clarification=true，并只生成一个简洁、自然的后续疑问句。
-- 不得创造候选列表之外的新范围 ID。
+- 用户可以提出候选以外的新范围或结合多个候选；若回答足够具体，填写 custom_scope，并将 matched_scope_ids 留空，不得强行贴近候选。
+- 不得创造候选列表之外的新候选 ID。
 - question 只在需要继续澄清时填写，否则为 null。
 
 严格返回 JSON：
 {{
   "matched_scope_ids": ["scope_id"],
+  "custom_scope": "用户提出的候选外范围；没有则为null",
   "needs_clarification": false,
   "question": null,
   "reason": "判断依据"

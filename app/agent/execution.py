@@ -28,6 +28,12 @@ def checkpoint(
     progress_callback: Callable[[str, int, int], None] | None,
 ) -> None:
     """在节点边界检查取消，并报告进度。"""
+    # WHY: 节点边界是最密集的执行闸门；租约失效（owner 被接管/续约终止）
+    # 必须在下一个昂贵步骤前被识别为 AgentExecutionStale 终止，而不是等
+    # 远程调用层报错后被节点当普通故障降级、继续在失权会话里烧费。
+    from app.agent.execution_budget import check_execution
+
+    check_execution()
     if should_cancel and should_cancel():
         logger.info("Agent cancelled before step: %s", step)
         raise AgentCancelledError(f"任务已在 {step} 前取消")

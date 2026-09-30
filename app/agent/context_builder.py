@@ -142,6 +142,8 @@ def _current_stage(state: dict[str, Any]) -> str:
 
 
 def _next_actions(state: dict[str, Any]) -> list[str]:
+    from app.agent.action_registry import recovery_handoff_action
+
     plan = state.get("research_plan") or {}
     pending = [
         str(item.get("operation") or item.get("id") or "")
@@ -151,6 +153,9 @@ def _next_actions(state: dict[str, Any]) -> list[str]:
     decision = state.get("quality_recovery_decision") or state.get("recovery_decision") or {}
     if decision.get("action") and str(decision.get("action")) not in pending:
         pending.insert(0, str(decision["action"]))
+    handoff = recovery_handoff_action(state)
+    if handoff:
+        pending.insert(0, handoff)
     from app.agent.evidence_recovery import targeted_search_kind
     return [item for item in dict.fromkeys(pending) if item and (
         item.lower() != "targeted_search" or targeted_search_kind(state)
@@ -167,6 +172,11 @@ def _agent_state(state: dict[str, Any]) -> AgentStateContext:
     ]
     quality = state.get("quality_gate") or {}
     global_gate = state.get("global_evidence_gate") or {}
+    # WHY: 把"语义待验"与"结构性失败"分开呈现给主 Agent。前者可靠重验补齐，
+    # 后者（无引用/缺片段）重验永远无进展，必须改走引用修复/弱化/删除/补证，
+    # 否则主 Agent 会反复申请重验或误判为接近完成。
+    semantic_verification = (state.get("claim_verification") or {}).get("semantic_verification") or {}
+    generation_quality = state.get("generation_quality") or {}
     used = int(state.get("recovery_action_count") or 0)
     ledger = state.get("agent_execution_budget") or {}
     execution_status = str(state.get("agent_execution_status") or "idle")
@@ -220,6 +230,12 @@ def _agent_state(state: dict[str, Any]) -> AgentStateContext:
             "claim_plans": len(state.get("claim_plans") or []),
             "has_review": bool(str(state.get("review") or "").strip()),
             "valid_citations": int(state.get("unique_valid_cited_paper_count") or 0),
+            "unverified_claims": int(
+                semantic_verification.get("not_completed")
+                or generation_quality.get("unverified_claims")
+                or 0
+            ),
+            "structural_claim_failures": int(semantic_verification.get("structural_failures") or 0),
         },
         remaining_action_budget=max(0, int(settings.recovery_total_action_budget) - used),
         budget_remaining={

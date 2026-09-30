@@ -90,6 +90,57 @@ def test_recovery_controller_rebuilds_claims_before_searching():
     assert decision.requires_user_input is False
 
 
+def test_failed_reverify_does_not_exhaust_independent_citation_repair():
+    state = _count_failure(eligible=5, authorized=4)
+    state["quality_gate"]["blocking_issues"].append({
+        "code": "claim_verification_incomplete", "message": "尚有主张未完成核验",
+    })
+    state["quality_recovery_history"] = [{
+        "action": RecoveryAction.REVERIFY_CLAIMS.value,
+        "outcome": "no_progress", "input_fingerprint": input_fingerprint(state),
+    }]
+    state["recovery_action_count"] = 1
+
+    decision = decide_generation_recovery(state, max_actions=6)
+
+    assert decision.action == RecoveryAction.REALLOCATE_CITATIONS
+    assert decision.remaining_budget == 5
+
+
+def test_started_recovery_is_not_treated_as_completed_attempt():
+    state = _count_failure(eligible=5, authorized=4)
+    state["quality_gate"]["blocking_issues"] = [{
+        "code": "claim_verification_incomplete", "message": "尚有主张未完成核验",
+    }]
+    state["quality_recovery_history"] = [{
+        "action": RecoveryAction.REVERIFY_CLAIMS.value,
+        "outcome": "started", "input_fingerprint": input_fingerprint(state),
+    }]
+    assert decide_generation_recovery(state, max_actions=6).action == RecoveryAction.REVERIFY_CLAIMS
+
+
+def test_changed_draft_invalidates_no_progress_action_history():
+    state = _count_failure(eligible=5, authorized=4)
+    state["review"] = "原稿 [p1]"
+    before = input_fingerprint(state)
+    state["review"] = "新稿 [p1]"
+    assert input_fingerprint(state) != before
+
+
+def test_allocation_gap_uses_stable_citation_source_after_rendering():
+    from app.agent.generation_recovery import _missing_allocation_sections
+
+    state = {
+        "review": "正文 [1]。",
+        "citation_rendered_text": "正文 [1]。",
+        "citation_source_text": "正文 [p1]。",
+        "citation_allocation_plans": [{"sections": [
+            {"section_id": "s1", "paper_ids": ["p1"]},
+        ]}],
+    }
+    assert _missing_allocation_sections(state) == []
+
+
 def test_recovery_progress_uses_persisted_final_valid_coverage():
     state = _count_failure(eligible=60, authorized=40)
     state["required_reference_count"] = 40
@@ -125,6 +176,23 @@ def test_private_research_state_keeps_transactional_generation_products():
     assert private["citation_map"] == state["citation_map"]
     assert private["claim_verification"] == state["claim_verification"]
     assert private["unique_valid_cited_paper_count"] == 1
+
+
+def test_blocked_output_quarantines_stale_release_flags_and_explains_quality_gap():
+    state = {
+        "result_status": "blocked", "review": "隔离草稿[p1]",
+        "references": ["测试参考文献"],
+        "quality_gate": {"passed": False, "draft_released": True,
+                         "blocking_issues": [{"code": "minimum_cited_references_not_met",
+                                              "requested": 40, "actual": 35}]},
+        "errors": [{"code": "main_agent_blocked", "message": "x" * 300}],
+    }
+    output = _build_output(state)
+    assert output["body"] == ""
+    assert output["references"] == []
+    assert output["draft_released"] is False
+    assert output["quality_gate"]["draft_released"] is False
+    assert "正文有效引用 35 篇，低于要求的 40 篇" in output["answer"]
 
 
 def test_final_answer_treats_missing_valid_count_as_zero():
@@ -263,19 +331,44 @@ def test_focus_gap_asks_user_when_expansion_forbidden():
 
 def test_focus_recovery_target_and_progress_use_the_blocking_issue():
     state = _focus_failure()
+    state["reference_coverage_stats"]["final_valid"] = 0
+    state["core_deliverables"] = ["research_status"]
+    state["research_semantic_frame"] = {"required_focuses": ["S-T分析法"]}
+    state["paper_cards"] = []
     decision = decide_generation_recovery(state, max_actions=6)
     state["active_quality_recovery"] = decision.model_dump(mode="json")
     state["quality_recovery_history"] = [{
         "progress_before": decision.progress.model_dump(mode="json"),
+        "input_fingerprint": input_fingerprint(state),
         "outcome": "started",
     }]
 
     assert active_focus_recovery_targets(state) == ["S-T分析法"]
-    state["quality_gate"]["blocking_issues"] = []
+    state["paper_cards"] = [{
+        "paper_id": "p-focus", "title": "S-T分析法的应用", "year": 2025,
+        "quality_status": "valid", "evidence_source": "abstract",
+        "relation_type": "direct", "eligible_deliverables": ["research_status"],
+    }]
     complete_recovery_action(state)
 
     assert state["quality_recovery_history"][-1]["outcome"] == "improved"
     assert "active_quality_recovery" not in state
+
+
+def test_clearing_or_deleting_old_gate_does_not_count_as_recovery_progress():
+    for remove_gate in (False, True):
+        state = _focus_failure()
+        decision = decide_generation_recovery(state, max_actions=6)
+        state["quality_recovery_history"] = [{
+            "progress_before": decision.progress.model_dump(mode="json"),
+            "input_fingerprint": input_fingerprint(state), "outcome": "started",
+        }]
+        if remove_gate:
+            state.pop("quality_gate")
+        else:
+            state["quality_gate"]["blocking_issues"] = []
+        complete_recovery_action(state)
+        assert state["quality_recovery_history"][-1]["outcome"] == "no_progress"
 
 
 def test_count_gap_keeps_cheaper_in_evidence_remedy_before_focus_search():
@@ -642,6 +735,171 @@ def test_repeated_incomplete_verification_stops_without_search_or_rewrite():
 
     assert decision.action == RecoveryAction.DEGRADE
     assert decision.status == RecoveryStatus.EXHAUSTED
+
+
+def test_structural_failures_do_not_schedule_reverify():
+    """T03：报告只剩结构性失败（无引用/缺片段）时不可调度 REVERIFY_CLAIMS。"""
+    state = {
+        "claim_verification": {
+            "unsupported": 2,
+            "unverified": 0,
+            "claims": [
+                {"claim_id": "c001", "verification_status": "verified",
+                 "citations": [], "evidence_snippets": [],
+                 "issues": ["factual_claim_without_citation"]},
+                {"claim_id": "c002", "verification_status": "verified",
+                 "citations": ["p1"], "evidence_snippets": [],
+                 "issues": ["missing_evidence_for_verification"]},
+            ],
+        },
+        "quality_gate": {
+            "passed": False,
+            "phase": "post_generation",
+            "blocking_issues": [{
+                "code": "claim_verification_incomplete",
+                "details": {"claim_ids": ["c001", "c002"]},
+            }],
+        },
+    }
+
+    decision = decide_generation_recovery(state, max_actions=4)
+
+    assert decision.action != RecoveryAction.REVERIFY_CLAIMS
+
+
+def test_genuine_semantic_pending_schedules_reverify():
+    """T03：满足前提但缺 provider 判定的主张仍是合格重验对象。"""
+    state = {
+        "claim_verification": {
+            "unsupported": 1,
+            "unverified": 1,
+            "claims": [
+                {"claim_id": "c001", "verification_status": "not_completed",
+                 "citations": ["p1"], "evidence_snippets": [{"text": "evidence"}],
+                 "issues": ["entailment_not_verified"]},
+            ],
+        },
+        "quality_gate": {
+            "passed": False,
+            "phase": "post_generation",
+            "blocking_issues": [{
+                "code": "claim_verification_incomplete",
+                "details": {"claim_ids": ["c001"]},
+            }],
+        },
+    }
+
+    decision = decide_generation_recovery(state, max_actions=4)
+
+    assert decision.action == RecoveryAction.REVERIFY_CLAIMS
+    assert decision.target_claim_ids == ["c001"]
+
+
+def test_legacy_access_failure_is_not_reverify_eligible():
+    from app.agent.generation_recovery import reverify_eligible_claim_ids, reverify_ineligible_claim_ids
+
+    state = {"claim_verification": {"claims": [{
+        "claim_id": "c001", "verification_status": "not_completed",
+        "citations": ["p1"], "evidence_snippets": [{"text": "abstract"}],
+        "issues": ["access_level_too_weak_for_claim", "entailment_not_verified"],
+    }]}}
+    assert reverify_eligible_claim_ids(state) == []
+    assert reverify_ineligible_claim_ids(state) == {"c001"}
+
+
+def _pending_verification_state():
+    return {
+        "review": "当前正文 [p1]。",
+        "claim_verification": {"unsupported": 1, "unverified": 1},
+        "quality_gate": {"passed": False, "phase": "post_generation",
+                         "blocking_issues": [{"code": "claim_verification_incomplete"}]},
+    }
+
+
+def test_same_input_fresh_reverification_counts_as_progress():
+    from app.agent.generation_recovery import start_recovery_action
+    from app.agent.graph import _draft_fingerprint
+
+    state = _pending_verification_state()
+    decision = decide_generation_recovery(state, max_actions=6)
+    start_recovery_action(state, decision)
+    before_input = input_fingerprint(state)
+    state["claim_verification"] = {"unsupported": 0, "unverified": 0}
+    state["quality_gate"] = {"passed": True, "phase": "post_generation", "blocking_issues": []}
+    state["autonomous_verified_fingerprint"] = _draft_fingerprint(state)
+    assert input_fingerprint(state) == before_input
+    complete_recovery_action(state)
+    assert state["quality_recovery_history"][-1]["outcome"] == "improved"
+
+
+def test_old_verification_fingerprint_cannot_authorize_cleared_gate():
+    from app.agent.generation_recovery import start_recovery_action
+    from app.agent.graph import _draft_fingerprint
+
+    state = _pending_verification_state()
+    state["autonomous_verified_fingerprint"] = _draft_fingerprint(state)
+    start_recovery_action(state, decide_generation_recovery(state, max_actions=6))
+    state["claim_verification"] = {"unsupported": 0, "unverified": 0}
+    state["quality_gate"]["blocking_issues"] = []
+    complete_recovery_action(state)
+    assert state["quality_recovery_history"][-1]["outcome"] == "no_progress"
+
+
+def test_replay_of_prior_verified_report_is_not_new_progress():
+    import copy
+    from app.agent.generation_recovery import start_recovery_action
+    from app.agent.graph import _draft_fingerprint
+
+    state = _pending_verification_state()
+    state["autonomous_verified_fingerprint"] = _draft_fingerprint(state)
+    start_recovery_action(state, decide_generation_recovery(state, max_actions=6))
+    state["claim_verification"] = copy.deepcopy(state["claim_verification"])
+    complete_recovery_action(state)
+    assert state["quality_recovery_history"][-1]["outcome"] == "no_progress"
+
+
+def test_same_input_rewrite_rejection_is_not_reselected_across_restart():
+    """T09：同输入下 REWRITE_SECTIONS 失败后不再被选中；约束随持久化状态跨重启有效。"""
+    state = _count_failure(eligible=6, authorized=4)
+    state["quality_gate"]["blocking_issues"] = [{
+        "code": "claim_evidence_quality_not_met", "message": "仍有未支持主张",
+    }]
+    fingerprint = input_fingerprint(state)
+    state["quality_recovery_history"] = [{
+        "action": RecoveryAction.REWRITE_SECTIONS.value,
+        "input_fingerprint": fingerprint,
+        "outcome": "no_progress",
+    }]
+
+    # 仅凭持久化状态重新决策（等价于外层恢复换层或进程重启后恢复）。
+    decision = decide_generation_recovery(state, max_actions=6)
+
+    assert decision.action != RecoveryAction.REWRITE_SECTIONS
+    assert decision.action == RecoveryAction.REBUILD_CLAIMS
+
+
+def test_substantive_evidence_change_reallows_same_rewrite_strategy():
+    """T09：只有证据实质变化（新指纹）才允许重新尝试同一重写策略。"""
+    state = _count_failure(eligible=6, authorized=4)
+    state["quality_gate"]["blocking_issues"] = [{
+        "code": "claim_evidence_quality_not_met", "message": "仍有未支持主张",
+    }]
+    old_fingerprint = input_fingerprint(state)
+    state["quality_recovery_history"] = [{
+        "action": RecoveryAction.REWRITE_SECTIONS.value,
+        "input_fingerprint": old_fingerprint,
+        "outcome": "no_progress",
+    }]
+    # 证据实质变化：新增一篇可用卡片 → 输入指纹改变。
+    state["paper_cards"] = [{
+        "paper_id": "p_new", "evidence_source": "abstract",
+        "quality_status": "valid", "evidence_state": {"access_level": "abstract"},
+    }]
+    assert input_fingerprint(state) != old_fingerprint
+
+    decision = decide_generation_recovery(state, max_actions=6)
+
+    assert decision.action == RecoveryAction.REWRITE_SECTIONS
 
 
 def test_checkpoint_promotion_rejects_sparse_and_duplicate_sections():

@@ -94,9 +94,22 @@ def allowed_actions(
             continue
         if spec.role is not None and spec.name not in handlers:
             continue
+        if spec.name in {"rewrite_sections", "generate_deliverables"}:
+            from app.agent.generation_recovery import rewrite_attempt_exhausted
+
+            if rewrite_attempt_exhausted(state):
+                continue
+        if spec.name == "search_and_rank" and state.get("active_quality_recovery"):
+            if (state.get("retrieval_profile") or {}).get("mode") == "hybrid":
+                pending = any(p.get("_pending_semantic_check") for p in state.get("ranked_papers") or [])
+                if not pending and not has_unsearched_queries(state):
+                    continue
         if spec.name == "targeted_search":
             from app.agent.evidence_recovery import targeted_search_kind
             if not targeted_search_kind(state):
+                continue
+        elif spec.name == "fetch_metadata" and (state.get("retrieval_profile") or {}).get("mode") == "hybrid":
+            if not admitted_ranked_papers(state):
                 continue
         elif any(not state.get(field) for field in spec.required_fields):
             continue
@@ -105,6 +118,58 @@ def allowed_actions(
         allowed.append(spec.name)
     # 控制动作始终可用；研究动作仍须由真实 handler 注册。
     return allowed
+
+
+def has_unsearched_queries(state: dict[str, Any]) -> bool:
+    """当前检索窗口是否还有尚未请求的查询。"""
+    if state.get("incremental_search_window"):
+        return True
+    queried = {str(item).strip().casefold() for item in state.get("searched_keywords") or []}
+    keywords = [str(item.get("keyword") or item.get("query") or "")
+                if isinstance(item, dict) else str(item)
+                for item in state.get("keywords") or [state.get("topic") or ""]]
+    return any(item.strip() and item.strip().casefold() not in queried for item in keywords)
+
+
+def admitted_ranked_papers(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """当前用户语义范围内，详情动作真正可以消费的混合检索结果。"""
+    if (state.get("retrieval_profile") or {}).get("mode") != "hybrid":
+        return list(state.get("ranked_papers") or [])
+    from app.services.retrieval_ranking_service import (
+        admission_scope_fingerprint, is_semantically_admitted,
+    )
+
+    scope = admission_scope_fingerprint(state)
+    return [paper for paper in state.get("ranked_papers") or []
+            if is_semantically_admitted(paper, scope_fingerprint=scope)]
+
+
+def recovery_handoff_action(state: dict[str, Any]) -> str:
+    """质量恢复后优先把已确认的候选推进到当前证据与授权。"""
+    if not state.get("active_quality_recovery") or state.get("intent") == "search_papers":
+        return ""
+    if (state.get("retrieval_profile") or {}).get("mode") != "hybrid":
+        return ""
+    from app.agent.nodes.base import _paper_identity_key
+
+    ranked = admitted_ranked_papers(state)
+    detail_ids = {_paper_identity_key(p) for p in state.get("paper_details") or []}
+    if any(_paper_identity_key(p) not in detail_ids for p in ranked):
+        return "fetch_metadata"
+    if not state.get("paper_details"):
+        return ""
+    cards = {_paper_identity_key(p): p for p in state.get("paper_cards") or []}
+    if any(_paper_identity_key(p) not in cards or
+           cards[_paper_identity_key(p)].get("relation_type") != p.get("_topic_relation") or
+           set(cards[_paper_identity_key(p)].get("eligible_deliverables") or []) !=
+           set(p.get("_eligible_deliverables") or [])
+           for p in state.get("paper_details") or []):
+        return "extract_paper_cards"
+    if state.get("paper_cards") and not state.get("validated_routes"):
+        return "validate_routes"
+    if state.get("paper_cards") and not state.get("claim_plans"):
+        return "plan_claims"
+    return ""
 
 
 def tool_schemas(names: list[str]) -> list[dict[str, Any]]:

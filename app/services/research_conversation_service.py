@@ -9,9 +9,10 @@ from sqlalchemy.orm import Session
 
 from app.agent.topic_disambiguation import (
     analyze_topic_ambiguity,
-    build_scoped_query,
+    resolve_scope,
     resolve_scope_conversational,
 )
+from app.agent.query_rewrite import rewrite_research_query
 from app.database.repositories import ResearchSessionRepository
 from app.schemas.agent_schema import AgentRequest, ResearchRevisionRequest
 from app.services.research_execution_service import with_artifact_store
@@ -66,6 +67,44 @@ _QUALITY_DECISION_ORDER: tuple[str, ...] = (
 def _quality_option_label(option_id: str) -> str:
     """取问句中使用的选项原文，使问句与解析器不可能各说各话。"""
     return _QUALITY_DECISION_OPTIONS[option_id][1]
+
+
+# WHY: 预算耗尽/截止/租约失权是硬性执行停止，代表系统已无法继续自动工作。
+# 会话结算必须如实呈现该停止原因，不能再转成质量澄清——否则用户被要求重新
+# 提交或选择恢复动作，重跑只会再次撞上同一停止，并把系统停止包装成"用户
+# 范围不明确"。取消/失权已分别落在 cancelled/failed 状态，这里覆盖预算类 blocked。
+_HARD_EXECUTION_STOP_CODES = {
+    "AgentBudgetExceeded", "agent_budget_exhausted",
+    "agent_token_budget_exhausted", "AgentExecutionStale",
+    "LLMProviderUnavailableError",
+}
+
+
+def _has_hard_execution_stop(result: dict[str, Any]) -> bool:
+    """判断结果是否因预算/截止/失权等硬性执行停止而终止。"""
+    candidates: list[Any] = list(result.get("errors") or [])
+    candidates.extend((result.get("research_state") or {}).get("errors") or [])
+    return any(
+        isinstance(item, dict) and item.get("code") in _HARD_EXECUTION_STOP_CODES
+        for item in candidates
+    )
+
+
+def _terminal_status_for_exception(exc: BaseException) -> str:
+    """把执行异常映射为会话终态，使 job/session/result 一致。
+
+    WHY: 租约失权（AgentExecutionStale）继承 AgentCancelledError 以复用取消
+    透传边界，但它不是用户取消，必须记 failed；否则前端显示"已取消"会掩盖
+    真实失权原因，且与 job 服务的 stale→failed 分类不一致。
+    """
+    from app.agent.graph import AgentCancelledError
+    from app.agent.execution_budget import AgentExecutionStale
+
+    if isinstance(exc, AgentExecutionStale):
+        return "failed"
+    if isinstance(exc, AgentCancelledError):
+        return "cancelled"
+    return "failed"
 
 
 _CHINESE_YEAR_DIGITS = {
@@ -211,6 +250,14 @@ class ResearchConversationService:
         # 避免把上一主题的论文池混入新主题。
         existing_session = self.repo.get(session_id)
         existing_state = (existing_session or {}).get("state") or {}
+        if "retrieval_profile" not in initial_state:
+            from app.core.config import get_settings
+
+            initial_state["retrieval_profile"] = (
+                existing_state.get("retrieval_profile")
+                or {"mode": "rules" if existing_session else get_settings().retrieval_ranking_mode,
+                    "version": "hybrid.v1"}
+            )
         from app.agent.orchestration import normalize_orchestration_mode
         initial_state["agent_orchestration_mode"] = normalize_orchestration_mode(
             existing_state if existing_session else initial_state
@@ -449,6 +496,7 @@ class ResearchConversationService:
             from app.agent.graph import _run_autonomous_pipeline
             from app.services.research_memory_service import ResearchMemoryService
             editable = dict(state.get("editable_research_state") or {})
+            prior_answers = list(editable.get("user_clarifications") or [])
             editable.setdefault("user_clarifications", []).append(answer)
             editable["session_id"] = session_id
             editable["user_operation_sequence"] = int(editable.get("user_operation_sequence") or 0) + 1
@@ -466,10 +514,18 @@ class ResearchConversationService:
             for key in keys:
                 editable[key] = updated_request[key] = getattr(slots, key)
             editable["research_request"] = updated_request
-            semantic_query = session["original_query"] + "\n用户补充约束：\n" + "\n".join(editable["user_clarifications"])
+            rewrite = rewrite_research_query(
+                session["original_query"], str(clarification.get("question") or ""),
+                answer, llm=self.llm, prior_answers=prior_answers,
+            )
+            editable["research_query_rewrite"] = rewrite
+            semantic_query = rewrite["rewritten_query"]
+            editable["user_query"] = semantic_query
+            grounding_query = session["original_query"] + "\n" + "\n".join(editable["user_clarifications"])
             editable["research_semantic_frame"] = parse_research_semantics(
                 semantic_query, str(editable.get("topic") or session["original_query"]),
                 deliverables=editable.get("core_deliverables") or [], llm=self.llm,
+                grounding_query=grounding_query,
             ).model_dump(mode="json")
             editable["semantic_frame_source_query"] = semantic_query
             editable.pop("autonomous_verified_fingerprint", None)
@@ -554,7 +610,7 @@ class ResearchConversationService:
                 "type": "clarification_answer",
             }
         )
-        if not selected:
+        if not selected and resolution.get("needs_clarification"):
             question = resolution.get("question") or "你希望这次研究主要侧重哪个方向？"
             history.append(
                 {
@@ -590,27 +646,79 @@ class ResearchConversationService:
                 "errors": [],
             }
 
-        state["selected_scope"] = selected
+        direct = resolve_scope(clarification, answer)
+        prior_answers = [
+            str(item.get("content") or "") for item in history[:-1]
+            if isinstance(item, dict) and item.get("type") == "clarification_answer"
+        ]
+        state["user_clarifications"] = [*prior_answers, answer]
+        explicit_exclusions = [
+            term.strip()
+            for clause in re.findall(r"(?:排除|不包括|不纳入|剔除)([^，。；;,\n]{1,40})", answer)
+            for term in re.split(r"[、]|(?:以及|并且)", clause)
+            if term.strip()
+        ]
+        # WHY: 自由回答可越过候选列表；模型匹配候选只作解释，不带入候选排除词和检索词。
+        state["selected_scope"] = {
+            "scope_id": str(direct.get("scope_id") or "confirmed") if direct else "user_clarification",
+            "label": str(direct.get("label") or answer) if direct else answer,
+            "description": "",
+            "include_terms": [],
+            "exclude_terms": list(dict.fromkeys(explicit_exclusions)),
+            "seed_queries": [],
+        }
         state["intent_context_role"] = "working_query"
         state["topic_interpretations"] = clarification.get("scopes") or []
-        scoped_query = build_scoped_query(
+        from app.agent.slot_extractor import extract_requested_sections, extract_slots
+        request_data = dict(state.get("research_request") or {})
+        # WHY: 前一轮澄清可能已修订篇数/年份；最终回答只给研究视角时不能
+        # 再退回原始数值。按用户轮次顺序合并，最后一次显式修订生效。
+        for clarification_text in [*prior_answers, answer]:
+            revision = extract_slots(
+                clarification_text,
+                request_data.get("task_type") or "generate_review",
+            )
+            if revision.year_range_explicit:
+                for key in ("start_year", "end_year", "year_range_explicit", "strict_year_range"):
+                    request_data[key] = getattr(revision, key)
+            if revision.max_papers_explicit:
+                for key in ("required_reference_count", "max_papers", "max_papers_explicit", "retrieval_target", "generation_limit"):
+                    request_data[key] = getattr(revision, key)
+            extra_sections = extract_requested_sections(clarification_text, "lookup")
+            if extra_sections:
+                request_data["requested_sections"] = (
+                    extra_sections if re.search(r"改为|只要|仅需", clarification_text)
+                    else list(dict.fromkeys([
+                        *(request_data.get("requested_sections") or []), *extra_sections,
+                    ]))
+                )
+        state["research_request"] = request_data
+        rewrite = rewrite_research_query(
             session["original_query"],
-            selected,
-            clarification_answer=answer,
+            str(clarification.get("question") or ""),
+            answer,
+            llm=self.llm,
+            confirmed_scope=str(direct.get("label") or "") if direct else "",
+            prior_answers=prior_answers,
         )
+        state["research_query_rewrite"] = rewrite
+        scoped_query = rewrite["rewritten_query"]
         from app.agent.research_semantic_parser import parse_research_semantics
 
-        semantic_query = (
-            session["original_query"].rstrip()
-            + "\n用户澄清原文（明确方法、对象、先后关系和分析目标均须保留）："
-            + answer.strip()
-        )
+        semantic_query = "\n".join([
+            session["original_query"].rstrip(), *prior_answers,
+            str(direct.get("label") or "") if direct else answer.strip(),
+        ])
         state["research_semantic_frame"] = parse_research_semantics(
-            semantic_query,
+            scoped_query,
             str((state.get("research_request") or {}).get("topic") or session["original_query"]),
             deliverables=state.get("core_deliverables") or [],
             llm=self.llm,
+            grounding_query=semantic_query,
         ).model_dump(mode="json")
+        state["semantic_frame_source_query"] = scoped_query
+        state.pop("compiled_scope", None)
+        state.pop("screening_protocol", None)
         return self._run_and_persist(
             session_id,
             scoped_query,
@@ -948,11 +1056,9 @@ class ResearchConversationService:
                 progress_callback=self.progress_callback,
             )
         except Exception as exc:
-            from app.agent.graph import AgentCancelledError
-
             self.repo.save(
                 session_id=session_id,
-                status="cancelled" if isinstance(exc, AgentCancelledError) else "failed",
+                status=_terminal_status_for_exception(exc),
                 original_query=original_query,
                 state=state,
             )
@@ -1115,7 +1221,16 @@ class ResearchConversationService:
             ),
             None,
         )
-        requested = int((count_issue or {}).get("requested") or 0)
+        requested = int(
+            (count_issue or {}).get("requested")
+            # WHY: 阻断列表缺少数量项时不得显示 requested=0；回退到权威需求
+            # （readiness/研究状态/结果保留的 required_reference_count），确保
+            # 用户始终看到真实的篇数要求（如 40），而不是被清空的 0。
+            or (result.get("generation_readiness") or {}).get("requested_minimum_references")
+            or (result.get("research_state") or {}).get("required_reference_count")
+            or result.get("required_reference_count")
+            or 0
+        )
         available = int(
             (count_issue or {}).get("available")
             or (count_issue or {}).get("actual")
@@ -1146,14 +1261,23 @@ class ResearchConversationService:
                 f"{_quality_option_label('broaden_scope')}或{_quality_option_label('stop')}。"
             )
         elif phase == "pre_generation":
+            # WHY: 写作前被阻断（授权/重点缺口等）不等于检查点缺失。只有
+            # _resume_checkpoint 的真实读取/还原失败才报告检查点不可恢复；这里
+            # 只陈述当前证据未达写作前提，并给出能推进任务的真实选项。
             question = (
-                "当前会话缺少执行自动恢复所需的可编辑检查点。请重新提交原始研究请求；"
-                "系统会重新核验已有证据后再决定是否需要补充检索。"
+                "当前证据尚未满足写作前的硬性要求，未通过核验的内容不会交付。"
+                f"你可以{_quality_option_label('best_effort_draft')}、"
+                f"{_quality_option_label('retry_search')}，"
+                f"或{_quality_option_label('stop')}。"
             )
         else:
+            # WHY: 普通门禁失败不得推断检查点缺失。草稿确已隔离（未发布），
+            # 如实说明并给出修复/最佳努力/停止的真实选项。
             question = (
-                "未通过验证的草稿已被隔离，但当前会话缺少可恢复检查点。"
-                "请重新提交原始研究请求，系统将从已保存证据重建写作计划。"
+                "未通过验证的草稿已被隔离，不会作为正式结果交付。"
+                f"你可以{_quality_option_label('conservative_rewrite')}、"
+                f"{_quality_option_label('best_effort_draft')}，"
+                f"或{_quality_option_label('stop')}。"
             )
         return {
             "kind": "quality_decision",
@@ -1217,11 +1341,9 @@ class ResearchConversationService:
                 progress_callback=self.progress_callback,
             )
         except Exception as exc:
-            from app.agent.graph import AgentCancelledError
-
             self.repo.save(
                 session_id=session_id,
-                status="cancelled" if isinstance(exc, AgentCancelledError) else "failed",
+                status=_terminal_status_for_exception(exc),
                 original_query=original_query,
                 state=state,
             )
@@ -1315,7 +1437,12 @@ class ResearchConversationService:
                            original_query=original_query, state=persisted_state, clarification=main_clarification)
             self.db.commit()
             return self._clarification_result(session_id, persisted_state, main_clarification, question)
-        clarification = self._quality_clarification(result) if result.get("status") not in {"failed", "cancelled"} else None
+        clarification = (
+            self._quality_clarification(result)
+            if result.get("status") not in {"failed", "cancelled"}
+            and not _has_hard_execution_stop(result)
+            else None
+        )
         if clarification:
             automatic = self._auto_recover_actionable_result(
                 session_id=session_id,
@@ -1403,6 +1530,7 @@ class ResearchConversationService:
                 "final_review_integrity", "citation_allocation_plan",
                 "citation_allocation_plans", "references", "reference_papers",
                 "citation_map", "citation_registry", "citation_validation",
+                "citation_source_text", "citation_rendered_text",
                 "generation_quality", "evidence_quality_report",
                 "unique_cited_paper_count", "unique_valid_cited_paper_count",
                 "final_requirement_met", "reference_coverage_stats",
@@ -1640,6 +1768,8 @@ class ResearchConversationService:
         history: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
         """恢复耗尽后，基于现有证据执行一次受控的最终草稿生成。"""
+        from app.core.config import get_settings
+
         editable = dict(result.get("research_state") or {})
         if editable.get("automatic_best_effort_attempted"):
             return None
@@ -1667,6 +1797,17 @@ class ResearchConversationService:
             or readiness.get("usable_reference_count")
             or 0
         )
+        requested_count = int(editable.get("required_reference_count") or 0)
+        if (
+            editable.get("max_papers_explicit")
+            and requested_count > 0
+            and usable_count / requested_count < float(
+                get_settings().reference_coverage_best_effort_ratio
+            )
+        ):
+            # WHY: 自动终局草稿也受用户新设的最低篇数比例约束；低于比例时
+            # 不耗费一次 Writer 调用。用户单独确认的手动草稿策略仍独立处理。
+            return None
         has_attributable_evidence = any(
             card.get("evidence_spans")
             or card.get("field_claims")
@@ -1789,8 +1930,14 @@ class ResearchConversationService:
             result = self.agent_runner(query, **runner_kwargs)
         except Exception as exc:
             from app.agent.graph import AgentCancelledError
+            from app.agent.execution_budget import AgentExecutionStale
 
-            cancelled = isinstance(exc, AgentCancelledError)
+            # WHY: 租约失效（AgentExecutionStale）继承 AgentCancelledError 以
+            # 复用透传，但语义是 failed：它不是用户主动取消。
+            cancelled = (
+                isinstance(exc, AgentCancelledError)
+                and not isinstance(exc, AgentExecutionStale)
+            )
             self.repo.save(
                 session_id=session_id,
                 status="cancelled" if cancelled else "failed",
@@ -1907,11 +2054,9 @@ class ResearchConversationService:
                 progress_callback=self.progress_callback,
             )
         except Exception as exc:
-            from app.agent.graph import AgentCancelledError
-
             self.repo.save(
                 session_id=request.session_id,
-                status="cancelled" if isinstance(exc, AgentCancelledError) else "failed",
+                status=_terminal_status_for_exception(exc),
                 original_query=session["original_query"],
                 state=state,
             )
@@ -1919,8 +2064,13 @@ class ResearchConversationService:
             raise
 
         # 与主流程 _persist_or_pause_result 对齐：门禁未过且无部分成功草稿时，
-        # 进入澄清流程，而不是把未达标结果标记为 completed。
-        clarification = self._quality_clarification(result)
+        # 进入澄清流程，而不是把未达标结果标记为 completed。硬性执行停止
+        # （预算/截止/失权）优先按停止原因结算，不得转成质量澄清。
+        clarification = (
+            self._quality_clarification(result)
+            if not _has_hard_execution_stop(result)
+            else None
+        )
         if clarification:
             revision_status = "needs_clarification"
         else:

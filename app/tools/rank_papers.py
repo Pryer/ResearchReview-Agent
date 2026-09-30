@@ -714,6 +714,7 @@ def evaluate_paper_hard_filters(
     language_branch: str = "",
     topic_synonyms: Sequence[str] | None = None,
     compiled_scope: Dict[str, Any] | None = None,
+    ranking_mode: str = "rules",
 ) -> tuple[bool, str, str]:
     """统一执行排序前与详情补全后的确定性硬过滤。
 
@@ -732,6 +733,29 @@ def evaluate_paper_hard_filters(
             topic=topic,
             research_mode=research_mode,
         )
+    if ranking_mode == "hybrid":
+        # WHY: 语义范围和协议逐篇条件仍是必需，但别名未命中只能标为待核验；
+        # 标题字面排除、年份和文献形态等确定性边界继续阻断。
+        passed, reason = evaluate_document_type_filter(paper)
+        if not passed:
+            return False, "document_type_filter", reason
+        passed, reason = evaluate_topic_filter(
+            paper, topic, excluded_title_terms=excluded_title_terms,
+            compiled_scope=compiled_scope,
+        )
+        if not passed:
+            return False, "topic_filter", reason
+        for term in _compiled_aliases(compiled_scope, "protocol_exclude"):
+            if excluded_term_matches_title(str(term), str(paper.get("title") or "")):
+                return False, "protocol_hard_filter", "标题命中协议排除词"
+        scope_passed, scope_reason = evaluate_scope_filter(
+            paper, scope, compiled_scope=compiled_scope,
+        )
+        if not scope_passed and "范围排除概念" in scope_reason:
+            return False, "scope_filter", scope_reason
+        # WHY: 这里只复核确定性边界；详情阶段也会调用本函数，不能覆盖先前
+        # 已验证且指纹仍有效的语义准入结论。待筛标签由融合候选入口设置。
+        return True, "pending_semantic_check", "等待语义范围及逐篇条件核验"
     protocol = screening_protocol or {}
     if protocol or compiled_scope is not None:
         if language_branch in {"zh", "en"}:

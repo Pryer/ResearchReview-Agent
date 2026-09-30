@@ -1,0 +1,19 @@
+{
+  "original_user_query": "调研近三年课堂行为分析论文，并生成研究背景和研究现状，引用论文不少于40篇",
+  "clarification_question": "你希望课堂行为分析重点研究什么视角与对象？",
+  "user_clarification": "教育技术视角下的课堂行为编码与分析",
+  "expected_working_query_contains": [
+    "近三年",
+    "教育技术视角",
+    "课堂行为编码与分析",
+    "研究背景",
+    "研究现状",
+    "不少于40篇"
+  ],
+  "expected_constraints": {
+    "required_reference_count": 40,
+    "requested_sections": ["background", "research_status"],
+    "candidate_exclusions_are_explicit": false
+  },
+  "note": "这只是输入和期望状态，不包含真实论文或声称文献任务已完成。"
+}

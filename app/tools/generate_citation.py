@@ -229,6 +229,9 @@ def validate_citations(
     references: List[str],
     paper_cards: Optional[List[Dict[str, Any]]] = None,
     reference_papers: Optional[List[Dict[str, Any]]] = None,
+    *,
+    numeric_citation_map: Dict[str, int] | None = None,
+    allow_positional_numeric: bool = False,
 ) -> Dict[str, Any]:
     """检查正文引用与参考文献是否匹配。
 
@@ -248,9 +251,12 @@ def validate_citations(
             if cid in valid_ids:
                 continue
             if cid.isdigit():
-                # 纯数字引用按证据卡片位次解析；越界编号如实报告缺失，
-                # 不能借 isdigit 豁免静默漏报。
-                if not 1 <= int(cid) <= len(paper_cards):
+                # WHY: 数字编号不能默认解释为当前卡片位次；直接调用者须显式声明语义。
+                if numeric_citation_map is not None:
+                    known = cid in {str(number) for number in numeric_citation_map.values()}
+                else:
+                    known = allow_positional_numeric and 1 <= int(cid) <= len(paper_cards)
+                if not known:
                     missing.append(cid)
                 continue
             missing.append(cid)
@@ -387,6 +393,9 @@ def generate_and_validate_citations(
     paper_cards: List[Dict[str, Any]],
     citation_style: str = "gbt7714",
     llm=None,
+    *,
+    numeric_citation_map: Dict[str, int] | None = None,
+    allow_positional_numeric: bool = False,
 ) -> Dict[str, Any]:
     """一站式：生成参考文献 + 校验。
 
@@ -405,7 +414,12 @@ def generate_and_validate_citations(
         for paper in paper_cards
         if paper.get("paper_id")
     }
-    if any(cid.isdigit() for cid in extract_citation_ids(review_text)):
+    if numeric_citation_map:
+        from app.core.citation_syntax import resolve_numbered_citations
+
+        # WHY: 正式正文编号按首次出现排序，不能再按证据卡片位置解释。
+        review_text = resolve_numbered_citations(review_text, numeric_citation_map)
+    elif allow_positional_numeric and any(cid.isdigit() for cid in extract_citation_ids(review_text)):
         # 纯数字引用按证据卡片位次解析为内部 ID，与显式 ID 路径统一；
         # 越界编号保留原样，由 validate_citations 如实报告缺失。
         def _resolve_numeric(match: re.Match[str]) -> str:

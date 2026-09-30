@@ -280,6 +280,22 @@ def test_large_task_patch_is_fragmented_and_restored_without_dropping_evidence(d
     assert service.hydrate_state("s", stored)["agent_task_results"] == results
 
 
+def test_cleared_claim_plans_do_not_reappear_from_old_artifact_manifest(db):
+    from app.services.research_artifact_service import ResearchArtifactService
+
+    service = ResearchArtifactService(db)
+    state = {"paper_cards": [{"paper_id": "p1"}],
+             "claim_plans": [{"claim_id": "old"}]}
+    stored = service.externalize_state("s", state)
+    live = service.hydrate_state("s", stored)
+    live.pop("claim_plans")
+    cleared = service.externalize_state("s", live)
+    restored = service.hydrate_state("s", cleared)
+    assert "claim_plans" not in restored
+    assert "claim_plans" not in cleared["artifact_manifest"]
+    assert restored["paper_cards"] == [{"paper_id": "p1"}]
+
+
 def test_additive_runtime_migration_is_idempotent_and_preserves_existing_session(tmp_path):
     from app.database.models import ResearchSessionModel
     from scripts.migrate_agent_runtime import migrate
@@ -352,6 +368,184 @@ def test_duplicate_job_delivery_never_executes_completed_job_again(db, monkeypat
     ResearchJobService._run_job("job")
     ResearchJobService._run_job("job")
     assert calls == [1]
+
+
+# ---------- 租约心跳（2026-09-27 事故回归） ----------
+
+def test_heartbeat_renews_lease_while_execution_is_alive(db):
+    """健康执行即使单步超过 TTL，心跳也会持续把租约向后推。"""
+    repo = ResearchRuntimeRepository(db, "hb-alive", ttl=0.9)
+    repo.acquire({}, {})
+    try:
+        first_until = db.get(ResearchRuntimeModel, "hb-alive").lease_until
+        # ttl/3 = 0.3s；等待足够覆盖至少两个续约周期。
+        time.sleep(0.75)
+        db.expire_all()
+        renewed_until = db.get(ResearchRuntimeModel, "hb-alive").lease_until
+        assert renewed_until > first_until + 0.3
+        repo.check()  # 不抛 RuntimeConflict 即续约生效
+    finally:
+        repo.release({})
+
+
+def test_heartbeat_stops_immediately_after_release(db):
+    repo = ResearchRuntimeRepository(db, "hb-release", ttl=0.6)
+    repo.acquire({}, {})
+    repo.release({})
+    assert repo._heartbeat_stop.is_set()
+    time.sleep(0.5)
+    assert not repo._heartbeat_thread.is_alive()
+    row = db.get(ResearchRuntimeModel, "hb-release")
+    assert row.owner is None
+    assert row.lease_until == 0
+
+
+def test_heartbeat_stops_when_cancelled_and_check_raises_cancelled(db):
+    from app.agent.execution_budget import AgentExecutionCancelled
+
+    repo = ResearchRuntimeRepository(db, "hb-cancel", ttl=0.6)
+    repo.acquire({}, {})
+    cancel_runtime(db, "hb-cancel")
+    db.commit()
+    with pytest.raises(AgentExecutionCancelled):
+        repo.check()
+    # 超过两个续约周期后心跳必须自行退出，且没有把租约续上。
+    time.sleep(0.7)
+    assert not repo._heartbeat_thread.is_alive()
+    repo.release({})
+
+
+def test_heartbeat_stops_after_owner_takeover_without_reviving_lease(db):
+    repo = ResearchRuntimeRepository(db, "hb-owner", ttl=0.6)
+    repo.acquire({}, {})
+    # 模拟租约过期窗口被另一个执行接管。
+    db.execute(update(ResearchRuntimeModel).where(
+        ResearchRuntimeModel.session_id == "hb-owner"
+    ).values(owner="another-owner"))
+    db.commit()
+    time.sleep(0.7)
+    assert not repo._heartbeat_thread.is_alive()
+    with pytest.raises(RuntimeConflict):
+        repo.check()
+    assert db.get(ResearchRuntimeModel, "hb-owner").owner == "another-owner"
+
+
+def test_heartbeat_renews_through_independent_connection_when_worker_session_closed(db):
+    """续约不依赖工作线程的请求级 Session：worker session 关闭后心跳仍在续。"""
+    repo = ResearchRuntimeRepository(db, "hb-detached", ttl=0.6)
+    repo.acquire({}, {})
+    try:
+        first_until = db.get(ResearchRuntimeModel, "hb-detached").lease_until
+        # 事故根因：心跳曾与工作线程共用同一个 SQLAlchemy Session；这里直接
+        # 关掉 worker session，独立连接上的续约必须继续成功。
+        db.close()
+        assert repo._renew_lease() is True
+        time.sleep(0.45)  # ttl/4=0.15，覆盖至少两个后台续约周期
+        with Session(db.bind) as reader:
+            renewed_until = reader.get(ResearchRuntimeModel, "hb-detached").lease_until
+        assert renewed_until > first_until + 0.2
+    finally:
+        repo.release({})
+
+
+def test_heartbeat_renews_while_worker_session_is_conversely_hammered(db):
+    """工作线程在无锁情况下高频使用自己的 Session 时，心跳续约不得被打断。"""
+    import threading
+    from sqlalchemy import event, text
+
+    engine = db.bind
+
+    @event.listens_for(engine, "connect")
+    def _busy_pragma(dbapi_connection, _record):  # 心跳使用独立新连接
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+
+    db.execute(text("PRAGMA journal_mode=WAL"))
+    db.execute(text("PRAGMA busy_timeout=30000"))
+    db.commit()
+    repo = ResearchRuntimeRepository(db, "hb-noise", ttl=0.6)
+    repo.acquire({}, {})
+    stop = threading.Event()
+
+    def hammer():
+        # 不经过 runtime.lock：复现服务层 repo.save/progress commit 等
+        # 与心跳并发操作同一 worker Session 的真实形态。
+        while not stop.wait(0.001):
+            db.execute(select(ResearchRuntimeModel).where(
+                ResearchRuntimeModel.session_id == "hb-noise"))
+            db.commit()
+
+    thread = threading.Thread(target=hammer, daemon=True)
+    thread.start()
+    try:
+        first_until = db.get(ResearchRuntimeModel, "hb-noise").lease_until
+        time.sleep(0.75)
+        stop.set()
+        thread.join(timeout=2)
+        db.expire_all()
+        renewed_until = db.get(ResearchRuntimeModel, "hb-noise").lease_until
+        assert renewed_until > first_until + 0.3
+        repo.check()  # 租约仍有效：没有因跨线程 Session 竞争而漏续
+    finally:
+        stop.set()
+        repo.release({})
+        event.remove(engine, "connect", _busy_pragma)
+
+
+def test_checkpoint_gate_raises_stale_once_lease_expired(db):
+    """节点边界 checkpoint 必须把过期租约识别为 AgentExecutionStale 终止。"""
+    from app.agent.execution import checkpoint
+    from app.agent.execution_budget import AgentExecutionStale
+
+    current = state()
+    with budget_scope(current):
+        with durable_scope(db, "hb-gate", current, current["agent_execution_budget"]):
+            db.execute(update(ResearchRuntimeModel).where(
+                ResearchRuntimeModel.session_id == "hb-gate"
+            ).values(lease_until=time.time() - 1))
+            db.commit()
+            with pytest.raises(AgentExecutionStale):
+                checkpoint(current, "rank_papers", 1, 3, None, None)
+
+
+def test_llm_layer_converts_lease_conflict_to_stale_termination(db):
+    """账本 CAS/租约冲突冒到 LLM 边界时必须转为 Stale，不得包装成可降级 LLM 失败。"""
+    from app.services.llm_service import LLMService
+    from app.agent.execution_budget import AgentExecutionStale
+    from app.database.runtime_repository import RuntimeConflict
+
+    service = LLMService()
+    service.api_key, service.backup_enabled = "test", False
+
+    def create(**kwargs):
+        raise RuntimeConflict("execution lease expired or changed")
+
+    service._client = NS(chat=NS(completions=NS(create=create)))
+    current = state()
+    with budget_scope(current):
+        with durable_scope(db, "llm-stale", current, current["agent_execution_budget"]):
+            with pytest.raises(AgentExecutionStale):
+                service.complete("test", max_tokens=20)
+
+
+def test_check_execution_converts_expired_lease_to_stale_termination(db):
+    """租约过期后执行闸门必须抛 AgentExecutionStale 并被所有取消边界透传。"""
+    from app.agent.execution_budget import (
+        AgentExecutionStale,
+        check_execution,
+    )
+
+    current = state()
+    with budget_scope(current):
+        with durable_scope(db, "hb-stale", current, current["agent_execution_budget"]):
+            db.execute(update(ResearchRuntimeModel).where(
+                ResearchRuntimeModel.session_id == "hb-stale"
+            ).values(lease_until=time.time() - 1))
+            db.commit()
+            with pytest.raises(AgentExecutionStale):
+                check_execution()
+    assert issubclass(AgentExecutionStale, AgentExecutionCancelled)
 
 
 def test_explicit_budget_update_preserves_usage_and_survives_restore(db):

@@ -12,6 +12,35 @@ def client_with_usage(usage):
     return NS(chat=NS(completions=NS(create=create))), create
 
 
+@pytest.mark.parametrize('reasoning', [None, 15])
+def test_reasoning_details_persist_without_double_counting_or_inventing_unknown(monkeypatch, reasoning):
+    runtime = Mock()
+    runtime.reserve_attempt.return_value = 'attempt'
+    monkeypatch.setattr('app.services.durable_execution_service.active_runtime', lambda: runtime)
+    usage = NS(total_tokens=120, prompt_tokens=100, completion_tokens=20,
+               completion_tokens_details=NS(reasoning_tokens=reasoning))
+    client, _ = client_with_usage(usage)
+    state = {}
+    with budget_scope(state):
+        budgeted_create(client, messages=[], max_tokens=200)
+    persisted = runtime.settle_attempt.call_args.args[1]
+    assert persisted['total_tokens'] == 120
+    assert state['agent_execution_budget']['llm_tokens'] == 120
+    if reasoning is None:
+        assert 'reasoning_tokens' not in persisted
+    else:
+        assert persisted['reasoning_tokens'] == reasoning
+
+
+def test_old_failed_result_has_safe_balance_reason_for_frontend():
+    from app.agent.public_errors import public_result_failure_reason
+    reason = public_result_failure_reason({'errors': [{
+        'code': 'LLMInvocationError', 'message': '402 Insufficient Balance request_id: SECRET',
+    }]})
+    assert '余额不足' in reason
+    assert 'SECRET' not in reason
+
+
 @pytest.mark.parametrize("cache_ratio", [0, 0.8, 1])
 def test_full_output_and_cached_input_cannot_evade_total_token_limit(cache_ratio):
     state = {"agent_execution_budget": {"token_limit": 800, "cache_hit_ratio": cache_ratio}}
@@ -74,3 +103,33 @@ def test_latest_stop_reason_takes_precedence_over_recovered_error():
         "errors": ["search: recovered", {"code": "agent_no_progress", "message": "no progress"}]})
     assert "实质研究进展" in output["answer"]
     assert "search" not in output["answer"]
+
+
+def test_reservation_rejection_logs_safe_diagnostic_and_sends_no_request(caplog):
+    """T08：余额非零但不足预留时 provider 调用为 0，预留未占用且诊断不泄漏 prompt。"""
+    import logging
+
+    state = {"agent_execution_budget": {"token_limit": 1000}}
+    client, create = client_with_usage(None)
+    secret_prompt = "SECRET_PROMPT_CONTENT 机密提示词"
+    with caplog.at_level(logging.WARNING):
+        with budget_scope(state):
+            with pytest.raises(AgentBudgetExceeded, match="reservation exceeds remaining"):
+                budgeted_create(
+                    client,
+                    operation="verify_claim_entailment",
+                    messages=[{"role": "user", "content": secret_prompt}],
+                    max_tokens=5000,
+                )
+    create.assert_not_called()
+    ledger = state["agent_execution_budget"]
+    assert ledger.get("tokens_reserved", 0) == 0
+    assert ledger.get("llm_tokens", 0) == 0
+    # 拒绝前未调用 provider 的请求不计为已发送。
+    assert ledger.get("llm_requests", 0) == 0
+    diagnostic = "\n".join(record.getMessage() for record in caplog.records)
+    assert "BUDGET_RESERVATION_REJECTED" in diagnostic
+    assert "stage=reservation" in diagnostic
+    assert "verify_claim_entailment" in diagnostic
+    assert secret_prompt not in diagnostic
+    assert "SECRET_PROMPT_CONTENT" not in diagnostic

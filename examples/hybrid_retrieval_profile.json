@@ -1,0 +1,6 @@
+{
+  "k": 2,
+  "split": "dev",
+  "dataset_kind": "synthetic_algorithm_fixture_not_real_papers",
+  "annotation_version": "synthetic-v1"
+}

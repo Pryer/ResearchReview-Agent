@@ -8,10 +8,18 @@ from collections import deque
 from collections.abc import Callable
 from typing import Any
 
-from app.agent.action_registry import action_spec, allowed_actions, validate_arguments
+from app.agent.action_registry import (
+    action_spec, admitted_ranked_papers, allowed_actions, recovery_handoff_action,
+    validate_arguments,
+)
 from app.agent.context_builder import refresh_main_agent_context
 from app.agent.controller import AgentController
-from app.agent.execution_budget import AgentBudgetExceeded, budget_scope, check_execution
+from app.agent.execution_budget import (
+    AgentBudgetExceeded,
+    AgentExecutionStale,
+    budget_scope,
+    check_execution,
+)
 from app.agent.execution import AgentCancelledError
 from app.core.exceptions import LLMInvocationError
 from app.agent.main_policy import AgentDecisionError, MainAgentPolicy
@@ -31,6 +39,15 @@ def _progress_fingerprint(state: dict[str, Any]) -> str:
     payload = {
         "scope": state.get("selected_scope") or {},
         "candidates": stable_items(state.get("candidate_papers")),
+        # WHY: 排序抖动不算进展；逐篇语义合同确认后才算新增可处理材料。
+        "admitted_ranked": sorted({json.dumps({
+            "id": paper.get("paper_id") or paper.get("id") or paper.get("title"),
+            "content": paper.get("_screened_content_fingerprint"),
+            "scope": paper.get("_screened_scope_fingerprint"),
+            "relation": paper.get("_topic_relation"),
+            "eligible": sorted(paper.get("_eligible_deliverables") or []),
+        }, ensure_ascii=False, sort_keys=True) for paper in admitted_ranked_papers(state)})
+        if (state.get("retrieval_profile") or {}).get("mode") == "hybrid" else [],
         "details": stable_items(state.get("paper_details")),
         "cards": stable_items(state.get("paper_cards")),
         "routes": stable_items(state.get("validated_routes")),
@@ -58,8 +75,17 @@ class MainAgentLoop:
             with budget_scope(state, should_cancel):
                 return self._run(state, handlers=handlers, finish_validator=finish_validator,
                                  should_cancel=should_cancel)
-        except (AgentBudgetExceeded, AgentCancelledError, AgentDecisionError, LLMInvocationError, RuntimeConflict) as exc:
-            status = "cancelled" if isinstance(exc, AgentCancelledError) else "blocked" if isinstance(exc, AgentBudgetExceeded) else "failed"
+        except (AgentBudgetExceeded, AgentExecutionStale, AgentCancelledError, AgentDecisionError, LLMInvocationError, RuntimeConflict) as exc:
+            # WHY: AgentExecutionStale 继承 AgentCancelledError 以复用取消
+            # 透传，但租约失效不是用户取消，结果状态必须是 failed。
+            if isinstance(exc, AgentExecutionStale):
+                status = "failed"
+            elif isinstance(exc, AgentCancelledError):
+                status = "cancelled"
+            elif isinstance(exc, AgentBudgetExceeded):
+                status = "blocked"
+            else:
+                status = "failed"
             state["result_status"] = status
             if status == "blocked":
                 state["generation_blocked"] = True
@@ -84,6 +110,12 @@ class MainAgentLoop:
             if should_cancel and should_cancel():
                 state["result_status"] = "cancelled"
                 return "cancelled"
+            # WHY: 用户要求可用草稿时，已验证且获门禁释放的正文应确定性收尾；
+            # mandatory 恢复任务仍须履行，partial 标志本身不能跳过 finish 校验。
+            gate = state.get("quality_gate") or {}
+            if (state.get("best_effort_generation") and not state.get("agent_mandatory_actions")
+                    and gate.get("draft_released") and finish_validator(state)):
+                return str(state.get("result_status") or "partial")
             names = allowed_actions(state, set(handlers))
             mandatory = list(state.get("agent_mandatory_actions") or [])
             if mandatory:
@@ -98,6 +130,9 @@ class MainAgentLoop:
                     })
                     return "blocked"
                 names = [action_name]
+            handoff = recovery_handoff_action(state) if not mandatory else ""
+            if handoff and handoff in names:
+                names = [handoff]
             from app.services.research_execution_service import checkpoint_artifacts
             checkpoint_artifacts(state)
             state["allowed_agent_actions"] = names
@@ -116,6 +151,11 @@ class MainAgentLoop:
                         action=action_name,
                         arguments=arguments,
                         reason="履行已选定的质量恢复动作",
+                    )
+                elif handoff and handoff in names:
+                    decision = AgentDecision(
+                        action=handoff, arguments={},
+                        reason="推进已确认论文到当前证据与主张授权",
                     )
                 else:
                     decision = self.policy.decide(snapshot.context, allowed_actions=names)
@@ -173,6 +213,17 @@ class MainAgentLoop:
                     })
                     return "failed"
                 try:
+                    from app.agent.nodes.base import _paper_identity_key
+                    detail_before = {
+                        _paper_identity_key(paper): json.dumps(paper, ensure_ascii=False,
+                                                               sort_keys=True, default=str)
+                        for paper in state.get("paper_details") or []
+                    } if action == "fetch_metadata" else {}
+                    evidence_before = {
+                        key: json.dumps(state.get(key) or [], ensure_ascii=False,
+                                        sort_keys=True, default=str)
+                        for key in ("paper_details", "paper_cards")
+                    } if action in {"fetch_metadata", "extract_paper_cards"} else {}
                     result = self.controller.execute(
                         role=spec.role,
                         operation=action,
@@ -196,6 +247,26 @@ class MainAgentLoop:
                 if result.status.value in {"failed", "cancelled"}:
                     state["result_status"] = result.status.value
                     return result.status.value
+                if evidence_before and any(
+                    evidence_before[key] != json.dumps(state.get(key) or [], ensure_ascii=False,
+                                                        sort_keys=True, default=str)
+                    for key in evidence_before
+                ):
+                    # WHY: 子任务只提交自身契约字段；主控在证据提交后失效旧路线、
+                    # 主张与门禁，避免恢复时跨证据版本继续使用旧授权。
+                    from app.agent.graph import _GENERATION_PRODUCT_KEYS
+                    if action == "fetch_metadata":
+                        current_details = {
+                            _paper_identity_key(paper): json.dumps(paper, ensure_ascii=False,
+                                                                   sort_keys=True, default=str)
+                            for paper in state.get("paper_details") or []
+                        }
+                        state["paper_cards"] = [card for card in state.get("paper_cards") or []
+                                                if (key := _paper_identity_key(card)) in current_details
+                                                and detail_before.get(key) == current_details[key]]
+                    for key in (*_GENERATION_PRODUCT_KEYS, "validated_routes", "route_decisions",
+                                "autonomous_verified_fingerprint"):
+                        state.pop(key, None)
 
             current_progress = _progress_fingerprint(state)
             no_progress = no_progress + 1 if current_progress == previous_progress else 0

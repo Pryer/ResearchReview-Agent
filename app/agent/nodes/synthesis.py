@@ -184,6 +184,10 @@ def validate_routes_node(state: "ResearchAgentState", llm=None) -> "ResearchAgen
             len(state["route_decisions"]),
         )
     except Exception as e:
+        from app.agent.execution_budget import is_control_exception
+
+        if is_control_exception(e):
+            raise
         logger.warning("validate_routes_node failed: %s", e)
         state["validated_routes"] = []
         state["route_decisions"] = []
@@ -242,6 +246,10 @@ def cluster_node(state: "ResearchAgentState", llm=None) -> "ResearchAgentState":
             duration_ms=int((time.time() - t0) * 1000),
         )
     except Exception as e:
+        from app.agent.execution_budget import is_control_exception
+
+        if is_control_exception(e):
+            raise
         from app.agent.exceptions import LLMGenerationError
 
         error = LLMGenerationError(str(e), step="cluster", original_error=e)
@@ -502,6 +510,7 @@ def generate_deliverables_node(
         from app.agent.deliverable_router import (
             check_deliverable_readiness,
             check_generation_readiness,
+            permits_reference_coverage_writing,
             resolve_core_deliverables,
         )
         from app.agent.writing_plan import build_writing_plan
@@ -535,8 +544,25 @@ def generate_deliverables_node(
         ):
             state["forced_generation_issues"] = list(global_readiness.blocking_issues)
             global_readiness = global_readiness.model_copy(update={"ready": True})
+        coverage_writing_allowed = permits_reference_coverage_writing(
+            state, global_readiness,
+        )
         state["generation_readiness"] = global_readiness.model_dump(mode="json")
-        if not global_readiness.ready:
+        state["generation_readiness"]["partial_writing_allowed"] = coverage_writing_allowed
+        if coverage_writing_allowed:
+            previous_gate = state.get("quality_gate") or {}
+            previous_codes = {
+                str(issue.get("code") or "")
+                for issue in previous_gate.get("blocking_issues") or []
+                if isinstance(issue, dict)
+            }
+            if previous_gate.get("phase") == "pre_generation" and previous_codes <= {
+                "minimum_references_not_met", "minimum_planned_references_not_met",
+            }:
+                # WHY: 已授权的 85% 写作可从旧篇数阻断续跑；上轮门禁只属于
+                # 未写作的旧版本，不能阻止新正文完成后的真实验证。
+                state.pop("quality_gate", None)
+        if not global_readiness.ready and not coverage_writing_allowed:
             issue_lines = "\n".join(
                 f"- {item.get('message')}" for item in global_readiness.blocking_issues
             )
@@ -815,10 +841,10 @@ def generate_deliverables_node(
             duration_ms=int((time.time() - t0) * 1000),
         )
     except Exception as exc:
-        from app.agent.graph import AgentCancelledError
+        from app.agent.execution_budget import is_control_exception
 
-        if isinstance(exc, AgentCancelledError):
-            # 协作式取消必须继续向上传播，不能被包装成生成失败。
+        if is_control_exception(exc):
+            # WHY: 执行停止必须保留原类型，不能包装成可降级的写作质量失败。
             raise
         logger.error("generate_deliverables_node failed: %s", exc)
         # P1 集成：LLM 生成/写作管线失败可降级（fallback 模板），用
@@ -1005,9 +1031,12 @@ def _backfill_global_citation_union(
                         "backfill_citations:"
                         f"{allocation.get('deliverable_type') or index}"
                     ),
-                    thinking_enabled=True,
                 )
             except Exception as exc:
+                from app.agent.execution_budget import is_control_exception
+
+                if is_control_exception(exc):
+                    raise
                 logger.warning("Citation backfill LLM call failed: %s", exc)
                 continue
         if not revised or not revised.strip():
@@ -1435,6 +1464,10 @@ def _plan_citation_allocation(
                     if paper_id in allowed and paper_id not in proposed[section_id]
                 )
         except Exception as exc:
+            from app.agent.execution_budget import is_control_exception
+
+            if is_control_exception(exc):
+                raise
             logger.warning(
                 "Citation allocation planning failed: %s; using deterministic allocation",
                 exc,
@@ -1784,6 +1817,14 @@ def _apply_final_quality_gate(state: "ResearchAgentState") -> None:
         recovery.append("按章节重新生成并在引用检查前后各执行一次成文完整性验证")
 
     citation_validation = state.get("citation_validation") or {}
+    if (state.get("generation_readiness") or {}).get("partial_writing_allowed") and not citation_validation:
+        # WHY: 85% 只放宽进入 Writer 的篇数条件；该路径若未完成最终引用
+        # 校验，不能把缺失报告解释为引用有效或直接发布正文。
+        issues.append({
+            "code": "citation_verification_incomplete",
+            "message": "正文引用校验尚未完成，无法确认有效引用篇数",
+        })
+        recovery.append("完成引用与参考文献校验后重新判定")
     unknown_publication_status = list(
         citation_validation.get("unknown_publication_status") or []
     )
@@ -2024,21 +2065,19 @@ def _apply_final_quality_gate(state: "ResearchAgentState") -> None:
     coverage_ratio = (
         valid_count / requested_count if requested_count > 0 else 1.0
     )
-    from app.agent.generation_recovery import recovery_action_count
-
-    recovery_exhausted = recovery_action_count(state) >= int(
-        settings.recovery_total_action_budget
-    )
     reference_best_effort_release = bool(
         settings.enable_reference_coverage_best_effort_release
-        and recovery_exhausted
+        and state.get("best_effort_on_failure") is not False
+        and (state.get("generation_quality") or {}).get("passed") is True
+        and (state.get("citation_validation") or {}).get("valid") is True
+        and (not state.get("claim_plans") or bool(state.get("claim_citation_consistency")))
         and issue_codes == {"minimum_cited_references_not_met"}
         and coverage_ratio >= float(settings.reference_coverage_best_effort_ratio)
     )
     if reference_best_effort_release:
         # WHY: 原始 required_reference_count 不变，门禁仍为未通过；这里只在
-        # 自动恢复耗尽且没有其他质量失败时释放 partial 草稿，避免 39/40 因
-        # 单篇缺口隐藏正文，也避免用篇数比例稀释主张或引用正确性问题。
+        # 没有其他质量失败且最终有效引用达到比例时释放 partial 草稿，
+        # 避免篇数缺口隐藏已验证正文，也不稀释主张或引用正确性问题。
         warnings.append({
             "code": "reference_coverage_best_effort_released",
             "message": (
@@ -2057,8 +2096,16 @@ def _apply_final_quality_gate(state: "ResearchAgentState") -> None:
         if draft:
             state["quarantined_draft"] = draft
         state["generation_blocked"] = True
-        best_effort_released = bool(
-            state.get("best_effort_generation") or reference_best_effort_release
+        automatic_count_allowed = bool(
+            not state.get("automatic_best_effort_generation")
+            or not state.get("max_papers_explicit")
+            or requested_count <= 0
+            or coverage_ratio >= float(settings.reference_coverage_best_effort_ratio)
+        )
+        from app.agent.generation_recovery import draft_has_unsafe_quality
+        best_effort_released = not draft_has_unsafe_quality(state, issues) and bool(
+            (state.get("best_effort_generation") and automatic_count_allowed)
+            or reference_best_effort_release
         )
         state["quality_gate"] = {
             "passed": False,
@@ -2144,15 +2191,15 @@ def _assemble_answer(state: "ResearchAgentState") -> str:
         if quality_gate.get("draft_released") is True:
             draft = state.get("quarantined_draft") or state.get("review") or ""
             issues = quality_gate.get("blocking_issues") or []
-            issue_lines = "\n".join(f"- {item.get('message')}" for item in issues)
+            issue_lines = "\n".join(f"> - {item.get('message')}" for item in issues if item.get('message'))
             gate_warnings = quality_gate.get("warnings") or []
             warning_lines = "\n".join(
-                f"- {item.get('message')}" for item in gate_warnings if item.get("message")
+                f"> - {item.get('message')}" for item in gate_warnings if item.get("message")
             )
-            warning_block = f"\n> {warning_lines}" if warning_lines else ""
+            warning_block = f"\n{warning_lines}" if warning_lines else ""
             warning_banner = (
                 "\n\n> ⚠️ **质量门禁提示（部分满足）**\n>\n"
-                f"> {issue_lines}{warning_block}\n>\n"
+                f"{issue_lines}{warning_block}\n>\n"
                 "> 以下内容为未完全达标草稿，仅供参考，请补充检索或降低引用要求后重新生成。\n\n"
             )
             references = state.get("references") or []

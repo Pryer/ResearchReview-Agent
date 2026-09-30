@@ -504,14 +504,7 @@ def _verify_review_claims_legacy(
                 if issue != "low_claim_evidence_overlap"
             ]
             if not result:
-                issues.append("entailment_not_verified")
-                revised_claims.append(claim.model_copy(update={
-                    "support_status": "unsupported",
-                    "verification_status": "not_completed",
-                    "verification_method": "semantic",
-                    "issues": list(dict.fromkeys(issues)),
-                    "suggested_revision": "未完成语义蕴含验证；请重试验证或删除该主张。",
-                }))
+                revised_claims.append(_revise_unverified_claim(claim, issues))
                 continue
             label = str(result.get("label") or "insufficient").lower()
             try:
@@ -932,11 +925,19 @@ def verify_review_claims(
     }
     output["verification_stats"] = output["verification_scope"]
     output["verification_mode"] = "semantic" if llm is not None else "deterministic"
+    # WHY: 结构失败（无引用/引用无效/缺片段/访问不足）与语义待验是两类分母。
+    # 前者重验永远 submitted=0，必须单独计数，避免被混进"未完成语义核验"
+    # 让恢复链反复选中空重验；二者都仍计入 unsupported 进入整体质量判断。
+    structural_failures = sum(
+        1 for claim in factual_claims
+        if set(claim.issues) & _STRUCTURAL_VERIFICATION_ISSUES
+    )
     output["semantic_verification"] = {
         "requested": cache_stats["reused"] + cache_stats["computed"] + unverified,
         "cache_reused": cache_stats["reused"],
         "completed": cache_stats["reused"] + cache_stats["computed"],
         "not_completed": unverified,
+        "structural_failures": structural_failures,
         "llm_batches_attempted": llm_batch_stats["attempted"],
         "llm_batches_failed": llm_batch_stats["failed"],
         "llm_claims_submitted": llm_batch_stats["claims_submitted"],
@@ -972,6 +973,57 @@ def _entailment_fingerprint(claim: ClaimEvidenceResult) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+# 结构性失败：主张缺少可核验的引用或证据片段，语义蕴含永远无法补齐，必须
+# 直接判不受支持并交给引用修复/弱化/删除/补证，而不是被反复选进空重验。
+_STRUCTURAL_VERIFICATION_ISSUES = {
+    "factual_claim_without_citation", "citation_not_found",
+    "access_level_too_weak_for_claim", "evidence_level_too_weak_for_result_claim",
+    "missing_evidence_for_verification",
+}
+
+
+def has_semantic_verification_evidence(claim: ClaimEvidenceResult | Dict[str, Any]) -> bool:
+    """模型对象和持久化报告共用同一语义验证前提。"""
+    value = claim.get if isinstance(claim, dict) else lambda key, default=None: getattr(claim, key, default)
+    # WHY: 有摘要片段不代表能够核验全文级主张；结构硬失败优先于片段存在。
+    return bool(value("factual", True) and value("citations") and value("evidence_snippets")) and not (
+        set(value("issues", []) or []) & _STRUCTURAL_VERIFICATION_ISSUES
+    )
+
+
+def _revise_unverified_claim(
+    claim: ClaimEvidenceResult,
+    issues: List[str],
+) -> ClaimEvidenceResult:
+    """把"未拿到 provider 判定"的主张区分为结构性失败与真正待补的语义判定。
+
+    WHY: 二者都缺最终判定，但只有满足验证前提（有引用且有证据片段）却未拿到
+    provider 结论的主张才可能靠重验补齐；无引用/引用无效/缺片段的主张重验永远
+    submitted=0，若标成 not_completed 会让恢复链反复选中空重验、烧预算无进展。
+    结构性失败按确定性已核验的不受支持处理，仍阻断门禁但不再进入重验队列。
+    """
+    if has_semantic_verification_evidence(claim):
+        issues.append("entailment_not_verified")
+        return claim.model_copy(update={
+            "support_status": "unsupported",
+            "verification_status": "not_completed",
+            "verification_method": "semantic",
+            "issues": list(dict.fromkeys(issues)),
+            "suggested_revision": "未完成语义蕴含验证；请重试验证或删除该主张。",
+        })
+    if not any(issue in _STRUCTURAL_VERIFICATION_ISSUES for issue in issues):
+        issues.append("missing_evidence_for_verification")
+    return claim.model_copy(update={
+        "support_status": "unsupported",
+        "verification_status": "verified",
+        "verification_method": "deterministic",
+        "issues": list(dict.fromkeys(issues)),
+        "suggested_revision": (
+            "该主张缺少可核验的引用或证据片段；请补充能直接支持的证据、修正引用，或删除该主张。"
+        ),
+    })
+
+
 def _apply_llm_entailment(
     claims: List[ClaimEvidenceResult],
     llm,
@@ -985,7 +1037,7 @@ def _apply_llm_entailment(
     fingerprints: Dict[str, str] = {}
     reused = 0
     for claim in claims:
-        if not (claim.factual and claim.citations and claim.evidence_snippets):
+        if not has_semantic_verification_evidence(claim):
             continue
         fingerprint = _entailment_fingerprint(claim)
         fingerprints[claim.claim_id] = fingerprint
@@ -1023,14 +1075,7 @@ def _apply_llm_entailment(
             if issue != "low_claim_evidence_overlap"
         ]
         if not result:
-            issues.append("entailment_not_verified")
-            revised.append(claim.model_copy(update={
-                "support_status": "unsupported",
-                "verification_status": "not_completed",
-                "verification_method": "semantic",
-                "issues": list(dict.fromkeys(issues)),
-                "suggested_revision": "未完成语义蕴含验证；请重试验证或删除该主张。",
-            }))
+            revised.append(_revise_unverified_claim(claim, issues))
             continue
         label = str(result.get("label") or "insufficient").lower()
         try:
@@ -1071,6 +1116,19 @@ def _apply_llm_entailment(
     return revised, {"reused": reused, "computed": len(computed_results)}, batch_stats
 
 
+def _safe_failure_reason(exc: BaseException) -> str:
+    """返回可安全持久化的失败原因：仅异常类型名，不含 prompt、凭据或原始消息。
+
+    WHY: 失败原因要能区分超时/解析/调用错误以便诊断，但验证报告会随状态
+    持久化，provider 原始消息可能携带 URL 或敏感片段，故只保留类型名链。
+    """
+    names = [type(exc).__name__]
+    cause = exc.__cause__
+    if cause is not None and type(cause).__name__ != names[0]:
+        names.append(type(cause).__name__)
+    return ":".join(names)
+
+
 def _llm_entailment_results(
     claims: List[ClaimEvidenceResult],
     llm,
@@ -1080,7 +1138,7 @@ def _llm_entailment_results(
     """批量判断证据是否蕴含主张；失败或漏项由调用方按未验证处理。"""
     factual = [
         claim for claim in claims
-        if claim.factual and claim.citations and claim.evidence_snippets
+        if has_semantic_verification_evidence(claim)
     ]
     results: Dict[str, Dict[str, Any]] = {}
     for start in range(0, len(factual), 12):
@@ -1118,15 +1176,40 @@ def _llm_entailment_results(
             from app.core.json_utils import parse_json_object
 
             data = parse_json_object(response if isinstance(response, str) else str(response))
+            valid_ids = {claim.claim_id for claim in batch}
+            invalid_result = False
             for item in data.get("results") or []:
                 if not isinstance(item, dict):
+                    invalid_result = True
                     continue
                 claim_id = str(item.get("claim_id") or "")
-                if claim_id in {claim.claim_id for claim in batch}:
-                    results[claim_id] = item
-        except Exception:
+                label = str(item.get("label") or "").strip().lower()
+                # WHY: 缺项/非法标签不是模型的否定结论。只接收合法 verdict，
+                # 其余保持语义待验，不能计 completed 或污染判定缓存。
+                if claim_id not in valid_ids or label not in {"entailed", "contradicted", "insufficient"}:
+                    invalid_result = True
+                    continue
+                results[claim_id] = {**item, "label": label}
+            missing_results = valid_ids - results.keys()
+            if batch_stats is not None and (invalid_result or missing_results):
+                batch_stats["failed"] += 1
+                batch_stats.setdefault("failure_reasons", []).append(
+                    "InvalidEntailmentResult" if invalid_result else "MissingEntailmentResult"
+                )
+        except Exception as exc:
+            # WHY: 预算耗尽/取消/租约失权/账本冲突是停止信号，必须立即传播并
+            # 终止后续批次；吞掉它会让已停止的会话继续发起验证与备用调用（只
+            # 烧费），并把"系统停止"误报成"N 条判定失败"。普通 provider 超时、
+            # 缺项、解析失败仍按可恢复失败处理：记未完成、保留原因，不伪造否定。
+            from app.agent.execution_budget import is_control_exception
+
+            if is_control_exception(exc):
+                raise
             if batch_stats is not None:
                 batch_stats["failed"] += 1
+                batch_stats.setdefault("failure_reasons", []).append(
+                    _safe_failure_reason(exc)
+                )
             continue
     return results
 

@@ -18,6 +18,7 @@ from app.database.models import Base
 from app.database.repositories import ResearchSessionRepository
 from app.schemas.agent_schema import AgentRequest
 from app.services.research_conversation_service import ResearchConversationService
+from app.agent.query_rewrite import rewrite_research_query
 
 
 class AmbiguousLLM:
@@ -51,6 +52,164 @@ class AmbiguousLLM:
           ]
         }
         """
+
+
+def test_clarification_rewrite_uses_user_scope_without_candidate_exclusions(monkeypatch):
+    class RewriteLLM(AmbiguousLLM):
+        def complete(self, prompt: str, **kwargs) -> str:
+            if kwargs.get("operation") == "research_query_rewrite":
+                return json.dumps({"rewritten_query": (
+                    "调研近三年教育技术视角下的课堂行为编码与分析论文，"
+                    "生成研究背景和研究现状，最终引用不同论文不少于40篇"
+                )}, ensure_ascii=False)
+            if kwargs.get("operation") == "scope_answer_resolution":
+                return json.dumps({"matched_scope_ids": ["scope_a"], "needs_clarification": False})
+            return super().complete(prompt, **kwargs)
+
+    db = _db_session()
+    calls = []
+    import app.agent.planner as planner
+    from app.agent.nodes.planning import plan_node
+
+    planned_queries = []
+    original_build = planner.build_search_plan
+
+    def capture_plan(query, *args, **kwargs):
+        planned_queries.append(query)
+        return original_build(query, *args, **kwargs)
+
+    monkeypatch.setattr(planner, "build_search_plan", capture_plan)
+
+    def runner(query, db=None, initial_state=None):
+        calls.append((query, initial_state))
+        planned_state = {**initial_state, "user_query": query, "steps": [], "errors": []}
+        plan_node(planned_state, llm=None, current_year=2026)
+        assert planned_state["required_reference_count"] == 40
+        assert (planned_state["start_year"], planned_state["end_year"]) == (2024, 2026)
+        assert planned_state["semantic_frame_source_query"] == query
+        return {"answer": "完成", "steps": [], "references": [], "paper_cards": [],
+                "clusters": [], "errors": []}
+
+    service = ResearchConversationService(db, llm=RewriteLLM(), agent_runner=runner)
+    original = "调研近三年课堂行为分析论文，并生成研究背景和研究现状，引用论文不少于40篇"
+    service.handle(AgentRequest(user_query=original, session_id="rewrite-free-answer"))
+    service.handle(AgentRequest(
+        user_query="教育技术视角下的课堂行为编码与分析",
+        clarification_answer="教育技术视角下的课堂行为编码与分析",
+        session_id="rewrite-free-answer",
+    ))
+    query, state = calls[0]
+    assert "教育技术视角下的课堂行为编码与分析" in query
+    assert "不少于40篇" in query
+    assert state["semantic_frame_source_query"] == query
+    assert state["research_query_rewrite"]["source"] == "llm_validated"
+    constraints = state["research_query_rewrite"]["preserved_constraints"]
+    assert any(item["field"] == "required_reference_count" and item["value"] == 40
+               and item["source_turn"] == "original" for item in constraints)
+    assert state["selected_scope"]["exclude_terms"] == []
+    assert "自动识别" not in query
+    assert planned_queries == [query]
+
+
+def test_rewrite_rejects_dropped_reference_requirement():
+    class InvalidRewrite:
+        def complete(self, prompt, **kwargs):
+            return '{"rewritten_query":"调研教育技术课堂行为编码论文"}'
+
+    result = rewrite_research_query(
+        "调研近三年课堂行为论文，引用不少于40篇，生成研究背景和研究现状",
+        "你侧重什么？", "课堂行为编码", llm=InvalidRewrite(),
+    )
+    assert result["source"] == "conservative_merge"
+    assert "40篇" in result["rewritten_query"]
+
+
+def test_rewrite_rejects_candidate_exclusion_inserted_by_model():
+    class ExtraExclusion:
+        def complete(self, prompt, **kwargs):
+            return json.dumps({"rewritten_query": (
+                "调研近三年课堂行为编码论文，引用不少于40篇，"
+                "生成研究背景和研究现状；排除课堂观察研究"
+            )}, ensure_ascii=False)
+
+    result = rewrite_research_query(
+        "调研近三年课堂行为论文，引用不少于40篇，生成研究背景和研究现状",
+        "研究视角？", "课堂行为编码", llm=ExtraExclusion(),
+    )
+    assert result["source"] == "conservative_merge"
+    assert "排除课堂观察" not in result["rewritten_query"]
+
+
+def test_latest_explicit_reference_revision_replaces_previous_count():
+    class RevisedCount:
+        def complete(self, prompt, **kwargs):
+            return json.dumps({"rewritten_query": (
+                "调研近三年课堂行为编码论文，生成研究背景和研究现状，"
+                "最终引用不同论文不少于50篇"
+            )}, ensure_ascii=False)
+
+    result = rewrite_research_query(
+        "调研近三年课堂行为论文，生成研究背景和研究现状，引用不少于40篇",
+        "还需要修改什么？", "改为引用不少于50篇，聚焦课堂行为编码", llm=RevisedCount(),
+    )
+    assert result["source"] == "llm_validated"
+    assert "50篇" in result["rewritten_query"]
+    assert "40篇" not in result["rewritten_query"]
+    assert any(item["field"] == "required_reference_count" and item["value"] == 50
+               and item["source_turn"] == "clarification"
+               for item in result["preserved_constraints"])
+
+
+def test_rewrite_preserves_hard_constraint_from_intermediate_clarification():
+    class IntermediateRevision:
+        def complete(self, prompt, **kwargs):
+            return json.dumps({"rewritten_query": (
+                "调研近三年教育技术课堂行为编码论文，生成研究背景和研究现状，"
+                "最终引用不同论文不少于50篇"
+            )}, ensure_ascii=False)
+
+    result = rewrite_research_query(
+        "调研近三年课堂行为论文，生成研究背景和研究现状，引用不少于40篇",
+        "请确认研究视角？", "教育技术视角下的课堂行为编码与分析",
+        prior_answers=["引用要求改为不少于50篇"], llm=IntermediateRevision(),
+    )
+    assert result["source"] == "llm_validated"
+    assert "50篇" in result["rewritten_query"]
+    assert any(item["field"] == "required_reference_count" and item["value"] == 50
+               and item["source_turn"] == "clarification_1"
+               for item in result["preserved_constraints"])
+
+
+def test_invalid_rewrite_cannot_fall_back_to_conflicting_old_count():
+    class DroppedRevision:
+        def complete(self, prompt, **kwargs):
+            return '{"rewritten_query":"调研课堂行为编码论文，引用不少于40篇"}'
+
+    import pytest
+    with pytest.raises(ValueError, match="最新用户硬约束"):
+        rewrite_research_query(
+            "调研课堂行为论文，引用不少于40篇",
+            "是否修改篇数？", "改为引用不少于50篇",
+            llm=DroppedRevision(),
+        )
+
+
+def test_scope_answer_can_introduce_a_new_user_scope():
+    class NewScopeLLM:
+        def complete(self, prompt, **kwargs):
+            return json.dumps({
+                "matched_scope_ids": [], "custom_scope": "供应链韧性视角下的组织决策",
+                "needs_clarification": False, "question": None,
+            }, ensure_ascii=False)
+
+    clarification = {"question": "选择研究范围", "scopes": [
+        {"scope_id": "technical", "label": "算法检测", "exclude_terms": ["组织决策"]},
+    ]}
+    resolved = resolve_scope_conversational(
+        clarification, "供应链韧性视角下的组织决策", llm=NewScopeLLM(),
+    )
+    assert resolved["selected_scope"]["scope_id"] == "user_clarification"
+    assert resolved["selected_scope"]["exclude_terms"] == []
 
 
 class ConversationalScopeLLM:
@@ -468,7 +627,8 @@ def test_conversation_service_resumes_original_request_after_scope_selection():
     assert resumed["status"] == "completed"
     assert len(calls) == 1
     assert "调研近三年课堂行为分析" in calls[0]["query"]
-    assert "研究范围确认：范围甲" in calls[0]["query"]
+    assert "范围甲" in calls[0]["query"]
+    assert "概念乙" not in calls[0]["query"]
     assert calls[0]["state"]["research_request"]["required_reference_count"] == 40
     assert calls[0]["state"]["selected_scope"]["scope_id"] == "scope_a"
     assert ResearchSessionRepository(db).get("session-2")["status"] == "completed"
@@ -628,7 +788,8 @@ def test_conversation_service_keeps_asking_one_question_until_scope_is_clear():
     assert final["status"] == "completed"
     assert len(calls) == 1
     saved = ResearchSessionRepository(db).get("free-chat")
-    assert saved["state"]["selected_scope"]["scope_id"] == "technical"
+    assert saved["state"]["selected_scope"]["scope_id"] == "user_clarification"
+    assert saved["state"]["selected_scope"]["exclude_terms"] == []
 
 
 def test_related_work_clarifies_user_paper_profile_before_search():
@@ -1270,6 +1431,7 @@ def test_exhausted_shared_recovery_budget_runs_final_best_effort(monkeypatch):
         lambda: SimpleNamespace(
             recovery_total_action_budget=6,
             enable_recovery_exhausted_best_effort_generation=True,
+            reference_coverage_best_effort_ratio=0.85,
         ),
     )
     monkeypatch.setattr("app.agent.graph.regenerate_research_agent", fake_regenerate)
@@ -1301,6 +1463,22 @@ def test_exhausted_shared_recovery_budget_runs_final_best_effort(monkeypatch):
     assert regenerated[0]["allow_unvalidated_taxonomy"] is True
 
 
+def test_exhausted_automatic_generation_skips_evidence_below_85_percent():
+    db = _db_session()
+    service = ResearchConversationService(
+        db, llm=ClearTopicLLM(), agent_runner=lambda *args, **kwargs: {}
+    )
+    editable = _quality_blocked_result(required=40, available=33)["research_state"]
+    editable["reference_coverage_stats"] = {"evidence_backed": 33}
+    result = service._run_exhausted_best_effort_generation(
+        session_id="below-85", original_query="调研课堂行为分析",
+        state={}, result={"research_state": editable},
+        decision={"issues": [{"code": "minimum_references_not_met"}]},
+        history=[],
+    )
+    assert result is None
+
+
 def test_exhausted_best_effort_generation_can_be_disabled(monkeypatch):
     from types import SimpleNamespace
 
@@ -1309,6 +1487,7 @@ def test_exhausted_best_effort_generation_can_be_disabled(monkeypatch):
         lambda: SimpleNamespace(
             recovery_total_action_budget=6,
             enable_recovery_exhausted_best_effort_generation=False,
+            reference_coverage_best_effort_ratio=0.85,
         ),
     )
     db = _db_session()
@@ -1340,6 +1519,7 @@ def test_request_strict_policy_overrides_enabled_best_effort_default(monkeypatch
         lambda: SimpleNamespace(
             recovery_total_action_budget=6,
             enable_recovery_exhausted_best_effort_generation=True,
+            reference_coverage_best_effort_ratio=0.85,
         ),
     )
     db = _db_session()
@@ -1374,6 +1554,7 @@ def test_exhausted_best_effort_generation_runs_at_most_once(monkeypatch):
         lambda: SimpleNamespace(
             recovery_total_action_budget=6,
             enable_recovery_exhausted_best_effort_generation=True,
+            reference_coverage_best_effort_ratio=0.85,
         ),
     )
     monkeypatch.setattr(
@@ -1806,3 +1987,55 @@ def test_unauthorized_failed_draft_is_blocked_instead_of_partial_when_budget_exh
     assert persisted["status"] == "blocked"
     assert "QUARANTINE_SENTINEL" not in persisted["answer"]
     assert ResearchSessionRepository(db).get("quarantined-result")["status"] == "blocked"
+
+
+def test_budget_stop_with_checkpoint_settles_blocked_not_missing_checkpoint_clarification():
+    """T07：有检查点的预算终止按 blocked 结算，不转成"缺少检查点"澄清。"""
+    db = _db_session()
+    service = ResearchConversationService(
+        db, llm=ClearTopicLLM(), agent_runner=lambda *args, **kwargs: {},
+    )
+    # 该结果带有真实篇数缺口（会触发质量澄清），但终止原因是预算耗尽。
+    result = _quality_blocked_result(required=3, available=2)
+    result["status"] = "blocked"
+    result["errors"] = [
+        {"code": "AgentBudgetExceeded",
+         "message": "token reservation exceeds remaining budget"}
+    ]
+    # 检查点确实存在：可编辑状态与运行期检查点版本均已保存。
+    result["research_state"]["runtime_checkpoint_version"] = 7
+    state = {
+        "editable_research_state": result["research_state"],
+        "runtime_checkpoint_version": 7,
+    }
+
+    persisted = service._persist_or_pause_result(
+        "budget-stop", "调研近三年课堂行为分析并引用不少于3篇", state, result,
+    )
+
+    # 硬性执行停止优先：不得包装成 needs_clarification 让用户重新提交。
+    assert persisted["status"] == "blocked"
+    assert ResearchSessionRepository(db).get("budget-stop")["status"] == "blocked"
+
+
+def test_quality_clarification_preserves_authoritative_required_count():
+    """P0-C：阻断列表缺少数量项时 requested 回退到权威需求，不显示 0。"""
+    result = {
+        "status": "blocked",
+        "quality_gate": {
+            "passed": False,
+            "phase": "post_generation",
+            "blocking_issues": [
+                {"code": "claim_evidence_quality_not_met", "message": "支持率不足"}
+            ],
+        },
+        "generation_readiness": {"requested_minimum_references": 40},
+        "paper_cards": [{"paper_id": "p1"}],
+    }
+
+    clarification = ResearchConversationService._quality_clarification(result)
+
+    assert clarification is not None
+    assert clarification["requested"] == 40
+    # 普通门禁失败不得推断检查点缺失。
+    assert "检查点" not in clarification["question"]

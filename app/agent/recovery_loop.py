@@ -357,8 +357,10 @@ def run_route_evidence_recovery(
                 # reranking over the full accumulated pool on every round.
                 # The LLM remains responsible for semantic gap diagnosis and
                 # novel recovery-query planning upstream.
-                rank_node(state, llm=None)
-                fetch_detail_node(state, should_cancel=should_cancel)
+                rank_node(state, llm=llm if (state.get("retrieval_profile") or {}).get("mode") == "hybrid" else None)
+                fetch_detail_node(state, should_cancel=should_cancel, **(
+                    {"llm": llm} if (state.get("retrieval_profile") or {}).get("mode") == "hybrid" else {}
+                ))
                 if settings.enable_pdf_pipeline:
                     download_pdf_node(state)
                     if should_parse_pdf(state):

@@ -17,8 +17,14 @@ from typing import Any, Optional
 from openai import APIConnectionError, APIStatusError, APITimeoutError, BadRequestError
 
 from app.core.config import get_settings
-from app.core.exceptions import LLMInvocationError, NativeToolsUnsupportedError
-from app.agent.execution_budget import budgeted_create, AgentBudgetExceeded, AgentExecutionCancelled
+from app.core.exceptions import LLMInvocationError, LLMProviderUnavailableError, NativeToolsUnsupportedError
+from app.database.runtime_repository import RuntimeConflict
+from app.agent.execution_budget import (
+    budgeted_create,
+    AgentBudgetExceeded,
+    AgentExecutionCancelled,
+    AgentExecutionStale,
+)
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -48,6 +54,7 @@ class LLMService:
         self.model = settings.llm_model
         self.provider = settings.llm_provider
         self.thinking_enabled = settings.llm_thinking_enabled
+        self.reasoning_mode = settings.llm_reasoning_mode
         self.thinking_effort = settings.llm_thinking_effort
         self.thinking_max_tokens = settings.llm_thinking_max_tokens
         self.temperature = settings.llm_temperature
@@ -64,6 +71,31 @@ class LLMService:
         self.backup_provider = settings.llm_backup_provider
         self.backup_enabled = settings.llm_backup_enabled
         self._backup_client = None
+
+    def _providers(self):
+        from app.agent.execution_budget import active_budget
+        active = active_budget()
+        disabled = active.setdefault("unfunded_llm_providers", set()) if active is not None else set()
+        providers = []
+        # WHY: 余额拒绝只在当前执行中短路；新执行可在充值后恢复，不做进程永久缓存。
+        for name, enabled, model, provider, url, key in (
+            ("primary", bool(self.api_key), self.model, self.provider, self.base_url, self.api_key),
+            ("backup", self.backup_enabled, self.backup_model, self.backup_provider,
+             self.backup_base_url, self.backup_api_key),
+        ):
+            if enabled and (url, key) not in disabled:
+                providers.append((name, self.client if name == "primary" else self.backup_client, model, provider))
+        if not providers and disabled:
+            raise LLMProviderUnavailableError("configured LLM providers have insufficient balance")
+        return providers
+
+    def _record_unfunded_provider(self, name):
+        from app.agent.execution_budget import active_budget
+        active = active_budget()
+        if active is not None:
+            identity = ((self.base_url, self.api_key) if name == "primary"
+                        else (self.backup_base_url, self.backup_api_key))
+            active.setdefault("unfunded_llm_providers", set()).add(identity)
 
     @property
     def client(self):
@@ -136,10 +168,11 @@ class LLMService:
             return ""
 
         started = time.monotonic()
-        effective_requested_thinking = (
-            self.thinking_enabled
-            if thinking_enabled is None
-            else thinking_enabled
+        from app.services.reasoning_policy import choose_reasoning
+        effective_requested_thinking, effective_effort = choose_reasoning(
+            operation, mode=self.reasoning_mode,
+            default_enabled=self.thinking_enabled, default_effort=self.thinking_effort,
+            requested_enabled=thinking_enabled, requested_effort=reasoning_effort,
         )
         is_writing_operation = (
             operation == "completion"
@@ -186,13 +219,7 @@ class LLMService:
             base_kwargs["response_format"] = {"type": "json_object"}
 
         # 主用 → 备用 两段式，每个 provider 一次尝试，不做同提供商重试。
-        providers: list[tuple[str, object, str, str]] = []
-        if self.api_key:
-            providers.append(("primary", self.client, self.model, self.provider))
-        if self.backup_enabled:
-            providers.append(
-                ("backup", self.backup_client, self.backup_model, self.backup_provider)
-            )
+        providers = self._providers()
 
         try:
             last_exc: Exception | None = None
@@ -210,11 +237,7 @@ class LLMService:
                 # extra_body 传递厂商扩展字段；关闭后 token 会用于最终正文，
                 # 不再大量消耗在 reasoning_content。其他兼容提供商不接收该字段。
                 if provider.strip().lower() == "deepseek":
-                    effective_thinking = (
-                        self.thinking_enabled
-                        if thinking_enabled is None
-                        else thinking_enabled
-                    )
+                    effective_thinking = effective_requested_thinking
                     kwargs["extra_body"] = {
                         "thinking": {
                             "type": "enabled" if effective_thinking else "disabled"
@@ -225,9 +248,16 @@ class LLMService:
                     # 日志与调用方误以为最终写作仍受温度值控制。
                     if effective_thinking:
                         kwargs["extra_body"]["reasoning_effort"] = (
-                            reasoning_effort or self.thinking_effort
+                            effective_effort
                         )
                         kwargs.pop("temperature", None)
+                logger.info(
+                    "LLM_POLICY operation=%s provider=%s mode=%s requested_thinking=%s sent_thinking=%s effort=%s max_tokens=%s",
+                    operation, provider, self.reasoning_mode, effective_requested_thinking,
+                    effective_requested_thinking if provider.strip().lower() == "deepseek" else "unknown",
+                    effective_effort if effective_requested_thinking and provider.strip().lower() == "deepseek" else "unknown",
+                    kwargs["max_tokens"],
+                )
                 try:
                     content = self._attempt_once(
                         kwargs,
@@ -249,6 +279,8 @@ class LLMService:
                         continue  # 切到备用
                     break  # 备用也失败，跳出
                 except APIStatusError as e:
+                    if e.status_code == 402:
+                        self._record_unfunded_provider(prov_name)
                     if e.status_code in _RETRYABLE_STATUS_CODES:
                         last_exc = e
                         logger.warning(
@@ -300,10 +332,17 @@ class LLMService:
                 return content
 
             # 两个提供商都失败：让最后一次异常冒泡到外层 except，统一包成 LLMInvocationError。
+            if isinstance(last_exc, APIStatusError) and last_exc.status_code == 402:
+                raise LLMProviderUnavailableError("configured LLM providers have insufficient balance") from last_exc
             raise last_exc  # type: ignore[misc]
 
-        except (AgentBudgetExceeded, AgentExecutionCancelled):
+        except (AgentBudgetExceeded, AgentExecutionCancelled, LLMProviderUnavailableError):
             raise
+        except RuntimeConflict as exc:
+            # WHY: 账本 CAS/租约检查在个别路径上仍可能抛出裸 RuntimeConflict；
+            # 它是执行失权终止信号，绝不能包装成 LLMInvocationError，否则会被
+            # 节点当"LLM 暂时失败"降级为模板兜底，在失权会话里继续空转烧费。
+            raise AgentExecutionStale(str(exc)) from exc
         except Exception as e:
             logger.error(
                 "LLM_CALL_FAILED operation=%s duration_ms=%d error=%s",
@@ -336,11 +375,12 @@ class LLMService:
         if not self.api_key and not self.backup_enabled:
             raise LLMInvocationError("no LLM provider configured for tool decision")
         normalized = self._validate_messages(messages)
-        providers: list[tuple[str, object, str, str]] = []
-        if self.api_key:
-            providers.append(("primary", self.client, self.model, self.provider))
-        if self.backup_enabled:
-            providers.append(("backup", self.backup_client, self.backup_model, self.backup_provider))
+        from app.services.reasoning_policy import choose_reasoning
+        effective_thinking, effective_effort = choose_reasoning(
+            operation, mode=self.reasoning_mode,
+            default_enabled=False, default_effort=self.thinking_effort,
+        )
+        providers = self._providers()
         last_exc: Exception | None = None
         unsupported = False
         deadline = time.monotonic() + self.failover_total_timeout
@@ -359,22 +399,38 @@ class LLMService:
                 "timeout": min(self.request_timeout, remaining),
             }
             if provider.strip().lower() == "deepseek":
-                kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+                kwargs["extra_body"] = {"thinking": {"type": "enabled" if effective_thinking else "disabled"}}
+                if effective_thinking:
+                    # WHY: DeepSeek Chat Completions 思考模式不接受 required tool_choice。
+                    kwargs.pop("tool_choice", None)
+                    kwargs.pop("temperature", None)
+                    kwargs["extra_body"]["reasoning_effort"] = effective_effort
+            logger.info(
+                "LLM_TOOL_POLICY operation=%s provider=%s mode=%s requested_thinking=%s sent_thinking=%s effort=%s max_tokens=%s",
+                operation, provider, self.reasoning_mode, effective_thinking,
+                effective_thinking if provider.strip().lower() == "deepseek" else "unknown",
+                effective_effort if effective_thinking and provider.strip().lower() == "deepseek" else "unknown",
+                self.control_plane_max_tokens,
+            )
             started = time.monotonic()
             usage = {}
             def record_tool_response(response):
                 usage.update(self._record_usage(
                     getattr(response, "usage", None), model=model,
                     operation=operation, provider=provider, started=started,
+                    request_kwargs=kwargs,
                 ))
             try:
-                response = budgeted_create(client, on_response=record_tool_response, **kwargs)
+                response = budgeted_create(client, on_response=record_tool_response, operation=operation, **kwargs)
                 choices = getattr(response, "choices", None) or []
                 calls = (
                     getattr(choices[0].message, "tool_calls", None) or []
                     if choices else []
                 )
                 if len(calls) != 1:
+                    if provider.strip().lower() == "deepseek" and effective_thinking:
+                        # WHY: 思考模式只能自动选择工具；未选择时交回主控的 JSON 动作纠错通道。
+                        raise NativeToolsUnsupportedError("thinking tool response did not select one action")
                     raise ValueError("provider must return exactly one tool call")
                 call = calls[0]
                 arguments = json.loads(call.function.arguments or "{}")
@@ -404,6 +460,8 @@ class LLMService:
                 break
             except APIStatusError as exc:
                 last_exc = exc
+                if exc.status_code == 402:
+                    self._record_unfunded_provider(provider_name)
                 if (
                     exc.status_code in _RETRYABLE_STATUS_CODES
                     and provider_name == "primary"
@@ -418,6 +476,8 @@ class LLMService:
                 break
         if unsupported:
             raise NativeToolsUnsupportedError("provider does not support native tool calls") from last_exc
+        if isinstance(last_exc, APIStatusError) and last_exc.status_code == 402:
+            raise LLMProviderUnavailableError("configured LLM providers have insufficient balance") from last_exc
         raise LLMInvocationError(f"LLM tool decision failed: {last_exc}")
 
     def for_agent(self, role: str):
@@ -448,6 +508,7 @@ class LLMService:
         operation: str,
         provider: str,
         started: float,
+        request_kwargs: dict[str, Any] | None = None,
     ) -> dict[str, int]:
         """把一次真实响应的用量记入指标，并返回可随结果传递的用量字典。
 
@@ -465,11 +526,20 @@ class LLMService:
         }
         if usage:
             from app.core.metrics import get_metrics_collector
+            extra_body = (request_kwargs or {}).get("extra_body") or {}
+            sent_type = (extra_body.get("thinking") or {}).get("type")
+            reasoning_sent = (
+                sent_type == "enabled" if sent_type in {"enabled", "disabled"} else None
+            )
+            completion_details = getattr(usage, "completion_tokens_details", None)
+            reasoning_tokens = getattr(completion_details, "reasoning_tokens", None)
             get_metrics_collector().record_llm_call(
                 model=str(model or self.model),
                 duration_ms=int((time.monotonic() - started) * 1000),
                 operation=operation,
                 provider=provider,
+                reasoning_sent=reasoning_sent,
+                reasoning_tokens=reasoning_tokens,
                 **tokens,
             )
         return tokens
@@ -501,6 +571,7 @@ class LLMService:
                 operation=operation,
                 provider=provider,
                 started=started,
+                request_kwargs=kwargs,
             )
 
         def _content_of(resp) -> str:
@@ -512,9 +583,9 @@ class LLMService:
                 return ""
             return choices[0].message.content or ""
 
-        resp = self._call_with_possible_fallback(kwargs, response_format, client=client, record=_record)
+        resp = self._call_with_possible_fallback(kwargs, response_format, client=client, record=_record, operation=operation)
         if retry_empty:
-            resp = self._retry_if_content_empty(kwargs, resp, client=client, record=_record)
+            resp = self._retry_if_content_empty(kwargs, resp, client=client, record=_record, operation=operation)
         content = _content_of(resp)
 
         if (
@@ -525,12 +596,12 @@ class LLMService:
         ):
             logger.warning("LLM returned empty JSON response, retrying without response_format")
             kwargs.pop("response_format", None)
-            resp = budgeted_create(client, on_response=_record, **kwargs)
-            resp = self._retry_if_content_empty(kwargs, resp, client=client, record=_record)
+            resp = budgeted_create(client, on_response=_record, operation=operation, **kwargs)
+            resp = self._retry_if_content_empty(kwargs, resp, client=client, record=_record, operation=operation)
             content = _content_of(resp)
         return content
 
-    def _call_with_possible_fallback(self, kwargs: dict, response_format: str, client=None, record=None):
+    def _call_with_possible_fallback(self, kwargs: dict, response_format: str, client=None, record=None, operation: str = ""):
         """发起单次 LLM 调用，在 ``response_format`` 不被模型支持时降级重试一次。
 
         超时（APITimeoutError）、连接错误（APIConnectionError）和 API 状态错误
@@ -540,16 +611,16 @@ class LLMService:
         if client is None:
             client = self.client
         try:
-            return budgeted_create(client, on_response=record, **kwargs)
+            return budgeted_create(client, on_response=record, operation=operation, **kwargs)
         except BadRequestError:
             # 模型不支持 response_format=json_object —— 移除参数重试一次。
             if "response_format" not in kwargs:
                 raise
             logger.info("Model does not support response_format, retrying without it")
             kwargs.pop("response_format", None)
-            return budgeted_create(client, on_response=record, **kwargs)
+            return budgeted_create(client, on_response=record, operation=operation, **kwargs)
 
-    def _retry_if_content_empty(self, kwargs: dict, resp, client=None, record=None):
+    def _retry_if_content_empty(self, kwargs: dict, resp, client=None, record=None, operation: str = ""):
         """LongCat 等 reasoning 模型可能先消耗 token 到 reasoning_content。
 
         当正文 content 为空且 finish_reason=length 时，自动提高 max_tokens 重试一次，
@@ -593,7 +664,7 @@ class LLMService:
             "LLM returned empty content after reasoning tokens; retrying with max_tokens=%d",
             retry_max,
         )
-        return budgeted_create(client, on_response=record, **retry_kwargs)
+        return budgeted_create(client, on_response=record, operation=operation, **retry_kwargs)
 
     def is_available(self) -> bool:
         """检查 LLM 是否配置可用（主用或备用任一可用即视为可用）。"""

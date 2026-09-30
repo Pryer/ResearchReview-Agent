@@ -158,6 +158,7 @@ class GenerationRecoveryHistoryEntry(BaseModel):
     progress_before: RecoveryProgressVector = Field(default_factory=RecoveryProgressVector)
     progress_after: RecoveryProgressVector | None = None
     input_fingerprint: str = ""
+    verification_fingerprint_before: str = ""
     outcome: str = "started"
     stop_reason: str = ""
 

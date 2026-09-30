@@ -1,6 +1,7 @@
 """写作前与写作后质量门禁测试。"""
 
 from __future__ import annotations
+import pytest
 
 import json
 import re
@@ -8,6 +9,7 @@ import re
 from app.agent.deliverable_router import (
     check_deliverable_readiness,
     check_generation_readiness,
+    permits_reference_coverage_writing,
 )
 from app.agent.nodes import (
     _apply_final_quality_gate,
@@ -63,6 +65,28 @@ def _card(index: int) -> dict:
         },
         "unsupported_fields": ["limitations"],
     }
+
+
+def _authorizing_claim_plans(cards: list[dict]) -> list[dict]:
+    """为每张卡片构造一条已授权 background_fact 主张（证据 ID 与卡片一致）。
+
+    WHY: 写作入口现在要求当前有效主张授权；直接调用 generate_deliverables_node
+    的用例必须提供与真实 plan_claims 输出等价的授权，不能再依赖空 claim_plans
+    绕过检查。证据 ID 沿用 _card 的 ``{paper_id}:e001``。
+    """
+    return [{
+        "route_id": "reference_coverage",
+        "route_name": "证据覆盖",
+        "claims": [
+            {
+                "claim_id": f"cov_{card['paper_id']}",
+                "claim_type": "background_fact",
+                "evidence_ids": [f"{card['paper_id']}:e001"],
+                "support_level": "single",
+            }
+            for card in cards
+        ],
+    }]
 
 
 def test_search_answer_does_not_expose_internal_paper_id():
@@ -145,6 +169,92 @@ def test_explicit_minimum_reference_count_is_a_pre_generation_hard_gate():
     assert result.usable_reference_count == 28
     assert result.blocking_issues[0]["code"] == "minimum_references_not_met"
     assert result.blocking_issues[0]["requested"] == 40
+
+
+def test_85_percent_reference_coverage_allows_writer_only_with_authorized_evidence(monkeypatch):
+    def state_for(usable: int, authorized: int) -> dict:
+        return {
+            "intent": "generate_review", "topic": "课堂行为分析",
+            "canonical_topic": "课堂行为分析",
+            "core_deliverables": ["research_background"],
+            "max_papers_explicit": True,
+            "required_reference_count": 40, "max_papers": 40,
+            "paper_cards": [_card(index) for index in range(1, usable + 1)],
+            "claim_plans": [{"route_id": "r1", "claims": [{
+                "claim_id": "c1",
+                "evidence_ids": [f"p{index}:e001" for index in range(1, authorized + 1)],
+            }]}],
+            "steps": [], "errors": [],
+        }
+
+    for usable, authorized, allowed in [(33, 33, False), (34, 33, False), (34, 34, True)]:
+        state = state_for(usable, authorized)
+        readiness = check_generation_readiness(state)
+        assert readiness.ready is False
+        assert permits_reference_coverage_writing(state, readiness) is allowed
+
+    stale_allocation = state_for(40, 34)
+    stale_allocation["citation_allocation_plans"] = [{
+        "sections": [{"paper_ids": [f"p{index}" for index in range(1, 34)]}],
+    }]
+    readiness = check_generation_readiness(stale_allocation)
+    assert readiness.planned_reference_count == 33
+    assert permits_reference_coverage_writing(stale_allocation, readiness) is True
+
+    state = state_for(34, 34)
+    state["quality_gate"] = {
+        "passed": False, "phase": "pre_generation",
+        "blocking_issues": [{"code": "minimum_references_not_met"}],
+    }
+    monkeypatch.setattr(
+        "app.tools.write_deliverable.write_deliverable",
+        lambda plan, state, llm=None: (
+            "## 研究背景\n\n已有可核验研究。"
+            + "".join(f"[p{index}]" for index in range(1, 35))
+        ),
+    )
+    monkeypatch.setattr(
+        "app.tools.validate_deliverable.validate_deliverable",
+        lambda text, plan, state: {"valid": True, "errors": []},
+    )
+    generate_deliverables_node(state, llm=None)
+    assert state["generation_readiness"]["ready"] is False
+    assert state["generation_readiness"]["partial_writing_allowed"] is True
+    assert state["generation_blocked"] is False
+    assert state["writing_plans"]
+    assert "已有可核验研究" in state["review"]
+    assert "quality_gate" not in state
+
+
+def test_85_percent_writer_policy_respects_explicit_strict_request():
+    state = {
+        "max_papers_explicit": True, "required_reference_count": 40,
+        "best_effort_on_failure": False,
+        "core_deliverables": ["research_background"],
+        "paper_cards": [_card(index) for index in range(1, 35)],
+        "claim_plans": [{"claims": [{
+            "evidence_ids": [f"p{index}:e001" for index in range(1, 35)],
+        }]}],
+    }
+    readiness = check_generation_readiness(state)
+    assert permits_reference_coverage_writing(state, readiness) is False
+
+
+def test_85_percent_policy_does_not_bypass_missing_required_focus():
+    state = {
+        "max_papers_explicit": True, "required_reference_count": 40,
+        "core_deliverables": ["research_status"],
+        "research_semantic_frame": {"required_focuses": ["缺少直接证据的研究重点"]},
+        "paper_cards": [_card(index) for index in range(1, 35)],
+        "claim_plans": [{"claims": [{
+            "evidence_ids": [f"p{index}:e001" for index in range(1, 35)],
+        }]}],
+    }
+    readiness = check_generation_readiness(state)
+    assert {issue["code"] for issue in readiness.blocking_issues} >= {
+        "minimum_references_not_met", "required_focus_evidence_not_met",
+    }
+    assert permits_reference_coverage_writing(state, readiness) is False
 
 
 def test_metric_token_fragment_is_not_rendered_as_academic_claim():
@@ -722,8 +832,8 @@ def test_post_generation_gate_quarantines_failed_draft_without_authorization():
     assert state["steps"][-1]["status"] == "blocked"
 
 
-def test_user_accepted_best_effort_draft_is_released_with_warning():
-    """用户明确接受降级交付时，仍可发布带警告的草稿并保持 partial。"""
+def test_user_accepted_best_effort_cannot_release_unsupported_factual_prose():
+    """草稿授权不能把未支持的事实主张转成可交付正文。"""
     state = {
         "intent": "generate_review",
         "review": "## 研究现状\n\n这是一份最佳努力草稿。[p1]",
@@ -742,12 +852,10 @@ def test_user_accepted_best_effort_draft_is_released_with_warning():
 
     final_answer_node(state)
 
-    assert "这是一份最佳努力草稿" in state["answer"]
-    assert "质量门禁提示" in state["answer"]
-    assert state["body"] == state["review"]
-    assert state["quality_gate"]["draft_released"] is True
-    assert state["quality_gate"]["draft_disposition"] == "released_best_effort"
-    assert state["steps"][-1]["status"] == "partial"
+    assert "这是一份最佳努力草稿" not in state["answer"]
+    assert state["quality_gate"]["draft_released"] is False
+    assert state["quality_gate"]["draft_disposition"] == "quarantined"
+    assert state["steps"][-1]["status"] == "blocked"
 
 
 def test_abstract_only_research_status_uses_summary_level_evidence():
@@ -1076,9 +1184,11 @@ def test_unknown_publication_status_is_explicit_warning():
     assert "publication_status_unknown" in warnings
 
 
-def test_final_gate_rechecks_actual_references_against_confirmed_scope():
+@pytest.mark.parametrize('best_effort', [False, True])
+def test_final_gate_rechecks_actual_references_against_confirmed_scope(best_effort):
     state = {
         "intent": "generate_review",
+        "best_effort_generation": best_effort,
         "review": "## 研究现状\n\n当前证据支持形成综合结论[p1]。",
         "paper_cards": [_card(1)],
         "reference_papers": [{
@@ -1097,6 +1207,7 @@ def test_final_gate_rechecks_actual_references_against_confirmed_scope():
 
     codes = {issue["code"] for issue in state["quality_gate"]["blocking_issues"]}
     assert "citation_scope_not_met" in codes
+    assert state['quality_gate']['draft_released'] is False
 
 
 def test_reference_minimum_counts_only_claim_authorized_citations():
@@ -1160,7 +1271,7 @@ def test_final_integrity_ignores_renumbered_theme_sections():
     assert not any("缺少计划章节" in error for error in report["errors"])
 
 
-def test_reference_coverage_ratio_does_not_bypass_recovery_before_budget_exhaustion():
+def test_reference_coverage_ratio_releases_partial_before_budget_exhaustion():
     state = {
         "intent": "generate_review",
         "review": "## 研究现状\n\n课堂行为分析已有可核验证据[p1]。",
@@ -1184,7 +1295,9 @@ def test_reference_coverage_ratio_does_not_bypass_recovery_before_budget_exhaust
     assert issue["requested"] == 40
     assert issue["actual"] == 34
     assert state["quality_gate"]["passed"] is False
-    assert state["quality_gate"]["draft_released"] is False
+    assert state["quality_gate"]["draft_released"] is True
+    assert state["quality_gate"]["partial_success"] is True
+    assert state["body"] == state["review"]
 
 
 def test_count_only_shortfall_releases_partial_after_recovery_budget_exhaustion():
@@ -1241,6 +1354,89 @@ def test_reference_coverage_below_ratio_remains_quarantined():
     assert state["quality_gate"]["draft_released"] is False
     assert state["quality_gate"]["partial_success"] is False
     assert state["body"] == ""
+
+
+def test_automatic_best_effort_cannot_release_below_85_percent():
+    state = {
+        "intent": "generate_review",
+        "review": "## 研究现状\n\n课堂行为分析已有可核验证据[p1]。",
+        "max_papers_explicit": True, "required_reference_count": 40,
+        "best_effort_generation": True,
+        "automatic_best_effort_generation": True,
+        "unique_cited_paper_count": 33,
+        "citation_validation": {"valid": True},
+        "generation_quality": {"passed": True, "support_rate": 1.0, "unsupported_claims": 0},
+        "deliverable_validation": [], "writing_plans": [],
+        "steps": [], "errors": [],
+    }
+    final_answer_node(state)
+    assert state["quality_gate"]["passed"] is False
+    assert state["quality_gate"]["draft_released"] is False
+    assert state["body"] == ""
+
+
+def test_reference_coverage_release_respects_request_strict_policy():
+    state = {
+        "intent": "generate_review",
+        "review": "## 研究现状\n\n课堂行为分析已有可核验证据[p1]。",
+        "max_papers_explicit": True,
+        "required_reference_count": 40,
+        "best_effort_on_failure": False,
+        "unique_cited_paper_count": 34,
+        "citation_validation": {"valid": True},
+        "generation_quality": {"passed": True, "support_rate": 1.0, "unsupported_claims": 0},
+        "deliverable_validation": [], "writing_plans": [],
+        "steps": [], "errors": [],
+    }
+    final_answer_node(state)
+    assert state["quality_gate"]["draft_released"] is False
+    assert state["body"] == ""
+
+
+def test_reference_coverage_uses_final_valid_count_when_consistency_is_available():
+    state = {
+        "intent": "generate_review",
+        "review": "## 研究现状\n\n课堂行为分析已有可核验证据[p1]。",
+        "max_papers_explicit": True, "required_reference_count": 40,
+        "unique_cited_paper_count": 34,
+        "unique_valid_cited_paper_count": 33,
+        "claim_citation_consistency": {
+            "consistent_sentences": 1, "inconsistent_sentences": 0,
+        },
+        "citation_validation": {"valid": True},
+        "generation_quality": {"passed": True, "support_rate": 1.0, "unsupported_claims": 0},
+        "deliverable_validation": [], "writing_plans": [],
+        "steps": [], "errors": [],
+    }
+    final_answer_node(state)
+    assert state["quality_gate"]["draft_released"] is False
+    state["unique_valid_cited_paper_count"] = 34
+    final_answer_node(state)
+    assert state["quality_gate"]["draft_released"] is True
+    assert state["quality_gate"]["reference_coverage_ratio"] == 0.85
+
+
+def test_reference_coverage_does_not_release_without_completed_quality_reports():
+    state = {
+        "intent": "generate_review",
+        "review": "## 研究现状\n\n课堂行为分析已有可核验证据[p1]。",
+        "max_papers_explicit": True, "required_reference_count": 40,
+        "unique_cited_paper_count": 34,
+        "generation_readiness": {"partial_writing_allowed": True},
+        "citation_validation": {"valid": True},
+        "deliverable_validation": [], "writing_plans": [],
+        "steps": [], "errors": [],
+    }
+    final_answer_node(state)
+    assert state["quality_gate"]["draft_released"] is False
+    state["generation_quality"] = {"passed": True, "support_rate": 1.0, "unsupported_claims": 0}
+    state.pop("citation_validation")
+    final_answer_node(state)
+    assert state["quality_gate"]["draft_released"] is False
+    state["citation_validation"] = {"valid": True}
+    state["claim_plans"] = [{"claims": [{"evidence_ids": ["p1:e001"]}]}]
+    final_answer_node(state)
+    assert state["quality_gate"]["draft_released"] is False
 
 
 def test_reference_coverage_best_effort_release_can_be_disabled(monkeypatch):
@@ -1928,6 +2124,7 @@ def test_41_paper_two_part_generation_keeps_status_and_splits_40_citations():
         "dynamic_taxonomy": taxonomy,
         "theme_synthesis": synthesize_themes(cards, taxonomy),
         "taxonomy_validation": {"valid": True, "status": "valid"},
+        "claim_plans": _authorizing_claim_plans(cards),
         "required_reference_count": 40,
         "max_papers_explicit": True,
         "steps": [],
@@ -2008,6 +2205,7 @@ def test_reference_quota_is_not_collapsed_into_background_after_downgrade():
             "requires_revision": True,
             "status": "invalid",
         },
+        "claim_plans": _authorizing_claim_plans(cards),
         "required_reference_count": 40,
         "max_papers_explicit": True,
         "steps": [],
@@ -2634,3 +2832,121 @@ def test_citation_allocation_reports_section_floor_deficit():
         item["section_id"]: item["paper_ids"] for item in allocation["sections"]
     }
     assert by_section["theme_T2"] == ["p25"]
+
+
+def _coverage_card(paper_id: str, text: str) -> dict:
+    """构造证据绑定一致（field_evidence/spans/claims 同 ID）的可引用卡片。"""
+    evidence_id = f"{paper_id}:e1"
+    return {
+        "paper_id": paper_id,
+        "relation_type": "direct",
+        "quality_status": "valid",
+        "evidence_state": {"access_level": "abstract"},
+        "research_problem": text,
+        "field_evidence": {"research_problem": [evidence_id]},
+        "evidence_spans": [
+            {"evidence_id": evidence_id, "text": text, "source_type": "abstract"}
+        ],
+        "field_claims": {
+            "research_problem": [
+                {"evidence_id": evidence_id, "claim": text, "explicitly_reported": True}
+            ]
+        },
+    }
+
+
+def _coverage_gate_state() -> dict:
+    return {
+        "paper_cards": [
+            _coverage_card("p1", "课堂行为编码用于分析师生互动模式"),
+            _coverage_card("p2", "行为分析为教学诊断提供证据"),
+        ],
+        "claim_plans": [],
+        "max_papers_explicit": True,
+        "required_reference_count": 2,
+        "research_semantic_frame": {"canonical_topic": "课堂行为分析"},
+        "steps": [],
+        "errors": [],
+    }
+
+
+def test_coverage_claims_rejected_by_entailment_are_not_authorized():
+    """T05：覆盖补建的新增主张未通过同一门禁蕴含核验时不得计入授权。"""
+    from app.agent.nodes.verification import claim_evidence_gate_node
+
+    class ContradictLLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            # 覆盖主张的蕴含核验一律不返回 entailed → 应被门禁丢弃。
+            return '{"results": []}'
+
+    state = _coverage_gate_state()
+    claim_evidence_gate_node(state, llm=ContradictLLM())
+    gate = state["claim_evidence_gate"]
+    assert gate.get("coverage_added") == 0
+    assert gate.get("coverage_dropped", 0) >= 1
+    coverage_plans = [
+        plan for plan in state["claim_plans"]
+        if plan.get("route_id") == "reference_coverage"
+    ]
+    assert not any(plan.get("claims") for plan in coverage_plans)
+
+
+def test_coverage_claims_passing_entailment_are_authorized():
+    """T05 正向对照：通过蕴含核验的覆盖主张才进入授权池。"""
+    from app.agent.nodes.verification import claim_evidence_gate_node
+
+    class EntailLLM:
+        def complete(self, prompt: str, **kwargs) -> str:
+            import json as _json
+            import re as _re
+
+            match = _re.search(r"待验证项目：(\[.*?\])\n", prompt, _re.S)
+            payload = _json.loads(match.group(1)) if match else []
+            return _json.dumps({"results": [
+                {"claim_id": item["claim_id"], "label": "entailed", "confidence": 0.95}
+                for item in payload
+            ]})
+
+    state = _coverage_gate_state()
+    claim_evidence_gate_node(state, llm=EntailLLM())
+    gate = state["claim_evidence_gate"]
+    assert gate.get("coverage_added") == 2
+    authorized = {
+        eid
+        for plan in state["claim_plans"]
+        for claim in plan.get("claims") or []
+        for eid in claim.get("evidence_ids") or []
+    }
+    assert {"p1:e1", "p2:e1"} <= authorized
+
+
+def test_usable_evidence_without_authorization_blocks_writing_keeps_requirement():
+    """T06：46 可用/0 授权时不可写作，缺口明确且 required_reference_count 仍为 40。"""
+    cards = [_card(index) for index in range(1, 47)]  # 46 篇可用证据
+    state = {
+        "topic": "课堂行为分析",
+        "canonical_topic": "课堂行为分析",
+        "core_deliverables": ["research_status"],
+        "paper_details": cards,
+        "paper_cards": cards,
+        "required_reference_count": 40,
+        "max_papers_explicit": True,
+        # claim_plans 为空：过期授权被清理后应进入待规划阶段，而非继承 ready=true。
+        "claim_plans": [],
+        "steps": [],
+        "errors": [],
+    }
+
+    readiness = check_generation_readiness(state)
+
+    assert readiness.ready is False
+    assert readiness.requested_minimum_references == 40
+    assert readiness.usable_reference_count == 46
+    assert readiness.authorized_reference_count == 0
+    issue = next(
+        item for item in readiness.blocking_issues
+        if item["code"] == "minimum_planned_references_not_met"
+    )
+    assert issue["requested"] == 40
+    assert issue["available"] == 0
+    assert issue["eligible"] == 46

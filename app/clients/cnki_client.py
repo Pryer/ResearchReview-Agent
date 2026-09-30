@@ -45,6 +45,7 @@ try:
     from selenium.common.exceptions import (
         ElementNotInteractableException,
         NoAlertPresentException,
+        SessionNotCreatedException,
         StaleElementReferenceException,
         TimeoutException,
         UnexpectedAlertPresentException,
@@ -66,6 +67,7 @@ except ImportError:
     class NoAlertPresentException(WebDriverException): pass
     class StaleElementReferenceException(WebDriverException): pass
     class UnexpectedAlertPresentException(WebDriverException): pass
+    class SessionNotCreatedException(WebDriverException): pass
     Options = None
     Service = None
     By = None
@@ -87,6 +89,45 @@ def _record_search_diagnostic(outcome: str, *, error_code: str | None = None, me
         record_client_diagnostic(outcome, error_code=error_code, message=message)
     except Exception:
         pass
+
+
+# WHY: chromedriver 与浏览器版本不匹配是确定性配置错误。熔断恢复后再次启动同一
+# 不兼容驱动只会重复失败、拖慢检索，并被上层误读成"该来源无相关论文"。一旦识别
+# 即在本进程内短路后续驱动启动，并给出可执行修复方式；用户更新驱动并重启服务后
+# 标志自然清除。键为当时生效的驱动路径，便于诊断显式路径与自动发现的区别。
+_DRIVER_INCOMPATIBLE: dict[str, str] = {}
+
+
+def _classify_driver_incompatibility(exc: BaseException) -> str | None:
+    """识别 chromedriver 与本机 Chrome 版本不匹配，返回可执行修复说明。
+
+    与访问受限、网络异常、成功但零结果区分：只有会话根本无法创建
+    （SessionNotCreated）或消息明确给出版本不匹配签名时才判为驱动不兼容。
+    """
+    message = str(exc)
+    lowered = message.lower()
+    version_signature = (
+        "only supports chrome version" in lowered
+        or "current browser version is" in lowered
+    )
+    if not (isinstance(exc, SessionNotCreatedException) or version_signature):
+        return None
+    supported = re.search(r"only supports chrome version (\d+)", lowered)
+    current = re.search(r"current browser version is ([\d.]+)", lowered)
+    detail = (
+        f"（驱动仅支持 Chrome {supported.group(1)}，本机浏览器为 {current.group(1)}）"
+        if supported and current else ""
+    )
+    return (
+        "ChromeDriver 与本机 Chrome 浏览器版本不匹配，CNKI 浏览器会话无法建立"
+        f"{detail}。请将 chromedriver 更新到与浏览器主版本一致，或清空显式驱动路径"
+        "（CNKI_CHROMEDRIVER_PATH）交给 Selenium Manager 自动匹配后重启服务。"
+    )
+
+
+def _reset_driver_incompatibility() -> None:
+    """测试与驱动更新后清除进程级不兼容短路标志。"""
+    _DRIVER_INCOMPATIBLE.clear()
 
 
 CNKI_HOME = "https://www.cnki.net/"
@@ -953,6 +994,14 @@ def search_cnki(
     """
     from app.core.circuit_breaker import get_circuit_breaker
 
+    # WHY: 已知不兼容的驱动不再反复启动；直接按驱动不兼容诊断并返回空，
+    # 让上层把它与"访问受限/网络异常/成功但零结果"区分开，而不是误判为无文献。
+    if _DRIVER_INCOMPATIBLE:
+        reason = _DRIVER_INCOMPATIBLE.get("reason") or "ChromeDriver 与浏览器版本不匹配"
+        logger.warning("CNKI search skipped: known incompatible chromedriver")
+        _record_search_diagnostic("api_failed", error_code="DRIVER_INCOMPATIBLE", message=reason)
+        return []
+
     cb = get_circuit_breaker("cnki", failure_threshold=2, recovery_timeout=120.0)
     if not cb.allow_request():
         logger.warning("CNKI search skipped due to active circuit breaker")
@@ -1102,6 +1151,22 @@ def search_cnki(
         cb.record_success()
     except Exception as exc:
         cb.record_failure(exc)
+        driver_issue = _classify_driver_incompatibility(exc)
+        if driver_issue is not None:
+            # WHY: 驱动/浏览器版本不匹配是确定性配置错误，记入进程级短路标志，
+            # 后续检索不再反复启动同一不兼容驱动；诊断与网络/限流/零结果区分。
+            _DRIVER_INCOMPATIBLE.clear()
+            _DRIVER_INCOMPATIBLE.update({
+                "reason": driver_issue,
+                "driver_path": str(settings.cnki_chromedriver_path or "auto"),
+            })
+            logger.error("CNKI chromedriver incompatible: %s", driver_issue)
+            _record_search_diagnostic(
+                "api_failed", error_code="DRIVER_INCOMPATIBLE", message=driver_issue,
+            )
+            if not papers and raws:
+                papers = [_to_paper_metadata(raw) for raw in raws]
+            return papers
         logger.warning("CNKI search failed: %s: %s", type(exc).__name__, str(exc), exc_info=True)
         if not papers and raws:
             # 阶段二/三异常时仍交付已获得的结果页元数据。

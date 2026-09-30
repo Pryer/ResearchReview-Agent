@@ -29,6 +29,13 @@ def ground_semantic_frame(
     methods = _ground_items(frame.methods, user_query, "method", issues, warnings, evidence_aliases)
     actions = _ground_items(frame.research_actions, user_query, "research_action", issues, warnings, evidence_aliases)
     targets = _ground_items(frame.analysis_targets, user_query, "analysis_target", issues, warnings, evidence_aliases)
+    grounded_items = [*domains, *objects, *methods, *actions, *targets]
+    grounded_focuses = []
+    for focus in frame.required_focuses:
+        if _focus_grounded_in_user_text(str(focus), user_query, grounded_items):
+            grounded_focuses.append(focus)
+        else:
+            issues.append(f"dropped_ungrounded_focus:{focus}")
 
     return frame.model_copy(update={
         "application_domains": domains,
@@ -36,9 +43,29 @@ def ground_semantic_frame(
         "methods": methods,
         "research_actions": actions,
         "analysis_targets": targets,
+        "required_focuses": grounded_focuses,
         "validation_issues": list(dict.fromkeys([*frame.validation_issues, *issues])),
         "validation_warnings": list(dict.fromkeys([*frame.validation_warnings, *warnings])),
     })
+
+
+def _focus_grounded_in_user_text(focus: str, user_query: str, items: list[SemanticItem]) -> bool:
+    """Keep hard focus requirements only when user wording or a grounded entity supports them."""
+    normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", focus.casefold())
+    query = re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", str(user_query).casefold())
+    if not normalized:
+        return False
+    if normalized in query:
+        return True
+    if any(item.explicit and normalized == re.sub(
+        r"[^a-z0-9\u4e00-\u9fff]", "", str(item.label).casefold()
+    ) for item in items):
+        return True
+    # WHY: 组合重点允许轻微语序/连接词差异，但不能仅因共享“分析”等泛词
+    # 就把模型添加的技术路线升级成用户必须覆盖的硬要求。
+    focus_pairs = {normalized[index:index + 2] for index in range(len(normalized) - 1)}
+    query_pairs = {query[index:index + 2] for index in range(len(query) - 1)}
+    return bool(focus_pairs) and len(focus_pairs & query_pairs) / len(focus_pairs) >= 0.6
 
 
 def validate_semantic_relations(frame: ResearchSemanticFrame) -> ResearchSemanticFrame:

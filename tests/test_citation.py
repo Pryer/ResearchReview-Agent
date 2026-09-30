@@ -390,6 +390,7 @@ class TestCitationOrdering:
             review_text="结论见 [3]，与 [1] 相互印证。",
             paper_cards=papers,
             citation_style="gbt7714",
+            allow_positional_numeric=True,
         )
         # [3] 先出现 → 重编号为 1；[1] → 2；参考文献表同步按首现排序
         assert result["rendered_text"] == "结论见 [1]，与 [2] 相互印证。"
@@ -405,14 +406,40 @@ class TestCitationOrdering:
             review_text="见 [1] 与 [99]。",
             paper_cards=papers,
             citation_style="gbt7714",
+            allow_positional_numeric=True,
         )
         assert result["validation"]["valid"] is False
         assert "99" in result["validation"]["missing_citations"]
 
     def test_out_of_range_numeric_citation_detected_by_validator(self):
         cards = [_make_paper(paper_id="p1")]
-        result = validate_citations("见 [5]。", ["ref"], cards)
+        result = validate_citations("见 [5]。", ["ref"], cards, allow_positional_numeric=True)
         assert "5" in result["missing_citations"]
+
+    def test_numeric_citations_require_explicit_input_semantics(self):
+        cards = [_make_paper(paper_id="p1")]
+        invalid = validate_citations("见 [1]。", ["ref"], cards)
+        assert "1" in invalid["missing_citations"]
+        resolved = generate_and_validate_citations(
+            "见 [1]。", cards, numeric_citation_map={"p1": 1},
+        )
+        assert resolved["citation_map"] == {"p1": 1}
+
+    def test_numbered_group_and_range_follow_explicit_mapping(self):
+        from app.core.citation_syntax import resolve_numbered_citations
+
+        mapped = resolve_numbered_citations(
+            "结果见 [1, 3-4]，补充见 [2]。",
+            {"p_b": 1, "p_a": 2, "p_c": 3, "p_d": 4},
+        )
+        assert mapped == "结果见 [p_b; p_c; p_d]，补充见 [p_a]。"
+
+    def test_conflicting_number_mapping_is_rejected(self):
+        from app.core.citation_syntax import resolve_numbered_citations
+        import pytest
+
+        with pytest.raises(ValueError, match="conflicting"):
+            resolve_numbered_citations("见 [1]。", {"p1": 1, "p2": 1})
 
 
 class TestGenerateBibtexKey:

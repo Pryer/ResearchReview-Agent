@@ -14,6 +14,11 @@ decisions
 open_questions
 ```
 
+The authoritative state also stores a clarification rewrite with source anchors and
+the source query used for semantic parsing. Citation identity is tied to the
+pre-render body and a matching numbered render snapshot. These fields remain in
+the private research state and do not add fields to `MainAgentContext`.
+
 `goal` preserves the user request, deliverables, scope, and explicit constraints.
 `state` contains separate execution/research status, the current stage, allowed and
 pending actions, a bounded recent trajectory, failure reasons, artifact counts, gate
@@ -75,15 +80,23 @@ loop; it is not a main-Agent decision call.
 
 `request_clarification` returns public `needs_clarification`, stores its question and
 private `waiting_user` state, and resumes with the original evidence and the latest
-user constraints. Cancellation, failure and waiting states do not publish a draft.
+user constraints. A hard execution stop (budget exhaustion, lease staleness, or a
+ledger conflict) is distinct from a clarification: it settles as `blocked`, or `failed`
+for a stale lease, with one consistent reason across job, session, and result, and is
+never reported as a missing-checkpoint question. Cancellation, failure and waiting
+states do not publish a draft.
 Generation and citation-repair candidates run the normal verification chain; a
 worse candidate restores the previous generation products and is verified again.
 
 The budget ledger is shared across conversation parsing, graph entry points,
 specialist workers and automatic recovery. Each real LLM attempt reserves prompt
-bytes plus its output token cap before execution. Provider usage settles that
-reservation; missing usage or failed attempts retain the conservative reservation
-and set `usage_estimated`. Retries and fallback requests are charged separately.
+bytes plus its output token cap before execution. When the remaining budget cannot
+cover a reservation, the attempt is rejected before any provider call: the request is
+not counted as sent, no charge is incurred, and a structured diagnostic records the
+operation, used, reserved, requested, and remaining amounts. Provider usage settles an
+accepted reservation; missing usage or failed attempts retain the conservative
+reservation and set `usage_estimated`. Retries and fallback requests are charged
+separately.
 Retrieval is counted per search-node round, and recovery has its own sublimit.
 Nested controller actions charge the parent action once. The deadline spans the
 current user turn; cumulative usage survives pause/resume. In-flight external calls
@@ -146,6 +159,13 @@ specialist result. Existing retrieval loops, evidence recovery, writing renderer
 claim verification, and final quality gates remain authoritative. A successful
 specialist call does not imply that the overall research result passed its gates.
 
+During quality recovery, the main loop deterministically advances newly admitted
+hybrid candidates through detail, card, route, and claim actions before requesting
+another model decision. This uses the existing action contracts and keeps the
+model-facing context at the same five fields. Evidence changes invalidate dependent
+plans and gates after the specialist result commits; removed artifacts are also
+removed from the manifest before the next checkpoint can hydrate them.
+
 ## Configuration
 
 The compact view is controlled by:
@@ -175,3 +195,9 @@ or stale research results cannot erase incurred usage. Public session saves also
 the execution lease/version. The graph-only Python entry remains an in-memory mode.
 See [runtime, recovery and cache boundaries](agent-runtime-and-cache.md) for migration,
 explicit checkpoint resume, action dependencies and validation evidence.
+
+恢复细节继续外置在现有历史与候选拒绝记录中，不增加 Main Agent 的五字段。
+Controller 在创建重写任务和预留预算前执行与动作注册表、外层恢复一致的资格检查；
+task 幂等键包含 objective，不能替代这一限制。自主重写候选被回滚时保存操作和
+恢复输入指纹，随现有状态持久化。恢复历史新增可选的验证前指纹，允许同输入的
+新语义判定结算真实进展；旧历史默认空值，保持兼容和保守判断。

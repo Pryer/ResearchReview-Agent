@@ -55,7 +55,11 @@ def route_recovery_stop_reason(state: dict[str, Any]) -> str:
 
 def should_repair_citation_gap(state: dict[str, Any]) -> bool:
     """引用补检索的真实执行条件；阻断说明不视为可修复正文。"""
-    if state.get("generation_blocked") or state.get("citation_gap_repair_attempted"):
+    from app.core.citation_syntax import extract_citation_ids
+
+    if state.get("citation_gap_repair_attempted"):
+        return False
+    if not extract_citation_ids(str(state.get("review") or state.get("body") or "")):
         return False
     if not state.get("max_papers_explicit", False):
         return False
@@ -73,8 +77,6 @@ def targeted_search_kind(state: dict[str, Any]) -> str:
     if route_recovery_stop_reason(state):
         return ""
     if (state.get("evidence_gap_report") or {}).get("needs_recovery"):
-        return "route"
-    if state.get("generation_blocked") and state.get("paper_cards"):
         return "route"
     return ""
 

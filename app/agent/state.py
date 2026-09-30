@@ -52,6 +52,9 @@ class ResearchAgentState(TypedDict, total=False):
     max_papers: int
     required_reference_count: int  # 用户要求最终综述至少使用的唯一参考文献数量
     retrieval_target: int
+    retrieval_profile: Dict[str, Any]
+    hybrid_shadow_report: Dict[str, Any]
+    retrieval_screening_cache: Dict[str, Any]
     generation_limit: int
     # 证据池绝对目标（详情补全阶段的候选规模上限）。
     # WHY: 预留余量此前只加在"本轮增量"上，增量轮 required_to_fetch 变小
@@ -71,6 +74,7 @@ class ResearchAgentState(TypedDict, total=False):
     research_request: Dict[str, Any]
     research_plan: Dict[str, Any]
     research_semantic_frame: Dict[str, Any]
+    research_query_rewrite: Dict[str, Any]
     # 语义帧解析时所用的工作查询；查询变化（如澄清后追加范围确认）即失效重解析。
     semantic_frame_source_query: str
     screening_protocol: Dict[str, Any]
@@ -176,6 +180,7 @@ class ResearchAgentState(TypedDict, total=False):
     generation_readiness: Dict[str, Any]
     quality_gate: Dict[str, Any]
     quarantined_draft: str
+    quarantined_generation_snapshot: Dict[str, Any]
     generation_blocked: bool
     citation_eligible_paper_ids: List[str]
     reference_coverage_stats: Dict[str, int]
@@ -223,6 +228,8 @@ class ResearchAgentState(TypedDict, total=False):
     citation_validation: Dict[str, Any]
     claim_verification: Dict[str, Any]
     claim_verification_cache: Dict[str, Dict[str, Any]]
+    citation_source_text: str
+    citation_rendered_text: str
     generation_quality: Dict[str, Any]
     evidence_quality_report: Dict[str, Any]
     unique_cited_paper_count: int
