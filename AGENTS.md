@@ -57,6 +57,8 @@ Before modifying code:
   cancellation boundaries.
 - Do not silently swallow errors that affect research correctness.
 - Do not revert or overwrite user changes outside the current task.
+- Do not add AI co-author attribution to Git commits or pull requests unless the
+  user explicitly requests it.
 
 ## Change Log (Required)
 
