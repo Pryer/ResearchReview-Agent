@@ -153,3 +153,20 @@ def test_context_reports_budget_exceeded_without_dropping_hard_constraint(monkey
 
     assert "context_budget_exceeded" in snapshot.validation_errors
     assert snapshot.context.goal.explicit_constraints
+
+
+def test_react_context_preserves_latest_tool_observation_without_raw_documents():
+    state = _state()
+    state["agent_task_results"] = [{
+        "operation": "search_and_rank",
+        "status": "completed",
+        "outcome": "succeeded",
+        "findings": ["New papers found: 4", "Missing evidence on multimodal analysis"],
+        "evidence_refs": ["artifact://test-ref"],
+        "secret_internal_prompt": "SHOULD_NOT_LEAK",
+    }]
+    context = build_main_agent_context(state)
+    observations = context.state.recent_trajectory
+    assert observations[-1]["action"] == "search_and_rank"
+    assert observations[-1]["findings"][0] == "New papers found: 4"
+    assert "SHOULD_NOT_LEAK" not in str(context.model_dump())
