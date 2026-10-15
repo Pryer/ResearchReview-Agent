@@ -51,3 +51,50 @@ Then conduct a matched **baseline vs opt-in Sidecar** comparison on representati
 - Consider prompt-cache layout changes only after measuring provider cache hits.
 
 This preserves the core principle: **Model proposes, Harness authorizes, Environment executes, verification decides whether to finish.**
+
+
+## Proposed next migration: adaptive long-context compaction (not implemented yet)
+
+This section is the **target architecture**, not a statement that the running agent already has an append-only API trajectory. Currently `main_policy.py` sends a freshly serialized five-field snapshot per decision and `context_compaction.py` enforces a deterministic **character** cap. The new design must first implement protocol-correct multi-turn messages and token accounting. Do not present these as completed features until the migration and tests pass.
+
+### Context layout
+
+- Stable system prompt and stable-order tool definitions, with Controller still authoritative over per-turn allowed actions.
+- Original user objective and constraints (immutable except explicit user amendments).
+- Append-only, protocol-correct assistant tool calls and matching tool results. Store long tool results in artifacts; expose bounded, source-linked observations.
+- A framework-generated dynamic status bar at the end with stage, remaining budget, incomplete TODOs, blocking issues and most recent failure.
+- Long-lived research state, full event log, source materials and authoritative evidence remain outside the model context.
+
+### Three compaction tiers
+
+1. **L1 / per-tool output bound:** on oversized observations, preserve the full payload in an authorized artifact and expose a bounded, immutable summary plus source/fragment references. Do not mutate earlier visible tool messages in place.
+2. **L2 / batch trajectory compaction:** when (estimated input tokens + reserved output tokens) approaches a *configurable* threshold (start experiments at 80% of the model's actual usable context window), archive a complete original trajectory, then create a new context epoch: stable prefix + original task constraints + verified structured summary + source refs + recent complete tool-call/result pairs + latest status bar. This checkpoint is deliberately a cache break; do it infrequently, not every round.
+3. **L3 / fail-safe:** if post-compaction still exceeds the reserved token budget, do not drop immutable constraints or evidence identities. Report an explicit blocked state or request narrower scope / larger window; guard against repeated unsuccessful compaction attempts.
+
+### Protected information
+
+- Exact user requirements, priorities and any amendments, with provenance.
+- Most recent verified progress and outstanding tasks; hard quality-gate failures.
+- Failed or rejected operations and the reasons, especially repeated non-progress patterns.
+- Evidence and claim IDs, authorization boundaries, artifact refs and uncertainty.
+- Last few complete tool interactions where the provider API protocol requires coherent assistant/tool pairs.
+
+### Cache and correctness constraints
+
+- Compaction of old messages intentionally invalidates the cache from the first changed token. It trades some cache reuse for bounded context and reliable completion.
+- Prompt Cache matches **token prefixes**, not JSON keys, so field count is not the issue; frequently rewriting fields near the front is.
+- Track real provider token usage (prompt, cached tokens, completion), not just existing `main_context_max_chars`. Keep a conservative estimator with a safety margin for unknown providers.
+- Do not place a changing timestamp, counters or status in the system prompt or sort tool definitions differently per turn. Evaluate whether dynamically scoped tool schemas are worth their cost; never weaken Controller authorization to win a cache hit.
+- Keep history and authoritative state immutable/auditable in durable storage; compaction changes only the model-visible working view and explicit checkpoint pointer, never past facts or versions.
+- Do not blindly repass provider-specific hidden reasoning after compaction; respect the model/provider's documented thinking and tool-message protocol.
+
+### Acceptance tests
+
+- Below threshold -> no compaction; append-only prefix equality across ordinary turns.
+- Oversized tool result -> saved artifact and bounded, source-linked observation; no content loss in durable storage.
+- Above threshold -> one checkpoint and a new epoch; no repeated compaction loop.
+- User constraints, unresolved blockers, citations and latest successful/failed observations remain available.
+- All tool-call IDs and result messages remain correctly paired; stale or unauthorized tool calls are still rejected.
+- Compare completion rate, citation precision, number of redundant actions, input tokens, cached tokens, provider cost, latency and compaction failure cases against baseline.
+
+**Rollout sequence:** (1) stable message protocol and trajectory persistence, (2) token-budget accounting and status bar, (3) L1 bounding, (4) L2/L3 batch compaction with a feature flag, (5) provider-level caching and end-to-end evaluation. Preserve the existing five-field fallback until the new path is proven safe.
