@@ -2175,3 +2175,13 @@ what changed and how it was validated; it is not a replacement for Git history.
 - 验证：全部可达 Git 历史中目标署名为 0；备份历史提交数仍为 13，文件树逐条一致，主干提交保持原值。通过 Git 实际执行提交钩子的 5 项检查全部通过（普通说明、其他共同作者、Claude、大小写变化、Anthropic 地址）；本地 JSON 配置有效且保持被忽略；`git diff --check` 通过。
 - 收敛审查：只处理署名及防复发规则，没有生产代码变化、临时逻辑或多余刷新；本地钩子附中文 WHY 注释，不清理用户文件。
 - 限制：本地钩子及 Claude 配置不随仓库传播至其他克隆，显式跳过钩子的工具仍需遵守 Agent 规则；旧不可达对象和 reflog 保留正常恢复能力，不进行垃圾回收。未运行 pytest 或真实 CNKI/LLM E2E，本次未修改研究流程、质量门禁或证据处理。
+
+
+## 2026-10-16 01:54:46 +08:00 — 多源检索限流、重试与并发停止边界修复
+
+- 修改文件：.env.example; README.md; app/clients/arxiv_client.py; app/clients/crossref_client.py; app/clients/openalex_client.py; app/clients/semantic_scholar_client.py; app/core/config.py; app/core/rate_limiter.py; app/core/retry_policy.py; app/tools/search_papers.py; docs/change-log.md; docs/retrieval-failure-policy.md; tests/conftest.py; tests/test_openalex_rate_limit.py; tests/test_retrieval_failure_policy.py。
+- 根因：原 PR 已加入有限重试，但令牌桶等待不检查执行控制，S2 持锁等待阻碍冷却登记；部分请求在令牌等待后、重试前不复核熔断/冷却。429 仅在重试耗尽时才建立共享冷却，arXiv 后续请求也缺少源级冷却。双通道完成顺序会覆盖已返回数量；单线程池在工作线程报告控制异常前后可能继续执行排队请求。
+- 行为：令牌与退避等待每 250ms 检查取消、执行期限和租约；S2 持锁预留时刻后释放等待。Crossref/OpenAlex 搜索和详情共用请求策略，发送前复核熔断和冷却；S2 同样复核，arXiv 新增共享冷却。短 429 重试期间即登记冷却，长 Retry-After 直接跳过来源且不截短服务端期限，本地上限只限制兜底冷却；401/403/404 和其他 4xx 不触发无效重试，认证与未找到不计为服务故障。检索局部取消通过既有上下文传播机制停止同轮等待和排队请求，保留原始预算/失权异常；真实同步 HTTP 仍按客户端超时收尾。来源诊断固定合并失败类别和成功数量，保持原论文合并、去重与来源引用。
+- 验证：tests/test_retrieval_failure_policy.py、test_openalex_rate_limit.py、test_rate_limiter.py、test_search.py、test_diagnostics.py、test_circuit_breaker.py 定向 98 passed（1.13s）；最终全量 1530 passed、687 warnings（21.16s），JUnit 确认 failures=0、errors=0。使用占位 DashScope 密钥与 example.invalid 端点满足已有混合检索测试配置，HTTP、LLM 和浏览器调用均模拟，未访问真实数据源。改动模块 Ruff F 检查及 git diff --check 通过。
+- 收敛审查：保留单一线程池调度和既有 submit_with_context，没有增加独立调度循环；OpenAlex 详情复用搜索失败策略，未保留过渡实现。源级冷却、局部取消寿命与停止顺序有中文 WHY；测试覆盖等待途中熔断/冷却变化、并发停止保留原始原因、排队任务不发请求、长服务端冷却、超时恢复、认证分类和两种通道完成顺序。时间模拟同时推进 monotonic 与 sleep，并清理跨用例限流状态。
+- 限制：未运行真实 LLM/CNKI/学术 API E2E；同步 HTTP 和浏览器请求无法强制即时撤回，取消可能等待配置的客户端超时。限流、冷却和熔断仍是进程内状态，不提供多进程全局配额。长服务端 Retry-After 现在会优先于本地冷却上限，应通过诊断辨识来源暂不可用；不提前探测限流窗口。此验证针对 PR #2 独立分支，未合并 Context PR #1；PR 保持 Draft。

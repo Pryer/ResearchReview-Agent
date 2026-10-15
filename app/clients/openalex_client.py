@@ -15,7 +15,7 @@ import requests
 
 from app.core.config import get_settings
 from app.core.logger import get_logger
-from app.core.retry_policy import bounded_request_timeout, interruptible_sleep, retry_after_seconds
+from app.core.retry_policy import bounded_request_timeout, interruptible_sleep, retry_after_seconds, check_retrieval_execution
 from app.schemas.paper_schema import PaperMetadata
 from app.utils.title_cleaner import clean_abstract, clean_title
 
@@ -76,24 +76,17 @@ def _cooldown_remaining() -> float:
 
 
 def _enter_cooldown(seconds: float, retry_after: float = 0.0) -> None:
-    """进入 429 冷却，时长钳制在 ``openalex_max_cooldown_seconds`` 以内。
-
-    OpenAlex 在日配额耗尽时会返回指向"次日零点"的 Retry-After（实测达 41559
-    秒 / 11.5 小时）。无条件采纳会让本进程整天不再访问 OpenAlex，代价远大于
-    定期探测——429 立即返回且不传数据，探测成本极低。因此钳制上限，并对被
-    钳制的情形单独记日志，使"日配额耗尽"在日志中可辨识。
-    """
+    """本地兜底冷却有上限；服务端 Retry-After 不被截短。"""
     global _COOLDOWN_UNTIL
     ceiling = max(1.0, float(settings.openalex_max_cooldown_seconds or 1.0))
     requested = max(0.0, seconds)
-    effective = min(requested, ceiling)
+    # WHY: 长 Retry-After 只跳过该来源，不阻塞研究任务，也不提前重试。
+    effective = max(retry_after, min(requested, ceiling))
     if requested > ceiling:
         logger.warning(
-            "OpenAlex Retry-After %.0fs exceeds cooldown ceiling; capped to %.0fs "
-            "(likely daily quota exhausted on the shared common pool — "
-            "configure CROSSREF_MAILTO to use the polite pool)",
+            "OpenAlex Retry-After %.0fs exceeds cooldown ceiling; honoring server deadline "
+            "while skipping this source without waiting",
             retry_after or requested,
-            ceiling,
         )
     with _RATE_LOCK:
         _COOLDOWN_UNTIL = max(_COOLDOWN_UNTIL, time.monotonic() + effective)
@@ -118,22 +111,6 @@ def search_openalex(
     Args:
         sort_by: 排序方式，"relevance"（默认）或 "date"（按发表日期降序）。
     """
-    from app.core.circuit_breaker import get_circuit_breaker
-
-    cb = get_circuit_breaker("openalex")
-    if not cb.allow_request():
-        logger.warning("OpenAlex search skipped due to active circuit breaker")
-        return []
-
-    remaining = _cooldown_remaining()
-    if remaining > 0:
-        logger.warning(
-            "OpenAlex search skipped: rate limit cooldown for another %.1fs", remaining,
-        )
-        return []
-
-    limiter = _get_limiter()
-
     # 排序映射
     oa_sort = "publication_date:desc" if sort_by == "date" else "relevance_score:desc"
 
@@ -149,18 +126,45 @@ def search_openalex(
         "mailto": _effective_mailto(),
     }
 
+    resp = _request_openalex(OPENALEX_API_URL, params=params)
+    return parse_openalex_response(resp.json()) if resp is not None else []
+
+
+def _request_ready(cb) -> bool:
+    check_retrieval_execution()
+    if not cb.allow_request():
+        _record_search_diagnostic("api_failed", error_code="CIRCUIT_OPEN",
+                                  message="OpenAlex circuit breaker is open")
+        return False
+    if (remaining := _cooldown_remaining()) > 0:
+        _record_search_diagnostic("rate_limited", error_code="HTTP_429",
+                                  message=f"OpenAlex cooldown: {remaining:.1f}s remaining")
+        return False
+    return True
+
+
+def _request_openalex(url: str, *, params: dict) -> requests.Response | None:
+    # WHY: 搜索与详情共用失败分类、重试和冷却边界，避免详情绕过修复。
+    from app.core.circuit_breaker import get_circuit_breaker
+
+    cb = get_circuit_breaker("openalex")
+    limiter = _get_limiter()
     max_retries = max(0, int(settings.openalex_max_retries or 0))
     max_wait = max(0.0, float(settings.openalex_max_retry_wait_seconds or 0))
     for attempt in range(max_retries + 1):
+        if not _request_ready(cb):
+            return None
         if not limiter.acquire(1.0, timeout=10.0):
             # 令牌等待超时说明本域已严重超速：跳过本次请求而不是照发不误，
             # 否则限流器形同虚设，只会换来 429 封禁。
             logger.warning("OpenAlex search skipped: rate limit token wait timed out")
             _record_search_diagnostic("rate_limited", error_code="RATE_LIMIT_WAIT_TIMEOUT", message="OpenAlex 限流等待超时")
-            return []
+            return None
+        if not _request_ready(cb):
+            return None
         try:
             resp = requests.get(
-                OPENALEX_API_URL,
+                url,
                 params=params,
                 timeout=bounded_request_timeout(settings.agent_request_timeout),
             )
@@ -169,9 +173,9 @@ def search_openalex(
             if isinstance(e, (requests.Timeout, requests.ConnectionError)) and attempt < max_retries:
                 interruptible_sleep(min(max_wait, 2 ** attempt))
                 continue
-            logger.warning("OpenAlex search failed (sort=%s): %s", sort_by, e)
+            logger.warning("OpenAlex request failed: %s", e)
             _record_search_diagnostic("timeout" if isinstance(e, requests.Timeout) else "api_failed", error_code="TIMEOUT" if isinstance(e, requests.Timeout) else "API_ERROR", message=str(e))
-            return []
+            return None
 
         if resp.status_code == 429:
             retry_after = _retry_after_seconds(resp)
@@ -184,9 +188,10 @@ def search_openalex(
                 resp.headers.get("Retry-After"),
                 attempt + 1,
                 max_retries + 1,
-                sort_by,
+                params.get("sort"),
             )
             if attempt < max_retries and sleep_seconds <= max_wait:
+                _enter_cooldown(sleep_seconds, retry_after=retry_after)
                 interruptible_sleep(sleep_seconds)
                 continue
             # 重试用尽：进入进程级冷却，并且不把 429 计入熔断失败——
@@ -196,19 +201,26 @@ def search_openalex(
                 retry_after=retry_after,
             )
             _record_search_diagnostic("rate_limited", error_code="HTTP_429", message="OpenAlex 返回 HTTP 429；已进入限流冷却")
-            return []
+            return None
 
+        if resp.status_code == 404:
+            return None
+        if resp.status_code in {401, 403}:
+            _record_search_diagnostic("authentication_failed", error_code=f"HTTP_{resp.status_code}",
+                                      message="OpenAlex authentication/authorization failed")
+            return None
         try:
             resp.raise_for_status()
         except requests.RequestException as e:
-            cb.record_failure(e)
-            logger.warning("OpenAlex search failed (sort=%s): %s", sort_by, e)
+            if resp.status_code >= 500:
+                cb.record_failure(e)
+            logger.warning("OpenAlex request failed: %s", e)
             _record_search_diagnostic("timeout" if isinstance(e, requests.Timeout) else "api_failed", error_code="TIMEOUT" if isinstance(e, requests.Timeout) else "API_ERROR", message=str(e))
-            return []
+            return None
 
         cb.record_success()
-        return parse_openalex_response(resp.json())
-    return []
+        return resp
+    return None
 
 
 def parse_openalex_response(response_json: dict) -> List[PaperMetadata]:
@@ -282,50 +294,8 @@ def parse_openalex_response(response_json: dict) -> List[PaperMetadata]:
 
 def get_openalex_detail(work_id: str) -> Optional[dict]:
     """获取 OpenAlex work 详情。"""
-    from app.core.circuit_breaker import get_circuit_breaker
-
-    # detail 接口与 search 共用同一熔断器、限流器与 429 冷却门。
-    cb = get_circuit_breaker("openalex")
-    if not cb.allow_request():
-        logger.warning("OpenAlex detail skipped due to active circuit breaker")
-        return None
-    remaining = _cooldown_remaining()
-    if remaining > 0:
-        logger.warning(
-            "OpenAlex detail skipped: rate limit cooldown for another %.1fs", remaining,
-        )
-        return None
-    limiter = _get_limiter()
-    if not limiter.acquire(1.0, timeout=10.0):
-        logger.warning("OpenAlex detail skipped: rate limit token wait timed out")
-        return None
-
-    url = f"{OPENALEX_API_URL}/{work_id}"
-    params = {"mailto": _effective_mailto()}
-
-    try:
-        resp = requests.get(url, params=params, timeout=bounded_request_timeout(settings.agent_request_timeout))
-        if resp.status_code == 404:
-            return None
-        if resp.status_code == 429:
-            # 与 search 一致：429 不计入熔断失败，改为进入冷却门。
-            retry_after = _retry_after_seconds(resp)
-            _enter_cooldown(
-                max(retry_after, float(settings.openalex_cooldown_seconds or 0)),
-                retry_after=retry_after,
-            )
-            logger.warning(
-                "OpenAlex detail rate limited: status=429 retry_after=%s",
-                resp.headers.get("Retry-After"),
-            )
-            return None
-        resp.raise_for_status()
-        cb.record_success()
-        return resp.json()
-    except requests.RequestException as e:
-        cb.record_failure(e)
-        logger.debug("OpenAlex detail fetch failed: %s", e)
-        return None
+    resp = _request_openalex(f"{OPENALEX_API_URL}/{work_id}", params={"mailto": _effective_mailto()})
+    return resp.json() if resp is not None else None
 
 
 def _reconstruct_abstract(inverted_index: Optional[dict]) -> Optional[str]:

@@ -60,3 +60,17 @@ def sample_card():
         "relevance_reason": "Highly relevant to vision transformers",
         "evidence_source": "abstract",
     }
+
+
+@pytest.fixture
+def retry_clock(monkeypatch):
+    """Advance both retry sleeps and cooldown clocks without real network waits."""
+    import time
+    from types import SimpleNamespace
+    clock = SimpleNamespace(now=time.monotonic(), waits=[])
+    def sleep(seconds):
+        clock.waits.append(seconds)
+        clock.now += seconds + 0.000001
+    monkeypatch.setattr(time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(time, "sleep", sleep)
+    return clock

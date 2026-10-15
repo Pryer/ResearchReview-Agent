@@ -159,6 +159,9 @@ class Settings(BaseSettings):
     semantic_scholar_max_retries: int = 3
     semantic_scholar_max_retry_wait_seconds: float = 15.0
     semantic_scholar_cooldown_seconds: float = 60.0
+    semantic_scholar_max_cooldown_seconds: float = 900.0
+    arxiv_cooldown_seconds: float = 60.0
+    arxiv_max_cooldown_seconds: float = 900.0
     # Crossref 429 uses a cooldown instead of counting toward outage breaker.
     crossref_max_retries: int = 2
     crossref_max_retry_wait_seconds: float = 15.0
@@ -170,9 +173,8 @@ class Settings(BaseSettings):
     openalex_max_retries: int = 3
     openalex_max_retry_wait_seconds: float = 15.0
     openalex_cooldown_seconds: float = 90.0
-    # 冷却时长上限。OpenAlex 日配额耗尽时会返回指向次日零点的 Retry-After
-    # （实测 41559 秒），无条件采纳会让整天不再访问该源；定期探测成本极低，
-    # 故钳制在此上限内。
+    # 本地兜底冷却上限；更长的服务端 Retry-After 仍须遵守。
+    # 冷却门直接跳过来源，不让研究线程等待整个冷却期。
     openalex_max_cooldown_seconds: float = 900.0
     # CNKI（知网）Selenium 客户端
     cnki_chromedriver_path: str = ""  # 留空则交给 Selenium Manager 自动下载

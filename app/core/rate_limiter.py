@@ -8,7 +8,7 @@ from __future__ import annotations
 import functools
 import threading
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Callable, Dict, Optional
 
 from app.core.logger import get_logger
 
@@ -17,6 +17,7 @@ logger = get_logger(__name__)
 
 class RateLimitAcquireTimeout(TimeoutError):
     """No token became available before the configured wait budget."""
+    error_code = "RATE_LIMIT_WAIT_TIMEOUT"
 
 
 class TokenBucketRateLimiter:
@@ -57,12 +58,18 @@ class TokenBucketRateLimiter:
         Returns:
             True 表示成功获取令牌，False 表示超时未获取到。
         """
+        from app.core.retry_policy import check_retrieval_execution, interruptible_sleep
+
+        check_retrieval_execution()
         if tokens <= 0:
             return True
+        if tokens > self.capacity:
+            return False
 
         deadline = (time.monotonic() + timeout) if timeout is not None else None
 
         while True:
+            check_retrieval_execution()
             with self._lock:
                 self._refill()
                 if self.tokens >= tokens:
@@ -85,7 +92,8 @@ class TokenBucketRateLimiter:
                 wait_time = min(wait_time, remaining)
 
             if wait_time > 0:
-                time.sleep(max(0.001, wait_time))
+                # WHY: 不持有桶锁等待；每 250ms 重新检查执行权及本地令牌期限。
+                interruptible_sleep(min(0.25, max(0.001, wait_time)))
 
     def try_acquire(self, tokens: float = 1.0) -> bool:
         """非阻塞尝试获取令牌。"""
@@ -137,6 +145,8 @@ def rate_limited(domain: str, tokens: float = 1.0, timeout: Optional[float] = 30
                 raise RateLimitAcquireTimeout(
                     f"rate limit token acquisition timed out for domain {domain!r}"
                 )
+            from app.core.retry_policy import check_retrieval_execution
+            check_retrieval_execution()
             return func(*args, **kwargs)
         return wrapper
     return decorator

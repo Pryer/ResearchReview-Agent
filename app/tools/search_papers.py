@@ -9,8 +9,9 @@ from __future__ import annotations
 import math
 import re
 from contextvars import ContextVar
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from app.agent.execution_budget import submit_with_context
+from app.core.retry_policy import check_retrieval_execution, retrieval_cancellation
 from typing import Any, Callable, List, Optional
 
 import requests
@@ -91,6 +92,20 @@ def _diagnostic_for_outcome(
     )
 
 
+def _merge_source_diagnostic(source, previous, count, failure):
+    total = count + (previous.returned_count if previous else 0)
+    failures = [item for item in (previous, failure) if item is not None and item.failure_category]
+    # WHY: 双通道完成顺序不应改变来源健康分类；有论文仍保留失败诊断及累计数。
+    if failures:
+        priority = {"human_action_required": 5, "authentication_failed": 4,
+                    "rate_limited": 3, "timeout": 2, "api_failed": 1}
+        selected = max(failures, key=lambda item: (priority.get(item.failure_category, 0),
+                                                  item.error_code or "", item.message or ""))
+        return selected.model_copy(update={"returned_count": total})
+    return _diagnostic_for_outcome(source, "success_with_results" if total else "success_empty",
+                                   returned_count=total)
+
+
 def _classify_search_exception(exc: BaseException) -> tuple[str, str]:
     """将客户端抛出的异常映射为稳定 outcome 与保留错误码。"""
     error_code = str(getattr(exc, "error_code", "") or "").upper()
@@ -100,7 +115,7 @@ def _classify_search_exception(exc: BaseException) -> tuple[str, str]:
     if status_code is None:
         match = re.search(r"(?:HTTP(?:Error)?|status(?:_code)?|status)[ =:_-]*(401|403|429)", text, re.I)
         status_code = int(match.group(1)) if match else None
-    if error_code in {"RATE_LIMITED", "RATE_LIMIT", "TOO_MANY_REQUESTS"} or status_code == 429:
+    if error_code in {"RATE_LIMITED", "RATE_LIMIT", "RATE_LIMIT_WAIT_TIMEOUT", "TOO_MANY_REQUESTS"} or status_code == 429:
         return "rate_limited", error_code or "HTTP_429"
     if isinstance(exc, (requests.Timeout, TimeoutError)) or "timeout" in text.lower() or "超时" in text:
         return "timeout", error_code or "TIMEOUT"
@@ -128,6 +143,7 @@ def _invoke_client(
     events: list[dict[str, Any]] = []
     token = _CLIENT_DIAGNOSTICS.set(events)
     try:
+        check_retrieval_execution()
         return fn(query, start_year, end_year, quota, sort_by), events
     except BaseException as exc:
         # 客户端为保持旧返回类型可能吞掉异常；若仍抛出，则把已记录的
@@ -179,7 +195,6 @@ def search_papers(
         "cnki": _search_cnki,
     }
 
-    all_papers: List[PaperMetadata] = []
     valid_tasks: list[tuple[str, object, str, int]] = []  # (source, fn, sort_by, quota)
 
     for source in sources:
@@ -234,80 +249,72 @@ def search_papers(
     results_by_key: dict[str, list[PaperMetadata]] = {}
     diagnostics_by_source: dict[str, SourceDiagnostic] = {}
 
-    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="paper-search") as executor:
-        future_to_meta = {}
-        for source, fn, sort_by, quota in valid_tasks:
-            task_key = f"{source}:{sort_by}"
-            future = submit_with_context(executor, _invoke_client, fn, query, start_year, end_year, quota, sort_by)
-            future_to_meta[future] = (source, sort_by, task_key)
-
-        for future in as_completed(future_to_meta):
-            if should_cancel and should_cancel():
-                for pending in future_to_meta:
-                    pending.cancel()
-                raise InterruptedError("论文检索已取消")
-            source, sort_by, task_key = future_to_meta[future]
+    with retrieval_cancellation(should_cancel) as stop_workers:
+        check_retrieval_execution()
+        executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="paper-search")
+        def invoke(*args):
             try:
-                papers, client_events = future.result()
-                results_by_key[task_key] = papers
-                logger.info("[%s] (sort=%s) Found %d papers", source, sort_by, len(papers))
-                if client_events and not papers:
-                    event = client_events[-1]
-                    outcome = str(event.get("outcome") or "api_failed")
-                    diagnostics_by_source[source] = _diagnostic_for_outcome(
-                        source, outcome, error_code=event.get("error_code"),
-                        message=event.get("message"),
-                    )
-
-                # 诊断信息：合并同一数据源的双通道结果。空结果仍明确标为
-                # success_empty，不能被后续流程误认为健康有结果。
-                prev = diagnostics_by_source.get(source)
-                new_count = len(papers) + (prev.returned_count if prev else 0)
-                if new_count > 0:
-                    # 即使本通道有结果，也保留同源另一通道报告的限流/API事件。
-                    if prev and prev.outcome not in {"success_empty", "success_with_results"}:
-                        diagnostics_by_source[source] = prev.model_copy(update={"returned_count": new_count})
-                    else:
-                        diagnostics_by_source[source] = _diagnostic_for_outcome(
-                            source, "success_with_results", returned_count=new_count,
-                        )
-                elif prev is None or prev.outcome in {"success_empty", "success_with_results"}:
-                    diagnostics_by_source[source] = _diagnostic_for_outcome(
-                        source, "success_empty", returned_count=0,
-                    )
-            except Exception as e:
-                # Deadline, cancellation and lease loss are execution-control
-                # signals, never ordinary per-provider search failures. Do not
-                # demote them to a failed diagnostic and keep searching.
+                return _invoke_client(*args)
+            except Exception as exc:
                 from app.agent.execution_budget import is_control_exception
-                if is_control_exception(e):
-                    for pending in future_to_meta:
-                        pending.cancel()
-                    raise
-                logger.warning("[%s] Search failed (sort=%s): %s", source, sort_by, e)
-                client_events = getattr(e, "_client_diagnostics", None) or []
-                if client_events:
-                    event = client_events[-1]
-                    outcome = str(event.get("outcome") or "api_failed")
-                    error_code = event.get("error_code") or "API_ERROR"
-                    message = event.get("message") or f"{type(e).__name__}: {e}"
-                else:
-                    outcome, error_code = _classify_search_exception(e)
-                    message = f"{type(e).__name__}: {e}"
-                previous = diagnostics_by_source.get(source)
-                # 保留已成功通道的结果，同时将故障细节留在诊断中；双通道
-                # 某一排序失败不应覆盖同源另一排序已经得到的证据。
-                if previous is None or not previous.returned_count:
-                    diagnostics_by_source[source] = _diagnostic_for_outcome(
-                        source, outcome, error_code=error_code,
-                        message=message,
-                    )
-                elif previous.message is None:
-                    diagnostics_by_source[source] = previous.model_copy(update={
-                        "error_code": error_code,
-                        "failure_category": outcome,
-                        "message": f"{type(e).__name__}: {e}",
-                    })
+                if is_control_exception(exc) or isinstance(exc, InterruptedError):
+                    # WHY: 工作线程返回异常前停止同轮请求，避免单 worker 继续执行排队动作。
+                    stop_workers(exc)
+                raise
+        try:
+            future_to_meta = {}
+            for source, fn, sort_by, quota in valid_tasks:
+                task_key = f"{source}:{sort_by}"
+                future = submit_with_context(executor, invoke, fn, query, start_year, end_year, quota, sort_by)
+                future_to_meta[future] = (source, sort_by, task_key)
+
+            pending = set(future_to_meta)
+            while pending:
+                check_retrieval_execution()
+                done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                for future in done:
+                    check_retrieval_execution()
+                    source, sort_by, task_key = future_to_meta[future]
+                    try:
+                        papers, client_events = future.result()
+                        results_by_key[task_key] = papers
+                        logger.info("[%s] (sort=%s) Found %d papers", source, sort_by, len(papers))
+                        event = client_events[-1] if client_events else None
+                        failure = (_diagnostic_for_outcome(
+                            source, str(event.get("outcome") or "api_failed"),
+                            error_code=event.get("error_code"), message=event.get("message"),
+                        ) if event else None)
+                        diagnostics_by_source[source] = _merge_source_diagnostic(
+                            source, diagnostics_by_source.get(source), len(papers), failure,
+                        )
+                    except Exception as e:
+                        # Deadline, cancellation and lease loss are execution-control
+                        # signals, never ordinary per-provider search failures. Do not
+                        # demote them to a failed diagnostic and keep searching.
+                        from app.agent.execution_budget import is_control_exception
+                        if is_control_exception(e) or isinstance(e, InterruptedError):
+                            for unfinished in future_to_meta:
+                                unfinished.cancel()
+                            raise
+                        logger.warning("[%s] Search failed (sort=%s): %s", source, sort_by, e)
+                        client_events = getattr(e, "_client_diagnostics", None) or []
+                        if client_events:
+                            event = client_events[-1]
+                            outcome = str(event.get("outcome") or "api_failed")
+                            error_code = event.get("error_code") or "API_ERROR"
+                            message = event.get("message") or f"{type(e).__name__}: {e}"
+                        else:
+                            outcome, error_code = _classify_search_exception(e)
+                            message = f"{type(e).__name__}: {e}"
+                        failure = _diagnostic_for_outcome(source, outcome, error_code=error_code, message=message)
+                        diagnostics_by_source[source] = _merge_source_diagnostic(
+                            source, diagnostics_by_source.get(source), 0, failure,
+                        )
+        finally:
+            # WHY: 先停止同轮等待和未开始的请求，再等待已发 HTTP 的有界超时；
+            # 不遗留持有过期执行上下文的后台检索线程。
+            stop_workers()
+            executor.shutdown(wait=True, cancel_futures=True)
 
     # 按配置源顺序合并（先 relevance 后 date，保证去重优先经典论文）
     merged_order = []
