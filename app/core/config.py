@@ -159,6 +159,11 @@ class Settings(BaseSettings):
     semantic_scholar_max_retries: int = 3
     semantic_scholar_max_retry_wait_seconds: float = 15.0
     semantic_scholar_cooldown_seconds: float = 60.0
+    # Crossref 429 uses a cooldown instead of counting toward outage breaker.
+    crossref_max_retries: int = 2
+    crossref_max_retry_wait_seconds: float = 15.0
+    crossref_cooldown_seconds: float = 60.0
+    crossref_max_cooldown_seconds: float = 900.0
     crossref_mailto: str = ""
     # OpenAlex 429 处理：未配置 crossref_mailto 时只能用 common pool，
     # 客户端会自动降速；重试用尽后进入进程级冷却而不计入熔断失败。
