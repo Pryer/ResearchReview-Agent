@@ -184,7 +184,7 @@ class MainAgentLoop:
             # Review only explicitly configured actions, before Controller effects.
             # The reviewer cannot override deterministic Controller authorization.
             if (settings.agent_sidecar_enabled
-                    and action in settings.agent_sidecar_review_actions_set
+                    and action in {item.strip() for item in settings.agent_sidecar_review_actions.split(",") if item.strip()}
                     and action not in {"request_finish", "report_blocked", "request_clarification"}):
                 review = self.sidecar.review(operation=action, arguments=decision.arguments)
                 state.setdefault("agent_sidecar_reviews", []).append({
