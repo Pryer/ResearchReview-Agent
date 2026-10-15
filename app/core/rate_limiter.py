@@ -15,6 +15,10 @@ from app.core.logger import get_logger
 logger = get_logger(__name__)
 
 
+class RateLimitAcquireTimeout(TimeoutError):
+    """No token became available before the configured wait budget."""
+
+
 class TokenBucketRateLimiter:
     """线程安全的令牌桶算法限流器。"""
 
@@ -130,6 +134,9 @@ def rate_limited(domain: str, tokens: float = 1.0, timeout: Optional[float] = 30
             acquired = limiter.acquire(tokens=tokens, timeout=timeout)
             if not acquired:
                 logger.warning("Rate limit exceeded for domain '%s' on %s", domain, func.__name__)
+                raise RateLimitAcquireTimeout(
+                    f"rate limit token acquisition timed out for domain {domain!r}"
+                )
             return func(*args, **kwargs)
         return wrapper
     return decorator
