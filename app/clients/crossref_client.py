@@ -7,11 +7,15 @@ Crossref 提供 DOI 元数据查询，常用于补全论文详情。
 from __future__ import annotations
 
 from typing import List, Optional
+import random
+import threading
+import time
 
 import requests
 
 from app.core.config import get_settings
 from app.core.logger import get_logger
+from app.core.retry_policy import bounded_request_timeout, interruptible_sleep, retry_after_seconds
 from app.schemas.paper_schema import PaperMetadata
 from app.utils.title_cleaner import clean_abstract, clean_title
 
@@ -28,6 +32,122 @@ def _record_search_diagnostic(outcome: str, *, error_code: str | None = None, me
 
 
 CROSSREF_API_URL = "https://api.crossref.org/works"
+
+
+# A shared source-level cooldown protects search and DOI-detail requests.
+# HTTP 429 is quota pressure, not evidence that Crossref is unavailable.
+_COOLDOWN_LOCK = threading.Lock()
+_COOLDOWN_UNTIL = 0.0
+
+
+def _cooldown_remaining() -> float:
+    with _COOLDOWN_LOCK:
+        return max(0.0, _COOLDOWN_UNTIL - time.monotonic())
+
+
+def _enter_cooldown(seconds: float) -> None:
+    global _COOLDOWN_UNTIL
+    ceiling = max(1.0, float(settings.crossref_max_cooldown_seconds))
+    with _COOLDOWN_LOCK:
+        _COOLDOWN_UNTIL = max(
+            _COOLDOWN_UNTIL,
+            time.monotonic() + min(max(0.0, seconds), ceiling),
+        )
+
+
+def _reset_cooldown() -> None:
+    """Test and explicit recovery hook."""
+    global _COOLDOWN_UNTIL
+    with _COOLDOWN_LOCK:
+        _COOLDOWN_UNTIL = 0.0
+
+
+def _request_crossref(
+    url: str, *, params: dict | None = None, headers: dict | None = None
+) -> requests.Response | None:
+    """Bounded retrieval with distinct 429, transient and auth failure paths."""
+    from app.core.circuit_breaker import get_circuit_breaker
+    from app.core.rate_limiter import get_rate_limiter
+
+    cb = get_circuit_breaker("crossref", failure_threshold=5, recovery_timeout=30.0)
+    if not cb.allow_request():
+        _record_search_diagnostic("api_failed", error_code="CIRCUIT_OPEN",
+                                  message="Crossref circuit breaker is open")
+        return None
+    if (remaining := _cooldown_remaining()) > 0:
+        _record_search_diagnostic("rate_limited", error_code="HTTP_429",
+                                  message=f"Crossref cooldown: {remaining:.1f}s remaining")
+        return None
+
+    limiter = get_rate_limiter("crossref")
+    retries = max(0, int(settings.crossref_max_retries))
+    max_wait = max(0.0, float(settings.crossref_max_retry_wait_seconds))
+    for attempt in range(retries + 1):
+        if _cooldown_remaining() > 0:
+            _record_search_diagnostic("rate_limited", error_code="HTTP_429",
+                                      message="Crossref rate limit cooldown active")
+            return None
+        if not limiter.acquire(1.0, timeout=10.0):
+            _record_search_diagnostic("rate_limited", error_code="RATE_LIMIT_WAIT_TIMEOUT",
+                                      message="Crossref token acquisition timed out")
+            return None
+        try:
+            resp = requests.get(
+                url, params=params, headers=headers,
+                timeout=bounded_request_timeout(settings.agent_request_timeout),
+            )
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            cb.record_failure(exc)
+            if attempt < retries:
+                interruptible_sleep(min(max_wait, 2 ** attempt))
+                continue
+            outcome = "timeout" if isinstance(exc, requests.Timeout) else "api_failed"
+            _record_search_diagnostic(outcome,
+                                      error_code="TIMEOUT" if outcome == "timeout" else "NETWORK_ERROR",
+                                      message=f"Crossref {outcome}")
+            return None
+        except requests.RequestException as exc:
+            cb.record_failure(exc)
+            _record_search_diagnostic("api_failed", error_code="API_ERROR",
+                                      message=f"Crossref {type(exc).__name__}")
+            return None
+
+        if resp.status_code == 429:
+            retry_after = retry_after_seconds(resp.headers)
+            # Respect Retry-After; only attempt in-line retries when the bounded
+            # wait can fit. Otherwise, enter cooldown and let other sources run.
+            wait = (retry_after if retry_after > 0
+                    else min(max_wait, 2 ** attempt) + random.uniform(0.0, 0.25))
+            if attempt < retries and wait <= max_wait:
+                interruptible_sleep(wait)
+                continue
+            _enter_cooldown(max(retry_after, float(settings.crossref_cooldown_seconds)))
+            _record_search_diagnostic("rate_limited", error_code="HTTP_429",
+                                      message="Crossref HTTP 429; cooldown started")
+            return None
+        if resp.status_code in {401, 403}:
+            _record_search_diagnostic("authentication_failed",
+                                      error_code=f"HTTP_{resp.status_code}",
+                                      message="Crossref authentication/authorization failed")
+            return None
+        if resp.status_code == 404:
+            return None
+        if resp.status_code in {500, 502, 503, 504}:
+            cb.record_failure()
+            if attempt < retries:
+                interruptible_sleep(min(max_wait, 2 ** attempt))
+                continue
+            _record_search_diagnostic("api_failed", error_code=f"HTTP_{resp.status_code}",
+                                      message="Crossref transient server failure")
+            return None
+        if resp.status_code >= 400:
+            _record_search_diagnostic("api_failed", error_code=f"HTTP_{resp.status_code}",
+                                      message="Crossref HTTP request failed")
+            return None
+        cb.record_success()
+        return resp
+    return None
+
 
 
 def search_crossref(
@@ -49,20 +169,6 @@ def search_crossref(
     Returns:
         论文元数据列表。
     """
-    from app.core.circuit_breaker import get_circuit_breaker
-    from app.core.rate_limiter import get_rate_limiter
-
-    cb = get_circuit_breaker("crossref", failure_threshold=5, recovery_timeout=30.0)
-    if not cb.allow_request():
-        logger.warning("Crossref search skipped due to active circuit breaker")
-        return []
-
-    limiter = get_rate_limiter("crossref")
-    if not limiter.acquire(1.0, timeout=10.0):
-        # 令牌等待超时说明本域已严重超速：跳过本次请求而不是照发不误。
-        logger.warning("Crossref search skipped: rate limit token wait timed out")
-        return []
-
     # 排序映射
     cr_sort = "published" if sort_by == "date" else "relevance"
 
@@ -80,61 +186,20 @@ def search_crossref(
         "mailto": settings.crossref_mailto or "research-review-agent@example.com",
     }
 
-    try:
-        resp = requests.get(
-            CROSSREF_API_URL,
-            params=params,
-            timeout=settings.agent_request_timeout,
-        )
-        resp.raise_for_status()
-        cb.record_success()
-        return parse_crossref_response(resp.json())
-    except requests.RequestException as e:
-        cb.record_failure(e)
-        logger.warning("Crossref search failed (sort=%s): %s", sort_by, e)
-        status_code = getattr(getattr(e, "response", None), "status_code", None)
-        outcome = "timeout" if isinstance(e, requests.Timeout) else (
-            "authentication_failed" if status_code in {401, 403} else "api_failed"
-        )
-        error_code = "TIMEOUT" if outcome == "timeout" else (
-            f"HTTP_{status_code}" if status_code in {401, 403} else "API_ERROR"
-        )
-        _record_search_diagnostic(outcome, error_code=error_code, message=str(e))
+    resp = _request_crossref(CROSSREF_API_URL, params=params)
+    if resp is None:
         return []
+    return parse_crossref_response(resp.json())
 
 
 def get_crossref_detail(doi: str) -> Optional[dict]:
     """根据 DOI 获取详情。"""
-    from app.core.circuit_breaker import get_circuit_breaker
-    from app.core.rate_limiter import get_rate_limiter
-
-    # detail 接口与 search 共用同一熔断器与限流器：此前完全绕过。
-    cb = get_circuit_breaker("crossref", failure_threshold=5, recovery_timeout=30.0)
-    if not cb.allow_request():
-        logger.warning("Crossref detail skipped due to active circuit breaker")
-        return None
-    limiter = get_rate_limiter("crossref")
-    if not limiter.acquire(1.0, timeout=10.0):
-        logger.warning("Crossref detail skipped: rate limit token wait timed out")
-        return None
-
     url = f"{CROSSREF_API_URL}/{doi}"
-    headers = {
-        "User-Agent": "ResearchReview-Agent/0.1 (mailto:research-review-agent@example.com)"
-    }
-
-    try:
-        resp = requests.get(url, headers=headers, timeout=settings.agent_request_timeout)
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        cb.record_success()
-        items = resp.json().get("message", {})
-        return _crossref_item_to_dict(items)
-    except requests.RequestException as e:
-        cb.record_failure(e)
-        logger.debug("Crossref detail failed: %s", e)
+    headers = {"User-Agent": "ResearchReview-Agent/0.1 (mailto:research-review-agent@example.com)"}
+    resp = _request_crossref(url, headers=headers)
+    if resp is None:
         return None
+    return _crossref_item_to_dict(resp.json().get("message", {}))
 
 
 def parse_crossref_response(response_json: dict) -> List[PaperMetadata]:
