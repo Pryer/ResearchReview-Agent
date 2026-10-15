@@ -253,3 +253,19 @@ def test_arxiv_does_not_retry_when_retry_after_exceeds_budget(monkeypatch):
     with pytest.raises(requests.HTTPError):
         arxiv._arxiv_get("https://export.arxiv.org/api/query", timeout=5, max_retries=3)
     assert len(calls) == 1
+
+
+def test_worker_budget_abort_is_not_misreported_as_source_failure(monkeypatch):
+    import importlib
+    tool = importlib.import_module("app.tools.search_papers")
+
+    def fail_budget(*args):
+        raise AgentBudgetExceeded("research execution deadline exceeded")
+
+    monkeypatch.setattr(tool, "_search_crossref", fail_budget)
+    diagnostics = []
+    with pytest.raises(AgentBudgetExceeded):
+        search_papers("action recognition", 2024, 2026, 5,
+                      sources=["crossref"], diagnostics=diagnostics,
+                      enable_dual_channel=False)
+    assert diagnostics == []
