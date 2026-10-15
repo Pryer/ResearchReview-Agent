@@ -141,6 +141,10 @@ class Settings(BaseSettings):
     main_context_system_reserve_chars: int = 6000
     main_context_output_reserve_chars: int = 4000
     agent_execution_action_budget: int = 64
+    # Chapter 4 Sidecar: opt-in independent tool-call safety review.
+    # By default no actions are reviewed; enabling requires selecting actions.
+    agent_sidecar_enabled: bool = False
+    agent_sidecar_review_actions: str = "generate_deliverables,rewrite_sections"
     agent_main_max_rounds: int = 24
     agent_main_no_progress_limit: int = 3
     agent_main_token_budget: int = 10000000
