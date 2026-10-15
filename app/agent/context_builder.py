@@ -191,6 +191,22 @@ def _agent_state(state: dict[str, Any]) -> AgentStateContext:
         "status": str(item.get("status") or "unknown"),
         "error": _clean_text(item.get("error"), 180),
     } for item in steps[-8:]]
+    # ReAct observation: expose concise, verified post-action feedback, not
+    # the specialist's full working context or unbounded raw tool output.
+    # Task results are already persisted by the Controller.
+    for item in (state.get("agent_task_results") or [])[-4:]:
+        if not isinstance(item, dict):
+            continue
+        findings = item.get("findings") or []
+        recent.append({
+            "action": str(item.get("operation") or ""),
+            "status": str(item.get("status") or "unknown"),
+            "outcome": str(item.get("outcome") or "unknown"),
+            "findings": [_clean_text(f, 200) for f in findings[:3]],
+            "error": _clean_text(item.get("error"), 180),
+            "evidence_refs": [str(ref) for ref in (item.get("evidence_refs") or [])[:3]],
+        })
+    recent = recent[-8:]
     allowed = [
         str(item) for item in state.get("allowed_agent_actions") or _next_actions(state)
     ]
