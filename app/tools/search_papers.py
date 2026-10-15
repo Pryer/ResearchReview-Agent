@@ -276,6 +276,14 @@ def search_papers(
                         source, "success_empty", returned_count=0,
                     )
             except Exception as e:
+                # Deadline, cancellation and lease loss are execution-control
+                # signals, never ordinary per-provider search failures. Do not
+                # demote them to a failed diagnostic and keep searching.
+                from app.agent.execution_budget import is_control_exception
+                if is_control_exception(e):
+                    for pending in future_to_meta:
+                        pending.cancel()
+                    raise
                 logger.warning("[%s] Search failed (sort=%s): %s", source, sort_by, e)
                 client_events = getattr(e, "_client_diagnostics", None) or []
                 if client_events:
