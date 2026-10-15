@@ -83,6 +83,12 @@ def _request_crossref(
     retries = max(0, int(settings.crossref_max_retries))
     max_wait = max(0.0, float(settings.crossref_max_retry_wait_seconds))
     for attempt in range(retries + 1):
+        # A breaker may open during previous failed attempts or from a parallel
+        # search. Never continue retrying after it has opened.
+        if not cb.allow_request():
+            _record_search_diagnostic("api_failed", error_code="CIRCUIT_OPEN",
+                                      message="Crossref circuit breaker opened during retries")
+            return None
         if _cooldown_remaining() > 0:
             _record_search_diagnostic("rate_limited", error_code="HTTP_429",
                                       message="Crossref rate limit cooldown active")
