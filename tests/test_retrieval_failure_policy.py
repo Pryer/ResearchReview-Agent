@@ -191,3 +191,65 @@ def test_multi_source_keeps_successful_papers_when_another_provider_rate_limits(
     assert [paper.paper_id for paper in results] == ["arxiv:123"]
     assert any(x.source == "crossref" and x.outcome == "rate_limited"
                for x in diagnostics)
+
+
+def test_semantic_scholar_timeout_retries_without_losing_result(monkeypatch):
+    s2 = semantic_scholar_client
+    monkeypatch.setattr(s2.settings, "semantic_scholar_max_retries", 1)
+    monkeypatch.setattr(s2, "_respect_rate_limit", lambda: None)
+    monkeypatch.setattr("app.core.retry_policy.time.sleep", lambda seconds: None)
+    calls = []
+
+    def get(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise requests.Timeout("temporary")
+        return Response(200, payload={"data": []})
+
+    monkeypatch.setattr(s2.requests, "get", get)
+    assert s2._request_json("https://api.semanticscholar.org/x", {}) == {"data": []}
+    assert len(calls) == 2
+    assert get_circuit_breaker("semantic_scholar").consecutive_failures == 0
+
+
+def test_openalex_timeout_retries_then_succeeds(monkeypatch):
+    from app.clients import openalex_client as oa
+    cb = get_circuit_breaker("openalex")
+    cb.reset()
+    oa._reset_cooldown()
+    limiter = get_rate_limiter("openalex")
+    limiter.tokens = limiter.capacity
+    monkeypatch.setattr(oa.settings, "openalex_max_retries", 1)
+    monkeypatch.setattr("app.core.retry_policy.time.sleep", lambda seconds: None)
+    calls = []
+
+    def get(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise requests.Timeout("temporary")
+        return Response(200, payload={"results": []})
+
+    monkeypatch.setattr(oa.requests, "get", get)
+    assert oa.search_openalex("topic", 2024, 2026) == []
+    assert len(calls) == 2
+    assert cb.consecutive_failures == 0
+    cb.reset()
+    oa._reset_cooldown()
+
+
+def test_arxiv_does_not_retry_when_retry_after_exceeds_budget(monkeypatch):
+    from app.clients import arxiv_client as arxiv
+
+    monkeypatch.setattr(arxiv, "_reserve_request_slot", lambda: None)
+    limiter = get_rate_limiter("arxiv")
+    limiter.tokens = limiter.capacity
+    calls = []
+
+    def get(*args, **kwargs):
+        calls.append(1)
+        return Response(429, headers={"Retry-After": "120"})
+
+    monkeypatch.setattr(arxiv.requests, "get", get)
+    with pytest.raises(requests.HTTPError):
+        arxiv._arxiv_get("https://export.arxiv.org/api/query", timeout=5, max_retries=3)
+    assert len(calls) == 1
