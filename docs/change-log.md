@@ -2175,3 +2175,13 @@ what changed and how it was validated; it is not a replacement for Git history.
 - 验证：全部可达 Git 历史中目标署名为 0；备份历史提交数仍为 13，文件树逐条一致，主干提交保持原值。通过 Git 实际执行提交钩子的 5 项检查全部通过（普通说明、其他共同作者、Claude、大小写变化、Anthropic 地址）；本地 JSON 配置有效且保持被忽略；`git diff --check` 通过。
 - 收敛审查：只处理署名及防复发规则，没有生产代码变化、临时逻辑或多余刷新；本地钩子附中文 WHY 注释，不清理用户文件。
 - 限制：本地钩子及 Claude 配置不随仓库传播至其他克隆，显式跳过钩子的工具仍需遵守 Agent 规则；旧不可达对象和 reflog 保留正常恢复能力，不进行垃圾回收。未运行 pytest 或真实 CNKI/LLM E2E，本次未修改研究流程、质量门禁或证据处理。
+
+
+## 2026-10-16 00:55:20 +08:00 — Context Engineering、追加式轨迹与分层预算控制
+
+- 修改文件：.env.example; README.md; app/agent/context_builder.py; app/agent/controller.py; app/agent/graph.py; app/agent/main_loop.py; app/agent/main_policy.py; app/agent/react_context.py; app/agent/state.py; app/core/config.py; app/prompt/agent_system.py; app/schemas/artifact_schema.py; app/schemas/context_schema.py; app/services/llm_service.py; app/services/research_artifact_service.py; docs/agent-context-architecture.md; docs/book-guided-agent-harness.md; docs/change-log.md; tests/test_durable_runtime.py; tests/test_main_agent_loop.py; tests/test_main_agent_policy.py; tests/test_react_context.py。
+- 原因：PR 原有上下文每轮重建为单次摘要，LLM 消息验证会丢弃工具协议字段，设计中的追加轨迹、请求容量预检及 Epoch 压缩尚未落地。
+- 行为：主策略持有稳定规则和排序固定的动作目录；权威五字段作为末尾状态栏追加，原始目标及所有修订保留。原生 assistant/tool 保留调用 ID、参数和 DeepSeek 续传字段，其他提供商剥离厂商扩展；JSON 回退在会话内固定。L1 有界观察，大输出及引用数组外置分片并通过单一归档索引访问；L2 达阈值时归档完整 Epoch，保留目标、约束、当前工作状态、观察/决策账本与最近完整交互；L3 无法归档或保留集超限时在模型调用前 blocked。活动轨迹随检查点分片持久化，Controller 将结果和观察原子提交，沿用既有权限、CAS、租约、取消、幂等和质量门禁。
+- 验证：新增上下文边界与真实 SQLite 事务恢复测试；相关新测试及耐久恢复 47 passed。最终全量 1492 passed、716 warnings（21.13s）；使用 DASHSCOPE_API_KEY=unit-test-placeholder、RETRIEVAL_EMBEDDING_URL=https://example.invalid/embedding、RETRIEVAL_RERANK_URL=https://example.invalid/rerank 的测试配置，远程模型均模拟。原始 HEAD 的混合检索测试在空配置下同样 12 failed、6 passed；未修改无关检索代码或用例。新模块及改动的 LLM 服务 Ruff F 检查通过，git diff --check 通过。
+- 收敛审查：主循环只有一条；主控直接管理自身稳定前缀，专业 Agent 沿用角色适配；结果与观察同一事务，不增加重复执行分支；没有依赖实时模型的摘要器。保留集无法表达时显式停止，原始要求、引用与完整原始结果可回溯。非显然状态寿命和提交边界有中文 WHY，回归覆盖前缀、权限拒绝、工具配对、归档失败、大引用列表、约束超限和恢复时机。
+- 限制：Token 输入为 UTF-8 字节上界加消息开销的保守估算，并非提供商 tokenizer 实测；实际 usage 单独记录，窗口须配置为主备模型较小的可用值。L2 需要会话 Artifact Store，直接内存图执行达到该边界时明确阻断。历史观察/决策保留集继续增长时仍可能触发 L3。未运行真实 LLM/CNKI E2E，未测缓存命中率、成本、延迟或任务完成率，不宣称已实现推理引擎 KV Cache 或性能提升；PR 保持 Draft。

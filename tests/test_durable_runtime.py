@@ -589,3 +589,34 @@ def test_budget_update_rejects_owned_runtime_and_queued_job(db):
     with pytest.raises(RuntimeConflict):
         runtime.update_token_limit(expected_limit=100000, new_limit=1000000)
     assert json.loads(db.get(ResearchRuntimeModel, "busy-budget").budget_json) == ledger
+
+
+def test_react_observation_commits_with_task_and_is_restored_without_reexecution(db):
+    from app.agent.react_context import ReActContext
+    from app.schemas.agent_decision_schema import AgentDecision
+    from app.services.research_artifact_service import ResearchArtifactService
+    from app.services.research_execution_service import _STORE
+    from app.services.llm_service import LLMService
+
+    current = state()
+    ReActContext(current).proposed(AgentDecision(
+        action="search_and_rank", transport="native_tool", tool_call_id="search-call"))
+    token = _STORE.set(ResearchArtifactService(db))
+    try:
+        with budget_scope(current):
+            with durable_scope(db, "s", current, current["agent_execution_budget"]) as runtime:
+                AgentController().execute(
+                    role=AgentRole.SEARCH, operation="search_and_rank", objective="search",
+                    state=current,
+                    handler=lambda working: working.update(candidate_papers=[{"paper_id": "p1"}]),
+                )
+                # Simulate restart at the Controller commit, before MainAgentLoop returns.
+                restored = runtime.restore()
+                trajectory = restored["main_agent_trajectory"]
+                assert not trajectory.get("pending")
+                assert trajectory["messages"][-1]["tool_call_id"] == "search-call"
+                assert json.loads(trajectory["messages"][-1]["content"])["status"] == "completed"
+                LLMService._validate_messages(trajectory["messages"])
+                assert restored["candidate_papers"] == [{"paper_id": "p1"}]
+    finally:
+        _STORE.reset(token)

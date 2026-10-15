@@ -140,6 +140,11 @@ class Settings(BaseSettings):
     # system/tool 前缀与结构化决策输出分别预留预算。
     main_context_system_reserve_chars: int = 6000
     main_context_output_reserve_chars: int = 4000
+    # 主备模型中较小的可用窗口；包含 system/tools/messages 和决策输出预留。
+    agent_context_window_tokens: int = Field(default=65536, ge=1)
+    agent_context_compact_ratio: float = Field(default=0.8, gt=0, lt=1)
+    agent_context_recent_turns: int = Field(default=2, ge=0)
+    agent_context_tool_result_chars: int = Field(default=4000, ge=1024)
     agent_execution_action_budget: int = 64
     # Chapter 4 Sidecar: opt-in independent tool-call safety review.
     # By default no actions are reviewed; enabling requires selecting actions.
