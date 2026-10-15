@@ -16,6 +16,7 @@ import requests
 
 from app.core.config import get_settings
 from app.core.logger import get_logger
+from app.core.retry_policy import bounded_request_timeout, interruptible_sleep, retry_after_seconds
 from app.schemas.paper_schema import PaperMetadata
 from app.utils.title_cleaner import clean_abstract, clean_title
 
@@ -50,7 +51,7 @@ def _reserve_request_slot() -> None:
         _last_request_time = scheduled
     wait = scheduled - now
     if wait > 0:
-        time.sleep(wait)
+        interruptible_sleep(wait)
 
 
 def _arxiv_get(url: str, timeout: int, max_retries: int = 3) -> requests.Response:
@@ -66,12 +67,18 @@ def _arxiv_get(url: str, timeout: int, max_retries: int = 3) -> requests.Respons
                 logger.warning("arXiv request skipped: rate limit token wait timed out")
                 raise requests.RequestException("arXiv rate limit token wait timed out")
             _reserve_request_slot()
-            resp = requests.get(url, timeout=timeout)
+            resp = requests.get(url, timeout=bounded_request_timeout(timeout))
             if resp.status_code == 429:
-                wait = min(10 * attempt, 30)
-                logger.warning("arXiv rate limited (429), waiting %ds before retry %d/%d", wait, attempt, max_retries)
-                _record_search_diagnostic("rate_limited", error_code="HTTP_429", message="arXiv 返回 HTTP 429，正在退避重试")
-                time.sleep(wait)
+                retry_after = retry_after_seconds(resp.headers)
+                wait = retry_after or min(10 * attempt, 30)
+                _record_search_diagnostic("rate_limited", error_code="HTTP_429",
+                                          message="arXiv HTTP 429; bounded retry")
+                # A long Retry-After is a stop signal for this bounded attempt.
+                if attempt >= max_retries or wait > 30:
+                    raise requests.HTTPError("arXiv HTTP 429 rate limited", response=resp)
+                logger.warning("arXiv rate limited (429), waiting %.1fs before retry %d/%d",
+                               wait, attempt, max_retries)
+                interruptible_sleep(wait)
                 continue
             resp.raise_for_status()
             return resp
@@ -79,7 +86,7 @@ def _arxiv_get(url: str, timeout: int, max_retries: int = 3) -> requests.Respons
             if attempt < max_retries:
                 wait = 5 * attempt
                 logger.warning("arXiv timeout on attempt %d/%d, retrying in %ds", attempt, max_retries, wait)
-                time.sleep(wait)
+                interruptible_sleep(wait)
             else:
                 raise
         except requests.RequestException:
