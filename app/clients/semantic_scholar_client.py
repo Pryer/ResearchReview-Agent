@@ -14,6 +14,7 @@ import requests
 
 from app.core.config import get_settings
 from app.core.logger import get_logger
+from app.core.retry_policy import bounded_request_timeout, interruptible_sleep, retry_after_seconds
 from app.schemas.paper_schema import PaperMetadata
 
 logger = get_logger(__name__)
@@ -47,13 +48,7 @@ def _headers() -> dict[str, str]:
 
 
 def _retry_after_seconds(resp: requests.Response) -> float:
-    value = resp.headers.get("Retry-After")
-    if not value:
-        return 0.0
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        return 0.0
+    return retry_after_seconds(resp.headers)
 
 
 def _respect_rate_limit() -> None:
@@ -71,7 +66,7 @@ def _respect_rate_limit() -> None:
         now = time.monotonic()
         wait_seconds = _S2_NEXT_ALLOWED_AT - now
         if wait_seconds > 0:
-            time.sleep(wait_seconds)
+            interruptible_sleep(wait_seconds)
             now = time.monotonic()
         _S2_NEXT_ALLOWED_AT = now + interval
 
@@ -113,7 +108,7 @@ def _request_json(url: str, params: dict) -> Optional[dict]:
                 url,
                 params=params,
                 headers=_headers(),
-                timeout=settings.agent_request_timeout,
+                timeout=bounded_request_timeout(settings.agent_request_timeout),
             )
             if resp.status_code == 429:
                 retry_after = _retry_after_seconds(resp)
@@ -129,14 +124,15 @@ def _request_json(url: str, params: dict) -> Optional[dict]:
                     resp.url,
                 )
                 if attempt < max_retries and sleep_seconds <= max_wait:
-                    time.sleep(sleep_seconds)
+                    interruptible_sleep(sleep_seconds)
                     continue
                 cooldown_dur = float(settings.semantic_scholar_cooldown_seconds or 0)
                 if settings.semantic_scholar_api_key:
                     cooldown_dur = min(cooldown_dur, 15.0)
                 with _S2_RATE_LOCK:
                     _S2_COOLDOWN_UNTIL = time.monotonic() + max(retry_after, cooldown_dur)
-                cb.record_failure()
+                # 429 means quota pressure; the cooldown gate, not the outage
+                # breaker, prevents additional attempts.
                 _record_search_diagnostic("rate_limited", error_code="HTTP_429", message="Semantic Scholar 连续返回 HTTP 429；已停止本轮后续请求")
                 raise SemanticScholarRateLimitError(
                     "Semantic Scholar 连续返回 HTTP 429；已停止本轮后续请求"
@@ -148,7 +144,8 @@ def _request_json(url: str, params: dict) -> Optional[dict]:
                     resp.text[:300],
                     resp.url,
                 )
-                cb.record_failure()
+                if resp.status_code not in {401, 403}:
+                    cb.record_failure()
                 outcome = "authentication_failed" if resp.status_code in {401, 403} else "api_failed"
                 _record_search_diagnostic(outcome, error_code=f"HTTP_{resp.status_code}", message=f"Semantic Scholar HTTP {resp.status_code}")
                 return None
@@ -156,6 +153,9 @@ def _request_json(url: str, params: dict) -> Optional[dict]:
             return resp.json()
         except requests.RequestException as e:
             cb.record_failure(e)
+            if isinstance(e, (requests.Timeout, requests.ConnectionError)) and attempt < max_retries:
+                interruptible_sleep(min(max_wait, 2 ** attempt))
+                continue
             logger.warning("Semantic Scholar request failed: %s", e)
             outcome = "timeout" if isinstance(e, requests.Timeout) else "api_failed"
             _record_search_diagnostic(outcome, error_code="TIMEOUT" if outcome == "timeout" else "API_ERROR", message=str(e))
