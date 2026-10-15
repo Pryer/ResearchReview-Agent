@@ -15,6 +15,7 @@ import requests
 
 from app.core.config import get_settings
 from app.core.logger import get_logger
+from app.core.retry_policy import bounded_request_timeout, interruptible_sleep, retry_after_seconds
 from app.schemas.paper_schema import PaperMetadata
 from app.utils.title_cleaner import clean_abstract, clean_title
 
@@ -66,13 +67,7 @@ def _get_limiter():
 
 
 def _retry_after_seconds(resp: requests.Response) -> float:
-    value = resp.headers.get("Retry-After")
-    if not value:
-        return 0.0
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        return 0.0
+    return retry_after_seconds(resp.headers)
 
 
 def _cooldown_remaining() -> float:
@@ -167,10 +162,13 @@ def search_openalex(
             resp = requests.get(
                 OPENALEX_API_URL,
                 params=params,
-                timeout=settings.agent_request_timeout,
+                timeout=bounded_request_timeout(settings.agent_request_timeout),
             )
         except requests.RequestException as e:
             cb.record_failure(e)
+            if isinstance(e, (requests.Timeout, requests.ConnectionError)) and attempt < max_retries:
+                interruptible_sleep(min(max_wait, 2 ** attempt))
+                continue
             logger.warning("OpenAlex search failed (sort=%s): %s", sort_by, e)
             _record_search_diagnostic("timeout" if isinstance(e, requests.Timeout) else "api_failed", error_code="TIMEOUT" if isinstance(e, requests.Timeout) else "API_ERROR", message=str(e))
             return []
@@ -189,7 +187,7 @@ def search_openalex(
                 sort_by,
             )
             if attempt < max_retries and sleep_seconds <= max_wait:
-                time.sleep(sleep_seconds)
+                interruptible_sleep(sleep_seconds)
                 continue
             # 重试用尽：进入进程级冷却，并且不把 429 计入熔断失败——
             # 限流是本端速率问题，不是 OpenAlex 不可用。
@@ -306,7 +304,7 @@ def get_openalex_detail(work_id: str) -> Optional[dict]:
     params = {"mailto": _effective_mailto()}
 
     try:
-        resp = requests.get(url, params=params, timeout=settings.agent_request_timeout)
+        resp = requests.get(url, params=params, timeout=bounded_request_timeout(settings.agent_request_timeout))
         if resp.status_code == 404:
             return None
         if resp.status_code == 429:
