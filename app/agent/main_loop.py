@@ -14,6 +14,7 @@ from app.agent.action_registry import (
 )
 from app.agent.context_builder import refresh_main_agent_context
 from app.agent.controller import AgentController
+from app.agent.sidecar import ActionSidecar
 from app.agent.execution_budget import (
     AgentBudgetExceeded,
     AgentExecutionStale,
@@ -67,6 +68,7 @@ class MainAgentLoop:
     def __init__(self, llm, *, controller: AgentController | None = None) -> None:
         self.policy = MainAgentPolicy(llm)
         self.controller = controller or AgentController()
+        self.sidecar = ActionSidecar(llm)
 
     def run(
         self, state, *, handlers, finish_validator, should_cancel=None,
@@ -179,6 +181,30 @@ class MainAgentLoop:
                 })
                 return "blocked"
             action = decision.action
+            # Review only explicitly configured actions, before Controller effects.
+            # The reviewer cannot override deterministic Controller authorization.
+            if (settings.agent_sidecar_enabled
+                    and action in settings.agent_sidecar_review_actions_set
+                    and action not in {"request_finish", "report_blocked", "request_clarification"}):
+                review = self.sidecar.review(operation=action, arguments=decision.arguments)
+                state.setdefault("agent_sidecar_reviews", []).append({
+                    "action": action, "verdict": review.verdict, "reason": review.reason,
+                })
+                if review.verdict != "allow":
+                    state.setdefault("main_agent_rejections", []).append({
+                        "action": action,
+                        "reason": "sidecar_" + review.verdict + ":" + review.reason,
+                        "round": round_index,
+                    })
+                    if review.verdict == "escalate":
+                        state["clarification"] = {
+                            "needed": True, "kind": "sidecar_review",
+                            "question": "此项研究操作需要人工确认：" + review.reason,
+                        }
+                        state["result_status"] = "waiting_user"
+                        return "waiting_user"
+                    # Denial becomes a new observation; no automatic re-execution.
+                    continue
             if action == "request_clarification":
                 state["clarification"] = {
                     "needed": True,
