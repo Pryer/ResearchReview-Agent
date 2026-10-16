@@ -33,6 +33,8 @@ class AgentStateContext(StrictContextModel):
     allowed_actions: list[str] = Field(default_factory=list)
     completed_actions: list[str] = Field(default_factory=list)
     recent_trajectory: list[dict[str, Any]] = Field(default_factory=list)
+    delegation: dict[str, Any] = Field(default_factory=dict)
+    agent_messages: list[dict[str, Any]] = Field(default_factory=list)
     failure_reasons: list[str] = Field(default_factory=list)
     gate_status: dict[str, Any] = Field(default_factory=dict)
     artifact_summary: dict[str, int | bool | str | None] = Field(default_factory=dict)

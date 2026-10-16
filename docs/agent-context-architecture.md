@@ -79,6 +79,58 @@ blocks explicitly instead of silently skipping the selected remedy.
 Request parsing runs in the search/planning adapter before the five-field decision
 loop; it is not a main-Agent decision call.
 
+## Independent specialist ReAct loops
+
+`MainAgentLoop` delegates its research decision to `SubagentLoop`. Each of Search,
+Analysis and Writing has a separate persisted namespace in `subagent_sessions`:
+its role prompt, trajectory, context usage, archive epochs, communication history
+and active delegation. `ReActContext` shares the context-management algorithm,
+not the mutable messages between roles. The main context sees structured reports,
+not the child's private trajectory. A child sees only its own communication and
+the current evidence/status projection allowed by its role's action contracts.
+Authoritative research evidence remains shared and versioned through Controller.
+
+For one delegation the specialist repeatedly chooses an eligible role action,
+executes it through `AgentController`, observes the committed result and chooses
+again. It can therefore search then fetch metadata, or extract evidence then plan
+claims, without a new main-model decision between every step. It returns through
+`report_to_main` with `completed`, `needs_help` or `blocked` and optional suggested
+actions. Suggestions and model-written reports do not authorize tools or establish
+evidence. The main model receives these reports in `state.agent_messages` and can
+reply by issuing a revised delegation; the same specialist retains its history.
+Native main-agent tools accept optional `delegation_message` text for the task or
+reply. Policy extracts it into the task objective before action argument validation;
+it is never passed to research handlers as an executable parameter. JSON decisions
+can use the existing `reason` field or the same communication metadata.
+
+The delegated operation must actually commit before a `completed` report is
+accepted. Its arguments are immutable; local rewrites cannot switch to full-draft
+generation. Mandatory recovery and evidence-handoff ordering remain authoritative.
+Requests outside the current role, action preconditions or registered handlers are
+rejected. Each additional child action receives its own Controller permission,
+version and budget checks, plus Sidecar review when configured. A child's completion
+means that its operation executed, not that final review quality passed.
+
+The implementation uses synchronous delegation, not background daemon workers or
+parallel shared-state mutation. Independent contexts survive multiple delegations.
+Each delegation has `AGENT_SUBAGENT_MAX_ROUNDS` (default 12) and
+`AGENT_SUBAGENT_NO_PROGRESS_LIMIT` (default 3); these counters survive checkpoints.
+All LLM calls, retries, retrievals and committed actions share the existing session
+budgets and cancellation/lease boundaries. Changed user goals invalidate an active
+delegation and require the main Agent to issue a new task.
+
+Controller commits the child observation, progress counters, updated evidence and
+invalidation of stale claims/gates in one snapshot. The parent's tool call remains
+pending until the child reports. Final reporting pairs the parent observation and
+clears the active delegation in one snapshot. Recovery resumes the active child
+before allowing another main decision, without repeating already committed actions.
+Uncommitted external effects retain the existing runtime's explicit uncertain-task
+boundary; this does not promise exactly-once execution of remote requests.
+Specialist trajectories use service-only artifact fragments, with the same strict
+cross-session access and bounded archive/compaction behavior as the main trajectory.
+These changes add model calls; no live-provider cost, latency or review-quality
+improvement has been measured by offline regression tests.
+
 `request_clarification` returns public `needs_clarification`, stores its question and
 private `waiting_user` state, and resumes with the original evidence and the latest
 user constraints. A hard execution stop (budget exhaustion, lease staleness, or a

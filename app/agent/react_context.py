@@ -59,9 +59,10 @@ def archive_payload(state: dict, kind: str, payload: dict) -> list[str]:
 
 
 class ReActContext:
-    def __init__(self, state: dict) -> None:
+    def __init__(self, state: dict, *, namespace: str | None = None) -> None:
         self.state = state
-        state.setdefault(
+        self.namespace = namespace
+        self.container.setdefault(
             "main_agent_trajectory",
             {
                 "version": 1,
@@ -76,9 +77,15 @@ class ReActContext:
             raise ContextBudgetExceeded("unsupported_trajectory_version")
 
     @property
+    def container(self) -> dict:
+        if self.namespace is None:
+            return self.state
+        return self.state.setdefault("subagent_sessions", {}).setdefault(self.namespace, {})
+
+    @property
     def data(self) -> dict:
         # WHY: Controller 提交会替换 state 内容，不能持有提交前的嵌套字典引用。
-        return self.state["main_agent_trajectory"]
+        return self.container["main_agent_trajectory"]
 
     def request(
         self, context, *, system: str, tools: list[dict], allowed_actions: list[str]
@@ -122,7 +129,7 @@ class ReActContext:
             self._compact(status)
             messages = build()
         estimate = estimate_tokens(messages, tools)
-        self.state["agent_context_usage"] = {
+        self.container["agent_context_usage"] = {
             "estimated_input_tokens": estimate,
             "estimate_method": "utf8_upper_bound",
             "output_reserve_tokens": reserve,
@@ -276,6 +283,11 @@ def _object(message: dict) -> dict:
 
 
 def record_tool_observation(state: dict, payload: dict) -> None:
+    role = state.get("active_subagent")
+    if role:
+        from app.agent.subagents.loop import record_subagent_observation
+        record_subagent_observation(state, payload)
+        return
     data = state.get("main_agent_trajectory") or {}
     if (data.get("pending") or {}).get("action") == payload.get("operation"):
         ReActContext(state).observe(payload)

@@ -81,6 +81,10 @@ class WorkflowLLM:
         ))
 
     def complete_tool_call(self, messages, **kwargs):
+        from tests.agent_decision_fakes import delegated_response
+        child = delegated_response(messages, kwargs.get("operation"))
+        if child is not None:
+            return child
         action = next(self.actions)
         name, arguments = action if isinstance(action, tuple) else (action, {})
         return {"name": name, "arguments": arguments}
@@ -516,6 +520,10 @@ def test_search_refines_keywords_after_low_recall(monkeypatch):
             self.actions = iter(("search_and_rank", "report_blocked"))
 
         def complete_tool_call(self, messages, **kwargs):
+            from tests.agent_decision_fakes import delegated_response
+            child = delegated_response(messages, kwargs.get("operation"))
+            if child is not None:
+                return child
             action = next(self.actions)
             return {"name": action, "arguments": {"reason": "检索后证据仍不足"} if action == "report_blocked" else {}}
 
@@ -1376,6 +1384,10 @@ def test_agent_stops_when_all_search_sources_return_empty(monkeypatch):
             self.actions = iter(("search_and_rank", "report_blocked"))
 
         def complete_tool_call(self, messages, **kwargs):
+            from tests.agent_decision_fakes import delegated_response
+            child = delegated_response(messages, kwargs.get("operation"))
+            if child is not None:
+                return child
             action = next(self.actions)
             return {"name": action, "arguments": {"reason": "数据源未返回论文，无法形成综述"} if action == "report_blocked" else {}}
 

@@ -176,6 +176,10 @@ class Decisions:
         self.calls = 0
 
     def complete_tool_call(self, messages, **kwargs):
+        from tests.agent_decision_fakes import delegated_response
+        child = delegated_response(messages, kwargs.get("operation"))
+        if child is not None:
+            return child
         self.calls += 1
         context = json.loads(messages[-1]['content'])
         if self.calls == 1:

@@ -230,6 +230,12 @@ def _agent_state(state: dict[str, Any]) -> AgentStateContext:
         allowed_actions=list(dict.fromkeys(item for item in allowed if item))[:16],
         completed_actions=list(dict.fromkeys(item for item in completed if item))[-10:],
         recent_trajectory=recent,
+        agent_messages=[
+            {key: message[key] for key in ("sender", "recipient", "kind", "content", "suggested_actions")}
+            for session in (state.get("subagent_sessions") or {}).values()
+            for message in (session.get("messages") or [])[-2:]
+            if message.get("recipient") == "main"
+        ],
         context_budget={
             **dict(state.get("agent_context_usage") or {}),
             **{"last_" + key: int(value) for key, value in (state.get("agent_context_last_usage") or {}).items()},

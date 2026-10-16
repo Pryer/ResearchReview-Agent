@@ -134,6 +134,8 @@ class ResearchAgentState(TypedDict, total=False):
     context_snapshot_version: int
     agent_task_results: List[Dict[str, Any]]
     main_agent_trajectory: Dict[str, Any]
+    subagent_sessions: Dict[str, Any]
+    active_subagent: str
     agent_context_usage: Dict[str, Any]
     agent_context_last_usage: Dict[str, int]
     state_revision: int

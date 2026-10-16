@@ -13,6 +13,10 @@ class NativeDecisionLLM:
         self.context_messages = []
 
     def complete_tool_call(self, messages, *, tools, operation):
+        from tests.agent_decision_fakes import delegated_response
+        child = delegated_response(messages, operation)
+        if child is not None:
+            return child
         self.context_messages.append(messages)
         action = next(self.actions)
         return {"name": action, "arguments": {}, "tool_call_id": action}

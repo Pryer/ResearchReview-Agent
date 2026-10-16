@@ -12,6 +12,7 @@ ResearchReview-Agent interprets research constraints and topic ambiguity from na
 - **Multi-turn research sessions:** Persists clarifications, paper collections, generation versions, and revision history; papers can be excluded by stable ID, title, or natural-language instruction.
 - **Five-field main agent:** Each round selects one registered action from the goal, state, key evidence, decisions, and open questions.
 - **Controlled specialist tasks:** The controller projects action inputs and validates authorization, types, identities, versions, budgets, and evidence before committing results.
+- **Independent specialist loops:** Search, Analysis and Writing retain separate ReAct contexts across delegations, choose multiple authorized actions, and exchange structured task, progress, help and completion messages with the main Agent. Delegation is synchronous; global budgets and final quality gates remain authoritative.
 - **Background task control:** Long-running jobs expose progress and support cooperative cancellation at node boundaries.
 - **Durable recovery:** Session leases and database CAS protect commits; checkpoints preserve evidence, explicit constraints, and cumulative budgets.
 - **Caching and usage accounting:** Reuses eligible work while tracking cache hits, misses, retries, failover requests, and model usage.
@@ -199,6 +200,8 @@ Edit `.env` using `.env.example` as the template. Important settings include:
 | `LLM_REASONING_MODE` | `static` respects the global switch; `auto` selects per operation | `static` |
 | `LLM_NATIVE_TOOLS_ENABLED` | Use native tool calls for the main agent | `true` |
 | `AGENT_MAIN_MAX_ROUNDS` | Maximum main-agent decision rounds | `24` |
+| `AGENT_SUBAGENT_MAX_ROUNDS` | Maximum decision rounds per specialist delegation, retained across recovery | `12` |
+| `AGENT_SUBAGENT_NO_PROGRESS_LIMIT` | Consecutive specialist actions without research progress | `3` |
 | `AGENT_EXECUTION_ACTION_BUDGET` | Cumulative specialist-action reservation | `64` |
 | `AGENT_MAIN_TOKEN_BUDGET` | Shared cumulative token budget | `10000000` |
 | `AGENT_RETRIEVAL_BUDGET` | Maximum retrieval rounds | `64` |

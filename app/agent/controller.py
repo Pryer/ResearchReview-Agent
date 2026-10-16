@@ -75,6 +75,7 @@ class AgentController:
         budget: dict[str, int] | None = None,
         should_cancel: Callable[[], bool] | None = None,
         consume_mandatory_action: bool = False,
+        invalidate_evidence: bool = False,
     ) -> AgentTaskResult:
         if operation in {"rewrite_sections", "generate_deliverables"}:
             from app.agent.generation_recovery import rewrite_attempt_exhausted
@@ -181,6 +182,8 @@ class AgentController:
             idempotency_key=idempotency_key,
         )
         agent = _AGENTS[role]()
+        from app.agent.evidence_invalidation import evidence_snapshot, invalidate_changed_evidence
+        evidence_before = evidence_snapshot(state, operation) if invalidate_evidence else None
         from app.services.durable_execution_service import active_runtime, active_task_id, task_scope
         from app.database.runtime_repository import RuntimeConflict
         # WHY: 有界复合动作的内层 Controller 不另起数据库提交；由外层一次提交。
@@ -198,6 +201,7 @@ class AgentController:
                 raise AgentExecutionCancelled("agent task cancelled before commit")
             candidate = copy.deepcopy(state) if runtime else state
             merge_task_result(candidate, task, result)
+            invalidate_changed_evidence(candidate, operation, evidence_before)
             commit_action(candidate)
             if consume_mandatory_action and result.status.value == "completed":
                 # WHY: 已选动作与任务结果必须进入同一持久化快照；否则进程在

@@ -38,4 +38,5 @@ STATE_ARTIFACT_FIELDS = {
     "review": "draft", "agent_task_results": "task_result",
     "quarantined_generation_snapshot": "quarantined_generation",
     "main_agent_trajectory": "context_trajectory",
+    "subagent_sessions": "context_trajectory",
 }

@@ -44,7 +44,7 @@ ResearchReview-Agent/
 │   │   ├── execution_budget.py / orchestration.py # 共享预算与旧会话模式规范
 │   │   ├── context_builder.py # 由完整状态构建五字段主 Agent 上下文
 │   │   ├── context_compaction.py # 保留硬约束和阻塞问题的确定性压缩
-│   │   ├── subagents/         # Search / Analysis / Writing 专业 Agent 适配器
+│   │   ├── subagents/         # 独立 ReAct 循环、角色执行器与主从通信
 │   │   ├── execution.py       # 执行原语：AgentCancelledError、节点边界检查、LLM 工厂
 │   │   ├── retrieval_loop.py  # ReAct 检索精化循环（从 graph 下沉的策略层）
 │   │   ├── recovery_loop.py   # 路线证据恢复状态机（从 graph 下沉的策略层）
@@ -121,17 +121,22 @@ ResearchReview-Agent/
 权威状态与会话级 artifact 中。检索、分析和写作阶段通过带输入指纹的专业 Agent
 任务契约按动作白名单投影输入，再在隔离工作副本中执行；输出键、字段删除和类型
 双重校验，提交前再次检查身份、指纹和版本，旧任务不会合并到新证据状态。
+三类专业 Agent 各自维护持久化 ReAct 轨迹、状态栏、压缩 Epoch 和通信历史。
+主控委派任务后，子 Agent 可连续选择多个本角色动作，通过 `report_to_main`
+汇报完成、请求协助或报告阻断；主控可通过 `delegation_message` 回复并再次委派。
+独立循环同步执行，共享研究数据和总预算；具体状态、恢复和权限边界见
+[上下文架构](docs/agent-context-architecture.md#independent-specialist-react-loops)。
 
 ### 3.1 autonomous 控制循环
 
 ```text
-请求 → 需求解析 → 构建五字段 → 主 Agent 选择一个动作
+请求 → 需求解析 → 构建五字段 → 主 Agent 委派任务
                                   ↓
-                     Controller 授权与预算检查
+                     子 Agent 独立上下文与多轮决策
                                   ↓
-                     Search / Analysis / Writing
+                     Controller 授权 → 执行 → 观察
                                   ↓
-           结果校验 → 数据库 CAS 提交 → 重建五字段 → 下一轮
+           结果校验与 CAS 提交 → 子循环继续 / 向主控汇报
 
 申请交付 → 确定性质量门禁 → 完成 / 明确降级 / 拒绝交付
 ```

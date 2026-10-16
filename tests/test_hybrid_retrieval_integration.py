@@ -538,6 +538,10 @@ class _DecisionLLM:
         self.actions = iter(["search_and_rank", ("request_finish", {})])
 
     def complete_tool_call(self, messages, **kwargs):
+        from tests.agent_decision_fakes import delegated_response
+        child = delegated_response(messages, kwargs.get("operation"))
+        if child is not None:
+            return child
         action = next(self.actions)
         if isinstance(action, tuple):
             return {"name": action[0], "arguments": action[1]}

@@ -566,6 +566,10 @@ class _SequencedDecisionLLM:
         self._actions = list(actions)
 
     def complete_tool_call(self, messages, **kwargs):
+        from tests.agent_decision_fakes import delegated_response
+        child = delegated_response(messages, kwargs.get("operation"))
+        if child is not None:
+            return child
         name = self._actions.pop(0) if self._actions else "request_finish"
         return {"name": name, "arguments": {}}
 

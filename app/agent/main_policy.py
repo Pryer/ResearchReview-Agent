@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 from pydantic import ValidationError
 
 from app.agent.action_registry import ACTION_REGISTRY, tool_schemas, validate_arguments
@@ -17,14 +19,28 @@ class AgentDecisionError(ValueError):
 
 
 class MainAgentPolicy:
-    def __init__(self, llm, *, correction_attempts: int = 1) -> None:
+    def __init__(self, llm, *, correction_attempts: int = 1,
+                 system_prompt: str = MAIN_AGENT_SYSTEM_PROMPT,
+                 tools: list[dict] | None = None, argument_validator=validate_arguments,
+                 operation: str = "main_agent_decision", delegation_messages: bool = True) -> None:
         self.llm = llm
         self.correction_attempts = max(0, int(correction_attempts))
         # WHY: 工具目录仅暴露协议，不授予执行权；合法动作始终由本轮状态与 Controller 检查。
-        self.tools = tool_schemas(sorted(ACTION_REGISTRY))
-        self.native_system = MAIN_AGENT_SYSTEM_PROMPT.strip()
+        self.tools = copy.deepcopy(tools if tools is not None else tool_schemas(sorted(ACTION_REGISTRY)))
+        self.delegation_messages = delegation_messages
+        if delegation_messages:
+            for tool in self.tools:
+                spec = ACTION_REGISTRY.get(tool["function"]["name"])
+                if spec and spec.role:
+                    tool["function"]["parameters"]["properties"]["delegation_message"] = {
+                        "type": "string", "minLength": 1, "maxLength": 600,
+                        "description": "给专业 Agent 的任务目标或协助请求回复；不能覆盖用户约束和权限",
+                    }
+        self.argument_validator = argument_validator
+        self.operation = operation
+        self.native_system = system_prompt.strip()
         self.system = (
-            MAIN_AGENT_SYSTEM_PROMPT.strip()
+            system_prompt.strip()
             + "\n核心工具目录（JSON 动作契约）："
             + encode(self.tools)
         )
@@ -51,8 +67,8 @@ class MainAgentPolicy:
             )
             try:
                 if callable(native) and native_enabled:
-                    raw = native(messages, tools=self.tools, operation="main_agent_decision")
-                    trajectory.state["agent_context_last_usage"] = dict(raw.get("usage") or {})
+                    raw = native(messages, tools=self.tools, operation=self.operation)
+                    trajectory.container["agent_context_last_usage"] = dict(raw.get("usage") or {})
                     decision = AgentDecision(
                         action=str(raw.get("name") or ""),
                         arguments=dict(raw.get("arguments") or {}),
@@ -62,24 +78,32 @@ class MainAgentPolicy:
                         tool_call_id=raw.get("tool_call_id"),
                         usage=dict(raw.get("usage") or {}),
                     )
-                    trajectory.proposed(decision, assistant_message=raw.get("assistant_message"))
                 else:
                     content = self.llm.complete_messages(
                         messages,
                         response_format="json",
                         retry_empty=False,
-                        operation="main_agent_decision",
+                        operation=self.operation,
                     )
-                    trajectory.state["agent_context_last_usage"] = dict(
+                    trajectory.container["agent_context_last_usage"] = dict(
                         getattr(self.llm, "last_usage", {}) or {}
                     )
                     decision = AgentDecision.model_validate_json(content)
-                    trajectory.proposed(decision)
+                if self.delegation_messages and decision.action in ACTION_REGISTRY and ACTION_REGISTRY[decision.action].role:
+                    arguments = dict(decision.arguments)
+                    message = arguments.pop("delegation_message", None)
+                    if message is not None:
+                        if not isinstance(message, str) or not message.strip() or len(message) > 600:
+                            raise ValueError("delegation_message must contain 1 to 600 characters")
+                        # WHY: 通信元数据不进入执行参数，避免扩大专业动作的输入输出契约。
+                        decision = decision.model_copy(update={"arguments": arguments, "reason": message})
+                trajectory.proposed(decision, assistant_message=(raw.get("assistant_message")
+                    if callable(native) and native_enabled else None))
                 if decision.action not in allowed_actions:
                     raise AgentDecisionError(
                         f"action {decision.action!r} is not allowed in current state"
                     )
-                validate_arguments(decision.action, decision.arguments)
+                self.argument_validator(decision.action, decision.arguments)
                 known_refs = {ref for item in context.key_evidence for ref in item.source_refs}
                 if not set(decision.evidence_refs).issubset(known_refs):
                     raise AgentDecisionError(

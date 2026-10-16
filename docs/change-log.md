@@ -2212,3 +2212,13 @@ what changed and how it was validated; it is not a replacement for Git history.
 - 验证：原 PR #2 定向 98 passed；新增 8 项 arXiv 回归（首批 6 项在修复前 4 failed、2 passed）；检索修复定向 104 passed，随后新增超时/连接失败上限回归并集成 PR #1。组合定向 184 passed（20.59s），组合全量 1568 passed（49.37s），均有 11 项第三方弃用警告，JUnit failures=0/errors=0/skipped=0。受检改动模块 Ruff F、git diff --check 通过。
 - 收敛复核：停止语义沿用既有执行控制和客户端错误分类，不添加新调度器或重复重试路径；成功空检索继续允许查询回退，既有 RequestException 捕获保持有效。失败/空结果区别和异常兼容约束附中文 WHY。用例验证从真实搜索入口得到的诊断、请求次数与零令牌时不发送请求，未修改引用、证据、质量门禁。
 - 边界：干净独立工作区、无真实凭据，HTTP/LLM/浏览器调用由测试模拟；未运行真实学术 API/CNKI/LLM E2E、缓存成本或延迟评测。原主工作区暂存内容未进入 PR 提交。
+
+## 2026-10-16 21:05:07 +08:00 — 独立专业 ReAct 循环、持久化上下文与主从通信
+
+- 修改文件：`.env.example`、`ARCHITECTURE.md`、`README.en.md`、`README.md`、`app/agent/context_builder.py`、`app/agent/controller.py`、`app/agent/evidence_invalidation.py`、`app/agent/graph.py`、`app/agent/main_loop.py`、`app/agent/main_policy.py`、`app/agent/react_context.py`、`app/agent/state.py`、`app/agent/subagents/loop.py`、`app/core/config.py`、`app/prompt/agent_system.py`、`app/schemas/agent_message_schema.py`、`app/schemas/artifact_schema.py`、`app/schemas/context_schema.py`、`app/services/research_artifact_service.py`、`docs/agent-context-architecture.md`、`docs/change-log.md`、`tests/agent_decision_fakes.py`、`tests/test_agent_completion_regressions.py`、`tests/test_agent_graph.py`、`tests/test_autonomous_recovery_handoff.py`、`tests/test_global_evidence_gate.py`、`tests/test_hybrid_retrieval_integration.py`、`tests/test_main_agent_loop.py`、`tests/test_subagent_react.py`。
+- 原因：原 Search / Analysis / Writing 是受控单动作执行器；用户要求它们拥有独立、连续决策的 ReAct 循环、独立上下文与 Main Agent 通信。
+- 行为：主控委派后，专业循环可连续选择本角色合法动作，分别保留轨迹、状态栏、预算用量、压缩 Epoch 和通信历史。支持任务/进展/完成/协助请求/阻断消息；原生工具的 delegation_message 经校验后转为任务目标，不进入研究工具执行参数。默认每次委派最多 12 轮、连续 3 次无进展停止，仍共享总 Token/动作/检索/时限预算和取消边界。局部改写不得越过主控指定章节；必做恢复与证据交接顺序继续由代码裁决。
+- 持久化与正确性：子任务结果、观察、局部进展和旧证据授权失效在 Controller 同一次 CAS 快照提交；最终汇报与主控观察配对及委派结束原子保存。恢复先续接活跃子循环，已提交动作不重放。子上下文以 service-only Artifact 分片保存，不暴露其他角色私有轨迹。子任务完成不替代最终引用/证据/输出质量门禁。
+- 测试与验证：新增 23 项行为回归；定向 100 passed；全量 1591 passed、0 failed、0 skipped（44.72 秒，11 条第三方弃用警告）。覆盖三角色多轮决策、原生/JSON 协议、真实任务回复、跨委派上下文、角色越权、必做动作出队、改写约束、证据授权失效、共享预算、取消/错误透传、子级 Sidecar、SQLite 检查点续跑、隔离归档与独立压缩。修改模块 Ruff F 检查及 git diff --check 通过。
+- 收敛审查：复用既有 ReAct 上下文与决策校验，删除主循环中延迟失效旧授权的逻辑并移入原子提交边界；没有加入关闭子循环的生产回退。原生协议通信缺口已通过显式元数据修复并回归；权限、证据交接、恢复轮数与取消约束有中文 WHY。现有工作流测试只扩展模型桩，实际子循环和 Controller 保持执行；保留用户原有已暂存变更。
+- 限制与未验证：当前为同步委派，不启动后台常驻/并行子工作线程；未提交或推送。未运行真实 CNKI/学术 API/LLM E2E，未测量新增模型调用的成本、延迟或质量收益；尚未提交的外部请求仍遵守现有不确定任务边界，不承诺远程请求 exactly-once。

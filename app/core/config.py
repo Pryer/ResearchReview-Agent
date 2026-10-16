@@ -151,6 +151,8 @@ class Settings(BaseSettings):
     agent_sidecar_enabled: bool = False
     agent_sidecar_review_actions: str = "generate_deliverables,rewrite_sections"
     agent_main_max_rounds: int = 24
+    agent_subagent_max_rounds: int = Field(default=12, ge=1, le=64)
+    agent_subagent_no_progress_limit: int = Field(default=3, ge=1)
     agent_main_no_progress_limit: int = 3
     agent_main_token_budget: int = 10000000
     agent_retrieval_budget: int = 64

@@ -30,6 +30,10 @@ class Decisions:
         self.contexts = []
 
     def complete_tool_call(self, messages, **kwargs):
+        from tests.agent_decision_fakes import delegated_response
+        child = delegated_response(messages, kwargs.get("operation"))
+        if child is not None:
+            return child
         context = json.loads(messages[-1]["content"])
         assert set(context) == {"goal", "state", "key_evidence", "decisions", "open_questions"}
         self.contexts.append(context)

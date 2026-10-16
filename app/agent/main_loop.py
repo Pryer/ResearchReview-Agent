@@ -70,6 +70,8 @@ class MainAgentLoop:
         self.policy = MainAgentPolicy(llm)
         self.controller = controller or AgentController()
         self.sidecar = ActionSidecar(llm)
+        from app.agent.subagents.loop import SubagentLoop
+        self.specialists = SubagentLoop(llm, self.controller)
 
     def run(
         self, state, *, handlers, finish_validator, should_cancel=None,
@@ -110,6 +112,9 @@ class MainAgentLoop:
     ) -> str:
         settings = get_settings()
         trajectory = ReActContext(state)
+        if state.get("active_subagent"):
+            # WHY: 检查点可能停在子循环内；先续接其观察与汇报，再允许主控生成新决策。
+            self.specialists.run(state, handlers=handlers, should_cancel=should_cancel)
         no_progress = 0
         previous_progress = _progress_fingerprint(state)
         progress_limit = max(1, int(settings.agent_main_no_progress_limit))
@@ -258,28 +263,11 @@ class MainAgentLoop:
                     })
                     return "failed"
                 try:
-                    from app.agent.nodes.base import _paper_identity_key
-                    detail_before = {
-                        _paper_identity_key(paper): json.dumps(paper, ensure_ascii=False,
-                                                               sort_keys=True, default=str)
-                        for paper in state.get("paper_details") or []
-                    } if action == "fetch_metadata" else {}
-                    evidence_before = {
-                        key: json.dumps(state.get(key) or [], ensure_ascii=False,
-                                        sort_keys=True, default=str)
-                        for key in ("paper_details", "paper_cards")
-                    } if action in {"fetch_metadata", "extract_paper_cards"} else {}
-                    result = self.controller.execute(
-                        role=spec.role,
-                        operation=action,
-                        objective=decision.reason or spec.description,
-                        state=state,
-                        handler=lambda working, fn=handler, args=decision.arguments: fn(working, args),
-                        constraints=decision.arguments,
-                        expected_output=list(spec.output_fields),
-                        input_artifact_refs=decision.evidence_refs,
+                    result = self.specialists.run(
+                        state, decision=decision, handlers=handlers,
                         should_cancel=should_cancel,
                         consume_mandatory_action=bool(mandatory),
+                        required_first=bool(handoff),
                     )
                     trajectory.observe(result.model_dump(mode="json"))
                 except AgentBudgetExceeded as exc:
@@ -293,26 +281,6 @@ class MainAgentLoop:
                 if result.status.value in {"failed", "cancelled"}:
                     state["result_status"] = result.status.value
                     return result.status.value
-                if evidence_before and any(
-                    evidence_before[key] != json.dumps(state.get(key) or [], ensure_ascii=False,
-                                                        sort_keys=True, default=str)
-                    for key in evidence_before
-                ):
-                    # WHY: 子任务只提交自身契约字段；主控在证据提交后失效旧路线、
-                    # 主张与门禁，避免恢复时跨证据版本继续使用旧授权。
-                    from app.agent.graph import _GENERATION_PRODUCT_KEYS
-                    if action == "fetch_metadata":
-                        current_details = {
-                            _paper_identity_key(paper): json.dumps(paper, ensure_ascii=False,
-                                                                   sort_keys=True, default=str)
-                            for paper in state.get("paper_details") or []
-                        }
-                        state["paper_cards"] = [card for card in state.get("paper_cards") or []
-                                                if (key := _paper_identity_key(card)) in current_details
-                                                and detail_before.get(key) == current_details[key]]
-                    for key in (*_GENERATION_PRODUCT_KEYS, "validated_routes", "route_decisions",
-                                "autonomous_verified_fingerprint"):
-                        state.pop(key, None)
 
             current_progress = _progress_fingerprint(state)
             no_progress = no_progress + 1 if current_progress == previous_progress else 0
