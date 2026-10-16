@@ -355,6 +355,7 @@ ResearchReview-Agent/
 - [docs/architecture.md](docs/architecture.md)：系统分层、模块边界和运行组件。
 - [docs/agent-context-architecture.md](docs/agent-context-architecture.md)：五字段、专业 Agent 与上下文边界。
 - [docs/agent-runtime-and-cache.md](docs/agent-runtime-and-cache.md)：动作契约、数据库提交、预算、恢复和缓存机制。
+- [docs/retrieval-failure-policy.md](docs/retrieval-failure-policy.md)：限流、重试、部分成功与检索取消边界。
 - [docs/research-workflow.md](docs/research-workflow.md)：Agent 工作流、阶段契约和分支保证。
 - [docs/evidence-model.md](docs/evidence-model.md)：PaperMetadata、Evidence、Claim、Citation 的关系。
 - [docs/quality-gates.md](docs/quality-gates.md)：能力、路线、主张、交付物和生成质量门禁。

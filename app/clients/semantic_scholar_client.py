@@ -14,6 +14,7 @@ import requests
 
 from app.core.config import get_settings
 from app.core.logger import get_logger
+from app.core.retry_policy import bounded_request_timeout, interruptible_sleep, retry_after_seconds, check_retrieval_execution
 from app.schemas.paper_schema import PaperMetadata
 
 logger = get_logger(__name__)
@@ -47,13 +48,7 @@ def _headers() -> dict[str, str]:
 
 
 def _retry_after_seconds(resp: requests.Response) -> float:
-    value = resp.headers.get("Retry-After")
-    if not value:
-        return 0.0
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        return 0.0
+    return retry_after_seconds(resp.headers)
 
 
 def _respect_rate_limit() -> None:
@@ -67,53 +62,68 @@ def _respect_rate_limit() -> None:
     if interval <= 0:
         return
 
+    # WHY: 仅持锁预留时刻，等待时释放；其他线程可写入冷却并检查取消。
     with _S2_RATE_LOCK:
         now = time.monotonic()
-        wait_seconds = _S2_NEXT_ALLOWED_AT - now
-        if wait_seconds > 0:
-            time.sleep(wait_seconds)
-            now = time.monotonic()
-        _S2_NEXT_ALLOWED_AT = now + interval
+        scheduled = max(now, _S2_NEXT_ALLOWED_AT)
+        _S2_NEXT_ALLOWED_AT = scheduled + interval
+    interruptible_sleep(scheduled - now)
+
+
+def _enter_cooldown(seconds: float, *, retry_after: float = 0.0) -> None:
+    global _S2_COOLDOWN_UNTIL
+    # WHY: 只钳制本地兜底冷却；服务端 Retry-After 是最早重试时刻，不能提前。
+    ceiling = max(1.0, float(settings.semantic_scholar_max_cooldown_seconds))
+    with _S2_RATE_LOCK:
+        _S2_COOLDOWN_UNTIL = max(_S2_COOLDOWN_UNTIL,
+                               time.monotonic() + max(retry_after, min(max(0.0, seconds), ceiling)))
+
+
+def _request_ready(cb) -> bool:
+    check_retrieval_execution()
+    if not cb.allow_request():
+        _record_search_diagnostic("api_failed", error_code="CIRCUIT_OPEN",
+                                  message="Semantic Scholar circuit breaker is open")
+        return False
+    with _S2_RATE_LOCK:
+        remaining = _S2_COOLDOWN_UNTIL - time.monotonic()
+    if remaining > 0:
+        _record_search_diagnostic("rate_limited", error_code="RATE_LIMITED",
+                                  message=f"Semantic Scholar cooldown: {remaining:.1f}s remaining")
+        raise SemanticScholarRateLimitError("Semantic Scholar 正在限流冷却")
+    return True
 
 
 def _request_json(url: str, params: dict) -> Optional[dict]:
     """请求 Semantic Scholar，显式处理 429，避免同一轮任务持续撞限流。"""
-    global _S2_COOLDOWN_UNTIL
     from app.core.circuit_breaker import get_circuit_breaker
 
     cb = get_circuit_breaker("semantic_scholar")
-    if not cb.allow_request():
-        logger.warning("Semantic Scholar request skipped due to active circuit breaker")
-        return None
-
     from app.core.rate_limiter import get_rate_limiter
 
     limiter = get_rate_limiter("semanticscholar")
-
-    with _S2_RATE_LOCK:
-        now = time.monotonic()
-        cooldown_remaining = _S2_COOLDOWN_UNTIL - now
-    if cooldown_remaining > 0:
-        _record_search_diagnostic("rate_limited", error_code="RATE_LIMITED", message=f"Semantic Scholar 正在限流冷却，剩余 {cooldown_remaining:.1f} 秒")
-        raise SemanticScholarRateLimitError(
-            f"Semantic Scholar 正在限流冷却，剩余 {cooldown_remaining:.1f} 秒"
-        )
-
     max_retries = max(0, int(settings.semantic_scholar_max_retries or 0))
     max_wait = max(0.0, float(settings.semantic_scholar_max_retry_wait_seconds or 0))
     for attempt in range(max_retries + 1):
+        if not _request_ready(cb):
+            return None
         try:
             if not limiter.acquire(1.0, timeout=10.0):
                 # 令牌等待超时说明本域已严重超速：跳过本次请求而不是照发
                 # 不误，否则限流器形同虚设，只会换来 429 封禁。
-                logger.warning("Semantic Scholar request skipped: rate limit token wait timed out")
+                _record_search_diagnostic("rate_limited", error_code="RATE_LIMIT_WAIT_TIMEOUT",
+                                          message="Semantic Scholar token acquisition timed out")
+                return None
+            if not _request_ready(cb):
                 return None
             _respect_rate_limit()
+            if not _request_ready(cb):
+                return None
             resp = requests.get(
                 url,
                 params=params,
                 headers=_headers(),
-                timeout=settings.agent_request_timeout,
+                timeout=bounded_request_timeout(settings.agent_request_timeout),
             )
             if resp.status_code == 429:
                 retry_after = _retry_after_seconds(resp)
@@ -129,18 +139,21 @@ def _request_json(url: str, params: dict) -> Optional[dict]:
                     resp.url,
                 )
                 if attempt < max_retries and sleep_seconds <= max_wait:
-                    time.sleep(sleep_seconds)
+                    _enter_cooldown(sleep_seconds)
+                    interruptible_sleep(sleep_seconds)
                     continue
                 cooldown_dur = float(settings.semantic_scholar_cooldown_seconds or 0)
                 if settings.semantic_scholar_api_key:
                     cooldown_dur = min(cooldown_dur, 15.0)
-                with _S2_RATE_LOCK:
-                    _S2_COOLDOWN_UNTIL = time.monotonic() + max(retry_after, cooldown_dur)
-                cb.record_failure()
+                _enter_cooldown(max(retry_after, cooldown_dur), retry_after=retry_after)
+                # 429 means quota pressure; the cooldown gate, not the outage
+                # breaker, prevents additional attempts.
                 _record_search_diagnostic("rate_limited", error_code="HTTP_429", message="Semantic Scholar 连续返回 HTTP 429；已停止本轮后续请求")
                 raise SemanticScholarRateLimitError(
                     "Semantic Scholar 连续返回 HTTP 429；已停止本轮后续请求"
                 )
+            if resp.status_code == 404:
+                return None
             if resp.status_code >= 400:
                 logger.warning(
                     "Semantic Scholar request failed: status=%s body=%s url=%s",
@@ -148,7 +161,8 @@ def _request_json(url: str, params: dict) -> Optional[dict]:
                     resp.text[:300],
                     resp.url,
                 )
-                cb.record_failure()
+                if resp.status_code >= 500:
+                    cb.record_failure()
                 outcome = "authentication_failed" if resp.status_code in {401, 403} else "api_failed"
                 _record_search_diagnostic(outcome, error_code=f"HTTP_{resp.status_code}", message=f"Semantic Scholar HTTP {resp.status_code}")
                 return None
@@ -156,6 +170,9 @@ def _request_json(url: str, params: dict) -> Optional[dict]:
             return resp.json()
         except requests.RequestException as e:
             cb.record_failure(e)
+            if isinstance(e, (requests.Timeout, requests.ConnectionError)) and attempt < max_retries:
+                interruptible_sleep(min(max_wait, 2 ** attempt))
+                continue
             logger.warning("Semantic Scholar request failed: %s", e)
             outcome = "timeout" if isinstance(e, requests.Timeout) else "api_failed"
             _record_search_diagnostic(outcome, error_code="TIMEOUT" if outcome == "timeout" else "API_ERROR", message=str(e))

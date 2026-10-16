@@ -1,6 +1,6 @@
 # ResearchReview-Agent：按《深入理解 AI Agent》设计的 Agent Harness
 
-> 设计基线（非全部已完成的功能）。参考 [《深入理解 AI Agent》](https://github.com/bojieli/ai-agent-book) 第 1–10 章，重点以第 1、2、3、4、5、7、10 章为依据。  
+> 设计基线（非全部已完成的功能）。参考 [《深入理解 AI Agent》](https://github.com/bojieli/ai-agent-book) 第 1–10 章，重点以第 1、2、3、4、5、7、10 章为依据。\
 > 代码实施进度：已接入稳定前缀、追加式多轮轨迹、末尾状态栏、输入预算预检、L1/L2/L3 分层控制及轨迹检查点恢复；可选 Sidecar 保持默认关闭。离线回归已执行，真实提供商缓存与科研端到端效果仍待测量。
 
 ## 1. 目标与边界

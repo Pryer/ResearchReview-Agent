@@ -40,7 +40,7 @@ def _clean_state():
     openalex_client._reset_cooldown()
 
 
-def test_429_retries_then_enters_cooldown_without_tripping_breaker(monkeypatch):
+def test_429_retries_then_enters_cooldown_without_tripping_breaker(monkeypatch, retry_clock):
     """429 重试用尽后进入冷却门，且不把限流计入熔断失败。"""
     monkeypatch.setattr(openalex_client.settings, "openalex_max_retries", 2)
     monkeypatch.setattr(openalex_client.settings, "openalex_max_retry_wait_seconds", 5.0)
@@ -53,7 +53,6 @@ def test_429_retries_then_enters_cooldown_without_tripping_breaker(monkeypatch):
         return _FakeResponse(429, headers={"Retry-After": "0"})
 
     monkeypatch.setattr(openalex_client.requests, "get", fake_get)
-    monkeypatch.setattr(openalex_client.time, "sleep", lambda _s: None)
 
     result = openalex_client.search_openalex("classroom behavior", 2024, 2026, max_results=10)
 
@@ -79,7 +78,7 @@ def test_cooldown_short_circuits_subsequent_calls(monkeypatch):
     assert openalex_client.get_openalex_detail("W123") is None
 
 
-def test_429_recovers_within_retry_budget(monkeypatch):
+def test_429_recovers_within_retry_budget(monkeypatch, retry_clock):
     """首次 429、重试成功时应返回结果且不留冷却。"""
     monkeypatch.setattr(openalex_client.settings, "openalex_max_retries", 3)
     monkeypatch.setattr(openalex_client.settings, "openalex_max_retry_wait_seconds", 5.0)
@@ -93,7 +92,6 @@ def test_429_recovers_within_retry_budget(monkeypatch):
         return responses.pop(0)
 
     monkeypatch.setattr(openalex_client.requests, "get", fake_get)
-    monkeypatch.setattr(openalex_client.time, "sleep", lambda _s: None)
 
     result = openalex_client.search_openalex("q", 2024, 2026)
 
@@ -131,8 +129,8 @@ def test_configured_mailto_keeps_polite_pool_rate(monkeypatch):
     assert openalex_client._effective_mailto() == "someone@lab.edu"
 
 
-def test_huge_retry_after_is_capped(monkeypatch, caplog):
-    """日配额耗尽式的巨大 Retry-After 必须被钳制，不能锁死整天。"""
+def test_huge_retry_after_is_honored_without_blocking(monkeypatch, caplog):
+    """长服务端冷却不截短；调用立即返回，不占用等待线程。"""
     monkeypatch.setattr(openalex_client.settings, "openalex_max_retries", 0)
     monkeypatch.setattr(openalex_client.settings, "openalex_cooldown_seconds", 90.0)
     monkeypatch.setattr(openalex_client.settings, "openalex_max_cooldown_seconds", 900.0)
@@ -148,7 +146,7 @@ def test_huge_retry_after_is_capped(monkeypatch, caplog):
         assert openalex_client.search_openalex("q", 2024, 2026) == []
 
     remaining = openalex_client._cooldown_remaining()
-    assert 0 < remaining <= 900.0
+    assert 41550.0 < remaining <= 41559.0
     assert any("exceeds cooldown ceiling" in r.message for r in caplog.records)
 
 
@@ -170,8 +168,8 @@ def test_normal_retry_after_is_not_capped(monkeypatch):
     assert 110.0 < remaining <= 120.0
 
 
-def test_detail_huge_retry_after_is_capped(monkeypatch):
-    """detail 接口同样受冷却上限约束。"""
+def test_detail_huge_retry_after_is_honored(monkeypatch):
+    """详情与搜索同样遵守服务端最早重试时刻。"""
     monkeypatch.setattr(openalex_client.settings, "openalex_max_cooldown_seconds", 600.0)
     monkeypatch.setattr(
         openalex_client.requests,
@@ -180,7 +178,7 @@ def test_detail_huge_retry_after_is_capped(monkeypatch):
     )
 
     assert openalex_client.get_openalex_detail("W123") is None
-    assert 0 < openalex_client._cooldown_remaining() <= 600.0
+    assert 41550.0 < openalex_client._cooldown_remaining() <= 41559.0
 
 
 def test_cooldown_expires_and_allows_retry(monkeypatch):
@@ -189,9 +187,9 @@ def test_cooldown_expires_and_allows_retry(monkeypatch):
     openalex_client._enter_cooldown(41559.0, retry_after=41559.0)
     assert openalex_client._cooldown_remaining() > 0
 
-    # 把时钟推过钳制后的冷却窗口。
+    # 把时钟推过服务端要求的冷却窗口。
     base = time.monotonic()
-    monkeypatch.setattr(openalex_client.time, "monotonic", lambda: base + 901.0)
+    monkeypatch.setattr(openalex_client.time, "monotonic", lambda: base + 41560.0)
     assert openalex_client._cooldown_remaining() <= 0
 
     monkeypatch.setattr(
