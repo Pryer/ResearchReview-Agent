@@ -18,7 +18,7 @@
 | 专业任务边界 | Controller 按动作投影输入，校验输出白名单、类型、身份与版本后提交 |
 | 后台任务控制 | 长任务异步执行，可查询步骤与进度，并在节点边界协作式取消 |
 | 持久化恢复 | 会话租约与数据库 CAS 保护提交；检查点恢复保留证据、显式约束及累计预算 |
-| 缓存与用量 | 固定提示规则前置，按实际输入复用章节；统计缓存 hit/miss、重试及备用请求用量 |
+| 缓存与用量 | 稳定前缀与追加式 ReAct 轨迹，Token 预算触发分层压缩和检查点恢复；统计真实缓存用量 |
 | 增量重生成 | 编辑论文集合后只重做聚类、写作和引用验证，不重复检索与详情补全 |
 | 多源检索 | arXiv + Semantic Scholar + OpenAlex + Crossref + CNKI（Selenium） |
 | 失败诊断 | 区分"真空结果"与"检索失败"，避免误判关键词不合适 |
@@ -63,6 +63,11 @@ arXiv ID 追踪证据，最终论文正文统一渲染为顺序编码或作者�
 随后覆盖研究状态。直接调用 graph 的脚本仍是内存执行模式。缓存优化保留完整
 证据核验，不代表已经测得固定节费比例。模块说明见 [ARCHITECTURE.md](ARCHITECTURE.md)，
 事务与恢复边界见 [执行、恢复与缓存说明](docs/agent-runtime-and-cache.md)。
+主控消息在同一 Context Epoch 内追加用户要求、动作、执行观察和末尾状态栏；
+窗口预算接近阈值时归档历史，保留约束、证据引用及最近完整调用后开始新 Epoch。
+`AGENT_CONTEXT_WINDOW_TOKENS` 应设为主备模型可用窗口的较小值，默认 65536；
+输入采用保守估算，实际用量来自服务商 usage。轨迹压缩需要会话 Artifact Store，
+详细配置及边界见 [上下文架构](docs/agent-context-architecture.md#react-epochs-and-context-capacity)。
 
 ---
 

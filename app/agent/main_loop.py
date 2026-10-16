@@ -14,6 +14,7 @@ from app.agent.action_registry import (
 )
 from app.agent.context_builder import refresh_main_agent_context
 from app.agent.controller import AgentController
+from app.agent.sidecar import ActionSidecar
 from app.agent.execution_budget import (
     AgentBudgetExceeded,
     AgentExecutionStale,
@@ -23,6 +24,7 @@ from app.agent.execution_budget import (
 from app.agent.execution import AgentCancelledError
 from app.core.exceptions import LLMInvocationError
 from app.agent.main_policy import AgentDecisionError, MainAgentPolicy
+from app.agent.react_context import ContextBudgetExceeded, ReActContext
 from app.schemas.agent_decision_schema import AgentDecision
 from app.core.config import get_settings
 from app.database.runtime_repository import RuntimeConflict
@@ -67,22 +69,26 @@ class MainAgentLoop:
     def __init__(self, llm, *, controller: AgentController | None = None) -> None:
         self.policy = MainAgentPolicy(llm)
         self.controller = controller or AgentController()
+        self.sidecar = ActionSidecar(llm)
 
     def run(
         self, state, *, handlers, finish_validator, should_cancel=None,
     ) -> str:
         try:
             with budget_scope(state, should_cancel):
-                return self._run(state, handlers=handlers, finish_validator=finish_validator,
-                                 should_cancel=should_cancel)
-        except (AgentBudgetExceeded, AgentExecutionStale, AgentCancelledError, AgentDecisionError, LLMInvocationError, RuntimeConflict) as exc:
+                status = self._run(state, handlers=handlers, finish_validator=finish_validator,
+                                   should_cancel=should_cancel)
+                if (state.get("main_agent_trajectory") or {}).get("pending"):
+                    ReActContext(state).observe({"status": status, "error": str((state.get("errors") or [{}])[-1].get("code") or "")})
+                return status
+        except (AgentBudgetExceeded, ContextBudgetExceeded, AgentExecutionStale, AgentCancelledError, AgentDecisionError, LLMInvocationError, RuntimeConflict) as exc:
             # WHY: AgentExecutionStale 继承 AgentCancelledError 以复用取消
             # 透传，但租约失效不是用户取消，结果状态必须是 failed。
             if isinstance(exc, AgentExecutionStale):
                 status = "failed"
             elif isinstance(exc, AgentCancelledError):
                 status = "cancelled"
-            elif isinstance(exc, AgentBudgetExceeded):
+            elif isinstance(exc, (AgentBudgetExceeded, ContextBudgetExceeded)):
                 status = "blocked"
             else:
                 status = "failed"
@@ -90,6 +96,8 @@ class MainAgentLoop:
             if status == "blocked":
                 state["generation_blocked"] = True
             state.setdefault("errors", []).append({"code": type(exc).__name__, "message": str(exc)})
+            if (state.get("main_agent_trajectory") or {}).get("pending"):
+                ReActContext(state).observe({"status": status, "error": type(exc).__name__})
             return status
 
     def _run(
@@ -101,6 +109,7 @@ class MainAgentLoop:
         should_cancel: Callable[[], bool] | None = None,
     ) -> str:
         settings = get_settings()
+        trajectory = ReActContext(state)
         no_progress = 0
         previous_progress = _progress_fingerprint(state)
         progress_limit = max(1, int(settings.agent_main_no_progress_limit))
@@ -141,8 +150,11 @@ class MainAgentLoop:
                 state["errors"] = list(state.get("errors") or []) + [
                     {"code": "main_context_invalid", "message": ",".join(snapshot.validation_errors)}
                 ]
-                state["result_status"] = "failed"
-                return "failed"
+                status = "blocked" if set(snapshot.validation_errors) == {"context_budget_exceeded"} else "failed"
+                state["result_status"] = status
+                if status == "blocked":
+                    state["generation_blocked"] = True
+                return status
             try:
                 if mandatory:
                     arguments = dict(required.get("arguments") or {})
@@ -158,7 +170,9 @@ class MainAgentLoop:
                         reason="推进已确认论文到当前证据与主张授权",
                     )
                 else:
-                    decision = self.policy.decide(snapshot.context, allowed_actions=names)
+                    decision = self.policy.decide(snapshot.context, allowed_actions=names, trajectory=trajectory)
+            except ContextBudgetExceeded:
+                raise
             except (AgentDecisionError, ValueError) as exc:
                 state["errors"] = list(state.get("errors") or []) + [
                     {"code": "invalid_agent_decision", "message": str(exc)}
@@ -168,6 +182,8 @@ class MainAgentLoop:
             state.setdefault("main_agent_decisions", []).append(
                 decision.model_dump(mode="json")
             )
+            if mandatory or (handoff and handoff in names):
+                trajectory.proposed(decision)
             ledger = state.setdefault("agent_execution_budget", {})
             ledger["decision_rounds"] = int(ledger.get("decision_rounds") or 0) + 1
             if int(ledger.get("llm_tokens") or 0) > int(ledger["token_limit"]):
@@ -179,7 +195,33 @@ class MainAgentLoop:
                 })
                 return "blocked"
             action = decision.action
+            # Review only explicitly configured actions, before Controller effects.
+            # The reviewer cannot override deterministic Controller authorization.
+            if (settings.agent_sidecar_enabled
+                    and action in {item.strip() for item in settings.agent_sidecar_review_actions.split(",") if item.strip()}
+                    and action not in {"request_finish", "report_blocked", "request_clarification"}):
+                review = self.sidecar.review(operation=action, arguments=decision.arguments)
+                state.setdefault("agent_sidecar_reviews", []).append({
+                    "action": action, "verdict": review.verdict, "reason": review.reason,
+                })
+                if review.verdict != "allow":
+                    trajectory.observe({"status": review.verdict, "error": review.reason})
+                    state.setdefault("main_agent_rejections", []).append({
+                        "action": action,
+                        "reason": "sidecar_" + review.verdict + ":" + review.reason,
+                        "round": round_index,
+                    })
+                    if review.verdict == "escalate":
+                        state["clarification"] = {
+                            "needed": True, "kind": "sidecar_review",
+                            "question": "此项研究操作需要人工确认：" + review.reason,
+                        }
+                        state["result_status"] = "waiting_user"
+                        return "waiting_user"
+                    # Denial becomes a new observation; no automatic re-execution.
+                    continue
             if action == "request_clarification":
+                trajectory.observe({"status": "waiting_user", "findings": [decision.arguments["question"]]})
                 state["clarification"] = {
                     "needed": True,
                     "question": decision.arguments["question"],
@@ -188,6 +230,7 @@ class MainAgentLoop:
                 state["result_status"] = "waiting_user"
                 return "waiting_user"
             if action == "report_blocked":
+                trajectory.observe({"status": "blocked", "error": decision.arguments["reason"]})
                 state["generation_blocked"] = True
                 state["errors"] = list(state.get("errors") or []) + [{
                     "code": "main_agent_blocked",
@@ -197,7 +240,9 @@ class MainAgentLoop:
                 return "blocked"
             if action == "request_finish":
                 if finish_validator(state):
+                    trajectory.observe({"status": str(state.get("result_status") or "completed")})
                     return str(state.get("result_status") or "completed")
+                trajectory.observe({"status": "rejected", "error": "finish_rejected_by_quality_gates"})
                 state.setdefault("main_agent_rejections", []).append({
                     "action": action,
                     "reason": "finish_rejected_by_quality_gates",
@@ -236,6 +281,7 @@ class MainAgentLoop:
                         should_cancel=should_cancel,
                         consume_mandatory_action=bool(mandatory),
                     )
+                    trajectory.observe(result.model_dump(mode="json"))
                 except AgentBudgetExceeded as exc:
                     state["result_status"] = "blocked"
                     state["generation_blocked"] = True

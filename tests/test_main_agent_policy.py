@@ -41,7 +41,7 @@ def test_json_policy_request_contains_only_five_field_dynamic_context():
         _context(), allowed_actions=["search_and_rank", "report_blocked"]
     )
 
-    dynamic_json = llm.messages[0]["content"].split("\n", 1)[0]
+    dynamic_json = llm.messages[-1]["content"]
     assert set(json.loads(dynamic_json)) == {
         "goal", "state", "key_evidence", "decisions", "open_questions",
     }
@@ -72,7 +72,8 @@ def test_policy_rejects_extra_tool_arguments():
         )
 
 
-def test_native_tool_catalog_only_offers_currently_allowed_actions():
+def test_native_tool_catalog_is_stable_but_action_validation_uses_current_permissions():
+    from app.agent.action_registry import ACTION_REGISTRY
     class NativeLLM:
         native_tools_enabled = True
 
@@ -88,5 +89,5 @@ def test_native_tool_catalog_only_offers_currently_allowed_actions():
         _context(), allowed_actions=["search_and_rank", "report_blocked"]
     )
 
-    assert llm.offered == ["search_and_rank", "report_blocked"]
+    assert llm.offered == sorted(ACTION_REGISTRY)
     assert decision.action == "search_and_rank"

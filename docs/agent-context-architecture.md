@@ -32,8 +32,8 @@ problems.
 Role rules form a stable system prefix. Native calls carry the tool catalog only
 through `tools`; the JSON fallback retains the textual catalog. Dynamic goals, evidence,
 and task state are serialized separately. `LLMService.for_agent(role)` injects the
-stable prefix while retaining the existing provider fallback, timeout, and metrics
-behavior. Raw document text is treated as research material and cannot redefine the
+stable prefix for specialist calls; `MainAgentPolicy` owns the main prefix and
+sorted action catalog. Both retain provider fallback, timeout, and metrics behavior. Raw document text is treated as research material and cannot redefine the
 role or tool boundary.
 
 The context builder is deterministic. It may shorten repeated or low-priority
@@ -47,7 +47,8 @@ constraint.
 
 ## Main-Agent decision loop
 
-`MainAgentPolicy` receives one freshly built `MainAgentContext` per round and returns
+`MainAgentPolicy` receives the latest five-field status bar and the persisted
+append-only trajectory per round and returns
 exactly one `AgentDecision`. The stable action registry is the source for tool
 descriptions, parameter schemas, roles, and controller authorization. Providers with
 native tool calling use a required single tool call; deployments that disable native
@@ -55,7 +56,7 @@ tools, or explicitly reject the native protocol, use strict JSON validated again
 the same contract. Tool schemas stay stable across rounds; the current allowed
 actions and correction reasons live inside `state`.
 
-`MainAgentLoop` executes `build -> decide -> validate -> execute -> commit -> rebuild`.
+`MainAgentLoop` executes `build -> decide -> validate -> execute -> commit observation -> rebuild`.
 The model may request completion, but deterministic quality gates decide whether the
 current draft can be released. Invalid actions receive one bounded correction chance;
 repeated no-progress actions, round limits, action limits, cancellation, and token
@@ -101,6 +102,55 @@ Retrieval is counted per search-node round, and recovery has its own sublimit.
 Nested controller actions charge the parent action once. The deadline spans the
 current user turn; cumulative usage survives pause/resume. In-flight external calls
 remain subject to their client timeouts; late results cannot commit after expiry.
+
+## ReAct epochs and context capacity
+
+Within an epoch, the original goal and subsequent goal/constraint revisions, status
+bars, assistant decisions, and observations are appended without rewriting prior
+messages. Native assistant calls retain their provider IDs, raw argument JSON,
+content, and DeepSeek continuation fields; `tool` observations match the IDs.
+JSON mode uses assistant JSON decisions followed by explicitly marked user
+observations. Transport/provider changes can invalidate cache prefixes; DeepSeek
+private continuation fields are omitted for other providers.
+
+L1 projects immutable bounded observations (status, outcome, findings, errors,
+evidence and output references). Full task results remain in authoritative state.
+Large results are split into immutable artifacts behind one service-only archive
+index, so the index list itself cannot fill the model context. Oversized reference
+lists retain their full values in that archive and expose a count plus the index;
+no truncated JSON or fabricated evidence references are used. Specialists continue
+to load only fields and artifact types allowed by their existing task contracts.
+
+Before each model request, the capacity guard counts the serialized system, native
+tools and complete trajectory with a conservative UTF-8 byte upper bound plus
+message framing overhead; this is an estimate, not provider usage. The configured
+`AGENT_CONTEXT_WINDOW_TOKENS` (default 65536) must be no larger than the smallest
+usable window among the primary and backup models. Output reserve equals
+`LLM_CONTROL_PLANE_MAX_TOKENS`. The status bar exposes the configured limit and
+previous-request estimates/usage. Actual prompt/completion/cache tokens come from
+provider usage, including OpenAI `prompt_tokens_details.cached_tokens`.
+
+At `AGENT_CONTEXT_COMPACT_RATIO` (default 0.8), L2 archives the entire epoch and
+starts a new one containing all goal revisions, a deterministic checkpoint with
+current evidence/decisions/questions, the compact observation/decision ledger,
+archive references and the latest complete interactions (default 2). No LLM is used
+to invent a summary. The previous archive is linked from the new archive. A short
+cooldown avoids repeated threshold compaction until more than the retained turn
+count has accumulated; a hard window overflow bypasses that cooldown.
+
+L3 blocks before model invocation if the retained set still exceeds the hard window,
+configuration is invalid, an archive fails, or a pending call is unresolved. L2
+requires the session Artifact Store; standalone in-memory graph calls explicitly
+block at this boundary instead of silently discarding history. The existing
+character limits still govern each rebuildable five-field status view separately.
+
+The active trajectory is stored as service-only JSON fragments in checkpoints and
+restored through the existing hydration path. Controller commits pair the task
+result and its observation in one transaction. A process restart after that commit
+recovers a complete interaction. Existing leases, CAS, cancellation, task
+idempotency and quality gates remain authoritative. This design enables shared
+prefix reuse; it does not implement an inference engine KV cache or guarantee a
+provider cache hit or a measured latency/cost improvement.
 
 ## Version and invalidation boundary
 

@@ -23,6 +23,10 @@ ARTIFACT_TYPES = {
     "draft": ArtifactSpec(frozenset({"analysis", "writing", "service"})),
     "quarantined_generation": ArtifactSpec(frozenset({"service"})),
     "task_result": ArtifactSpec(ALL),
+    "context_trajectory": ArtifactSpec(frozenset({"service"})),
+    "context_epoch": ArtifactSpec(frozenset({"service"})),
+    "context_archive_index": ArtifactSpec(frozenset({"service"})),
+    "tool_observation": ArtifactSpec(frozenset({"service"})),
     "evidence_bundle": ArtifactSpec(ALL),
 }
 
@@ -33,4 +37,5 @@ STATE_ARTIFACT_FIELDS = {
     "claim_plans": "claim_plan", "writing_plans": "writing_plan",
     "review": "draft", "agent_task_results": "task_result",
     "quarantined_generation_snapshot": "quarantined_generation",
+    "main_agent_trajectory": "context_trajectory",
 }

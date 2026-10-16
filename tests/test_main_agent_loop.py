@@ -242,7 +242,7 @@ def test_autonomous_graph_pipeline_reuses_existing_nodes_and_quality_gate(monkey
 
     output = graph._run_autonomous_pipeline(state)
 
-    assert output["status"] == "success"
+    assert output["status"] == "success", state.get("errors")
     assert output["answer"] == "有证据的正文 [1]"
     assert [item["action"] for item in state["main_agent_decisions"]] == [
         "search_and_rank", "fetch_metadata", "extract_paper_cards", "plan_claims",

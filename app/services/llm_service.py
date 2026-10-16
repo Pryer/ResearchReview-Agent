@@ -9,8 +9,8 @@
 
 from __future__ import annotations
 
+import copy
 import json
-import re
 import time
 from typing import Any, Optional
 
@@ -140,7 +140,7 @@ class LLMService:
         operation: str = "completion",
         thinking_enabled: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
-        messages: Optional[list[dict[str, str]]] = None,
+        messages: Optional[list[dict[str, Any]]] = None,
     ) -> str:
         """调用 LLM 获取单次回复。
 
@@ -226,6 +226,7 @@ class LLMService:
             for prov_name, client, model, provider in providers:
                 kwargs = dict(base_kwargs)
                 kwargs["model"] = model
+                kwargs["messages"] = self._provider_messages(normalized_messages, provider)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     last_exc = TimeoutError(
@@ -354,7 +355,7 @@ class LLMService:
 
     def complete_messages(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         **kwargs: Any,
     ) -> str:
         """结构化消息入口，复用 ``complete`` 的超时、回退与指标边界。"""
@@ -362,7 +363,7 @@ class LLMService:
 
     def complete_tool_call(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]],
         operation: str = "tool_decision",
@@ -391,7 +392,7 @@ class LLMService:
                 raise LLMInvocationError("tool decision failover deadline exhausted")
             kwargs: dict[str, Any] = {
                 "model": model,
-                "messages": normalized,
+                "messages": self._provider_messages(normalized, provider),
                 "tools": tools,
                 "tool_choice": "required",
                 "temperature": 0,
@@ -433,6 +434,8 @@ class LLMService:
                         raise NativeToolsUnsupportedError("thinking tool response did not select one action")
                     raise ValueError("provider must return exactly one tool call")
                 call = calls[0]
+                if not isinstance(getattr(call, "id", None), str) or not call.id:
+                    raise ValueError("provider tool call must have a nonempty id")
                 arguments = json.loads(call.function.arguments or "{}")
                 if not isinstance(arguments, dict):
                     raise ValueError("tool arguments must be a JSON object")
@@ -442,6 +445,14 @@ class LLMService:
                     "tool_call_id": str(getattr(call, "id", "") or ""),
                     "usage": usage,
                     "transport": "native_tool",
+                    "assistant_message": {
+                        "role": "assistant", "content": getattr(choices[0].message, "content", None),
+                        "tool_calls": [{"id": str(getattr(call, "id", "") or ""), "type": "function",
+                                        "function": {"name": call.function.name,
+                                                     "arguments": call.function.arguments}}],
+                        **({"reasoning_content": choices[0].message.reasoning_content}
+                           if isinstance(getattr(choices[0].message, "reasoning_content", None), str) else {}),
+                    },
                 }
             except BadRequestError as exc:
                 last_exc = exc
@@ -485,19 +496,53 @@ class LLMService:
         return _RoleBoundLLM(self, role)
 
     @staticmethod
-    def _validate_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    def _provider_messages(messages: list[dict[str, Any]], provider: str) -> list[dict[str, Any]]:
+        if provider.strip().lower() == "deepseek":
+            return copy.deepcopy(messages)
+        # WHY: DeepSeek 思考续传字段必须持久化；切换其他厂商时不能发送其私有扩展。
+        return [{key: copy.deepcopy(value) for key, value in message.items() if key != "reasoning_content"}
+                for message in messages]
+
+    @staticmethod
+    def _validate_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not messages:
             raise ValueError("messages must not be empty")
         allowed_roles = {"system", "user", "assistant", "tool"}
-        normalized: list[dict[str, str]] = []
+        normalized: list[dict[str, Any]] = []
+        pending: set[str] = set()
         for index, message in enumerate(messages):
             role = str(message.get("role") or "").strip()
             content = message.get("content")
             if role not in allowed_roles:
                 raise ValueError(f"invalid message role at index {index}: {role!r}")
-            if not isinstance(content, str):
+            calls = message.get("tool_calls")
+            if not isinstance(content, str) and not (role == "assistant" and calls and content is None):
                 raise ValueError(f"message content at index {index} must be a string")
-            normalized.append({"role": role, "content": content})
+            if pending and role != "tool":
+                raise ValueError("assistant tool calls must be followed by their results")
+            if role == "tool":
+                call_id = message.get("tool_call_id")
+                if not isinstance(call_id, str) or call_id not in pending:
+                    raise ValueError("tool result does not match a pending tool_call_id")
+                pending.remove(call_id)
+            elif message.get("tool_call_id") is not None:
+                raise ValueError("tool_call_id is only valid for tool messages")
+            if calls is not None:
+                if role != "assistant" or not isinstance(calls, list) or not calls:
+                    raise ValueError("tool_calls must be a nonempty assistant list")
+                for call in calls:
+                    function = call.get("function") or {}
+                    call_id = call.get("id")
+                    if (not isinstance(call_id, str) or not call_id or call_id in pending
+                            or call.get("type") != "function" or not function.get("name")
+                            or not isinstance(function.get("arguments"), str)):
+                        raise ValueError("invalid assistant tool call")
+                    pending.add(call_id)
+            if "reasoning_content" in message and (role != "assistant" or not isinstance(message["reasoning_content"], str)):
+                raise ValueError("invalid assistant reasoning_content")
+            normalized.append(copy.deepcopy({**message, "role": role, "content": content}))
+        if pending:
+            raise ValueError("tool results are missing")
         return normalized
 
     def _record_usage(
@@ -518,7 +563,8 @@ class LLMService:
             "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
             "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
             "prompt_cache_hit_tokens": int(
-                getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+                getattr(usage, "prompt_cache_hit_tokens", 0)
+                or getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", 0) or 0
             ),
             "prompt_cache_miss_tokens": int(
                 getattr(usage, "prompt_cache_miss_tokens", 0) or 0
@@ -542,6 +588,7 @@ class LLMService:
                 reasoning_tokens=reasoning_tokens,
                 **tokens,
             )
+        self.last_usage = dict(tokens)
         return tokens
 
 
@@ -694,7 +741,7 @@ class _RoleBoundLLM:
             **kwargs,
         )
 
-    def complete_messages(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
+    def complete_messages(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
         return self._service.complete_messages(
             [{"role": "system", "content": self._system_prompt}, *messages],
             **kwargs,
@@ -706,7 +753,7 @@ class _RoleBoundLLM:
 
     def complete_tool_call(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]],
         operation: str = "tool_decision",
