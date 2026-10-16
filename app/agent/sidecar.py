@@ -63,6 +63,11 @@ class ActionSidecar:
                 raise ValueError("invalid sidecar verdict")
             return SidecarDecision(verdict=verdict, reason=reason[:240])
         except Exception as exc:
+            from app.agent.execution_budget import is_control_exception
+
+            # WHY: 执行停止不属于审查意见；必须保留预算、取消和失权的原始终态。
+            if is_control_exception(exc):
+                raise
             # Only invoked for explicitly configured reviewed actions. Fail closed:
             # a reviewer outage must not silently authorize those actions.
             return SidecarDecision(

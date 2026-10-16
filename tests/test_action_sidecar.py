@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
+from app.agent.execution import AgentCancelledError
+from app.agent.execution_budget import AgentBudgetExceeded, AgentExecutionStale
+from app.agent.main_loop import MainAgentLoop
 from app.agent.sidecar import ActionSidecar
+from app.core.config import get_settings
+from app.core.exceptions import LLMProviderUnavailableError
+from app.database.runtime_repository import RuntimeConflict
 
 
 class StubLLM:
@@ -42,3 +50,42 @@ def test_sidecar_denies_and_escalates():
 def test_sidecar_invalid_classifier_response_fails_closed():
     llm = StubLLM({"verdict": "maybe", "reason": "unknown"})
     assert ActionSidecar(llm).review(operation="generate_deliverables", arguments={}).verdict == "escalate"
+
+
+STOP_CASES = [
+    (AgentBudgetExceeded, "blocked"),
+    (AgentCancelledError, "cancelled"),
+    (AgentExecutionStale, "failed"),
+    (RuntimeConflict, "failed"),
+    (LLMProviderUnavailableError, "failed"),
+]
+
+
+@pytest.mark.parametrize("error_type,status", STOP_CASES)
+def test_sidecar_preserves_execution_control_exception(error_type, status):
+    error = error_type("execution stopped")
+    with pytest.raises(error_type) as caught:
+        ActionSidecar(StubLLM(error=error)).review(operation="search_and_rank", arguments={})
+    assert caught.value is error
+
+
+@pytest.mark.parametrize("error_type,status", STOP_CASES)
+def test_sidecar_stop_reaches_loop_without_clarification_or_execution(monkeypatch, error_type, status):
+    monkeypatch.setattr(get_settings(), "agent_sidecar_enabled", True)
+    monkeypatch.setattr(get_settings(), "agent_sidecar_review_actions", "search_and_rank")
+    current = {
+        "user_query": "研究主题", "topic": "主题", "steps": [], "errors": [],
+        "agent_mandatory_actions": [{"action": "search_and_rank"}],
+    }
+    executed = []
+    result = MainAgentLoop(StubLLM(error=error_type("execution stopped"))).run(
+        current,
+        handlers={"search_and_rank": lambda *args: executed.append(True)},
+        finish_validator=lambda state: False,
+    )
+    assert result == status
+    assert current["result_status"] == status
+    assert current["errors"][-1]["code"] == error_type.__name__
+    assert "clarification" not in current
+    assert not executed
+    assert not current["main_agent_trajectory"].get("pending")
