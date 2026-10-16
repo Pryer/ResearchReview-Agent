@@ -24,21 +24,25 @@ ResearchReview-Agent interprets research constraints and topic ambiguity from na
 
 ## Architecture
 
-The system has one execution scheduler. In each round, the main agent selects one registered action; deterministic code enforces action authorization, budgets, cancellation, evidence versions, and quality gates. Historical sessions are normalized at the recovery boundary without discarding their goals, constraints, papers, evidence cards, recovery history, or budget usage.
+The system uses one main/specialist orchestration path. The main agent delegates a registered research task; Search, Analysis and Writing each run a separate ReAct loop that can select multiple authorized actions before reporting back. Deterministic code enforces action authorization, budgets, cancellation, evidence versions, and quality gates. Historical sessions are normalized at the recovery boundary without discarding their goals, constraints, papers, evidence cards, recovery history, or budget usage.
 
 ```text
-User request -> scope understanding -> five-field context -> action selection
-                                                        |
-                                         controller validation and delegation
-                                                        |
-                                         search / analysis / writing
-                                                        |
-                                version checks -> transaction commit -> next round
+User request -> scope understanding -> main-agent task delegation
+                                             |
+                       Search / Analysis / Writing: independent ReAct context
+                                             |
+                       decide -> Controller checks -> execute -> commit observation
+                         ^                                      |
+                         +--------------- next child turn ------+
+                                             |
+                       report completion / request help -> main-agent reply
 
 Deliverable request -> deterministic quality gates -> complete / degraded / blocked
 ```
 
 The model context is intentionally limited to `goal`, `state`, `key_evidence`, `decisions`, and `open_questions`. Full papers, evidence, and history remain in authoritative state and database records. See [ARCHITECTURE.md](ARCHITECTURE.md) and [runtime, recovery, and cache notes](docs/agent-runtime-and-cache.md).
+
+Each specialist retains its own trajectory, communication history, usage estimates and compaction epochs across delegations and checkpoints. The latest status includes the delegated objective, fixed arguments, evidence references, completed operations and six recent messages with the main agent. Delegation is synchronous. All loops share the session budget; a specialist's completion report does not authorize final delivery.
 
 ## Quick start
 
@@ -160,6 +164,8 @@ pytest
 ```
 
 The repository uses mocked external LLM and retrieval boundaries for deterministic tests. Real CNKI, external LLM, and live end-to-end runs require local credentials and are not part of the default test suite.
+
+The 2026-10-16 specialist-loop change passed **1,591 tests** in the full local suite and **100 targeted tests**, including 23 new specialist-loop cases. These results do not establish live-provider end-to-end completion, cost savings or latency improvements.
 
 ## Project structure
 

@@ -56,7 +56,9 @@ tools, or explicitly reject the native protocol, use strict JSON validated again
 the same contract. Tool schemas stay stable across rounds; the current allowed
 actions and correction reasons live inside `state`.
 
-`MainAgentLoop` executes `build -> decide -> validate -> execute -> commit observation -> rebuild`.
+`MainAgentLoop` executes `build -> decide -> delegate -> receive report -> rebuild`.
+The specialist executes its own `build -> decide -> Controller validation -> execute
+-> commit observation -> rebuild` cycle until it reports to the main Agent.
 The model may request completion, but deterministic quality gates decide whether the
 current draft can be released. Invalid actions receive one bounded correction chance;
 repeated no-progress actions, round limits, action limits, cancellation, and token
@@ -242,7 +244,8 @@ The deterministic controller delegates bounded tasks through `AgentTask` and
 `AgentTaskResult` contracts:
 
 - Search Agent: search, ranking, metadata retrieval, and targeted retrieval.
-- Analysis Agent: evidence cards, route validation, synthesis, and claim planning.
+- Analysis Agent: evidence cards, route validation, synthesis, claim planning and
+  deterministic result validation.
 - Writing Agent: deliverable generation and authorized section rewriting.
 
 Each task declares its objective, constraints, input artifacts, expected outputs,
@@ -261,11 +264,13 @@ specialist result. Existing retrieval loops, evidence recovery, writing renderer
 claim verification, and final quality gates remain authoritative. A successful
 specialist call does not imply that the overall research result passed its gates.
 
-During quality recovery, the main loop deterministically advances newly admitted
-hybrid candidates through detail, card, route, and claim actions before requesting
-another model decision. This uses the existing action contracts and keeps the
-model-facing context at the same five fields. Evidence changes invalidate dependent
-plans and gates after the specialist result commits; removed artifacts are also
+During quality recovery, deterministic handoff rules constrain the main and child
+loops to advance newly admitted hybrid candidates through detail, card, route and
+claim actions. Model decisions remain inside those allowed actions; moving work to
+another role requires a report and a new main delegation. This uses the existing
+action contracts and keeps the model-facing context at the same five fields.
+Metadata/card changes invalidate dependent plans and gates within the same Controller
+commit as the specialist result and observation; removed artifacts are also
 removed from the manifest before the next checkpoint can hydrate them.
 
 ## Configuration

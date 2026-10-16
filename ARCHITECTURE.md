@@ -110,7 +110,8 @@ ResearchReview-Agent/
 
 ## 3. 核心数据流（`app/agent/graph.py: run_research_agent`）
 
-当前只采用主 Agent 单动作决策循环；无 LangGraph 依赖。
+当前采用 Main Agent 委派与三类 Subagent 独立 ReAct 循环组成的主从编排；
+主控每轮选择一个任务，子 Agent 在本角色内多轮决策并汇报；无 LangGraph 依赖。
 节点函数在 `app/agent/nodes/`，原子能力在 `app/tools/`。
 
 主 Agent 基于五字段上下文每轮选择一个已注册动作；动作权限、预算、取消、提交
@@ -229,7 +230,11 @@ pytest tests/
 [上下文架构](docs/agent-context-architecture.md)，CAS、预算和恢复细节见
 [运行机制](docs/agent-runtime-and-cache.md)。
 
-2026-09-22 运行时与缓存修复验收的全量回归为 1224 项通过（后续检查见变更日志）；真实备用 LLM + CNKI 3 篇检索、
+2026-10-16 独立子循环改造的全量本地回归为 1591 项通过，相关定向回归 100 项通过，
+其中新增 23 项子循环行为测试；外部调用均使用 Mock，本轮未运行真实服务全链路，
+未测量额外模型调用的成本、性能或研究质量收益。
+
+历史真实服务验收：2026-09-22 全量回归为 1224 项通过；真实备用 LLM + CNKI 3 篇检索、
 提交和数据库重开恢复已通过。40 篇完整综述场景因请求预留超过剩余预算而阻断，
 尚未完成交付验收，未据此宣称确定节费比例。详见
 [验收记录](docs/validation/2026-09-22-runtime-cache.md)。

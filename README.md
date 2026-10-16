@@ -245,7 +245,11 @@ conda activate rragent
 pytest
 ```
 
-2026-09-22 运行时与缓存修复验收的全量回归为 **1224 项通过**；后续检查见变更日志。真实备用 LLM → CNKI
+2026-10-16 独立 Subagent ReAct 循环改造的本地全量回归为 **1591 项通过**，
+其中新增 23 项子循环行为测试；相关定向回归 100 项通过。外部学术 API、CNKI 和
+LLM 在这些回归中使用 Mock；本轮未执行真实服务全链路，也未测量成本或性能收益。
+
+历史真实服务验收：2026-09-22 的全量回归为 1224 项通过；真实备用 LLM → CNKI
 检索 3 篇 → 提交 → 数据库重开恢复已通过；“至少 40 篇完整综述”场景因剩余预算
 不足以预留下一请求而阻断，尚未完成交付验收。详见[验收记录](docs/validation/2026-09-22-runtime-cache.md)。
 
@@ -261,7 +265,9 @@ ResearchReview-Agent/
 │   │   ├── graph.py           # 四类交付物的主工作流入口（run/continue/regenerate）
 │   │   ├── main_loop.py / main_policy.py # 五字段决策循环与原生工具/JSON 动作策略
 │   │   ├── controller.py / action_contracts.py # 动作授权、输入投影、补丁与版本校验
-│   │   ├── context_builder.py / subagents/ # 上下文构建与 Search/Analysis/Writing
+│   │   ├── context_builder.py # 五字段状态摘要与主控可见的子 Agent 汇报
+│   │   ├── react_context.py   # 按角色隔离的追加式轨迹、观察和 Epoch 压缩
+│   │   ├── subagents/loop.py  # Search/Analysis/Writing 独立循环与主从通信
 │   │   ├── execution_budget.py # 跨主决策、专业任务和重试共享预算
 │   │   ├── nodes/             # 按阶段分组的节点包：planning/retrieval/extraction/synthesis/verification
 │   │   ├── retrieval_loop.py  # ReAct 检索精化循环

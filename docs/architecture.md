@@ -11,8 +11,11 @@ implementation is under app/, not src/.
 - app/agent/: stateful workflow orchestration, planning, routing, nodes, and bounded
   retrieval/evidence-recovery loops. `main_loop.py` / `main_policy.py` select actions;
   `controller.py`, `action_contracts.py`, `task_context.py` and `result_merger.py`
-  enforce specialist input/output and commit boundaries. `context_builder.py` and
-  `subagents/` supply the five-field view and specialist adapters.
+  enforce specialist input/output and commit boundaries.
+  `context_builder.py` supplies the five-field status view; `subagents/loop.py`
+  runs independent Search, Analysis and Writing ReAct loops and structured
+  main/specialist communication. `react_context.py` manages their separate
+  append-only trajectories, usage estimates and compaction epochs.
 - app/clients/: thin adapters for arXiv, Semantic Scholar, OpenAlex, Crossref,
   and CNKI. They map remote responses to PaperMetadata.
 - app/tools/: single-purpose search, ranking, deduplication, PDF, card,
@@ -28,9 +31,12 @@ implementation is under app/, not src/.
 
 ## Ownership Rules
 
-`main_loop.py` selects one registered action from the five-field context while
-graph.py supplies the node adapters and final quality boundary. New and resumed
-sessions use this scheduler. Historical sessions whose mode is absent or `legacy`
+`main_loop.py` selects one registered task from the five-field context and delegates
+research work to the appropriate specialist loop. Each specialist can choose
+multiple currently eligible role actions through Controller before reporting
+completion, requesting help or reporting a block. `graph.py` supplies the node
+adapters and final quality boundary. New and resumed sessions use this main/specialist
+orchestration path. Historical sessions whose mode is absent or `legacy`
 are normalized at the execution boundary; their evidence, explicit constraints,
 recovery history and consumed budget remain authoritative.
 The artifact repository externalizes heavy editable-state fields and validates
@@ -50,6 +56,28 @@ receives a rebuildable `MainAgentContext` containing only `goal`, `state`,
 operation-level allowlists and typed patches; they cannot change user goals, hard
 constraints or the shared budget. See [context architecture](agent-context-architecture.md).
 
+## Specialist context and communication
+
+Each role owns a namespace in `subagent_sessions`. It stores that specialist's
+trajectory, communication history, active delegation, usage estimates and archive
+epochs. Context construction first projects the union of inputs allowed by the
+role's action contracts, then builds the five-field status view. Executing an
+individual action applies the narrower operation-specific input and output
+contract again. Full raw documents are not copied into every decision prompt.
+
+The specialist request combines its fixed role/ReAct rules, its own prior goals,
+decisions and real observations, and the latest five-field status. The status
+contains the delegated operation/objective, immutable arguments, evidence references,
+completed operations, round count and six recent messages with the main Agent.
+Other roles' private trajectories are not included. The main Agent receives bounded
+structured reports and can reply through a new delegation; native tools carry an
+optional `delegation_message` that is extracted before research argument validation.
+
+Delegation is synchronous. Per-delegation round/no-progress limits are separate,
+while token, action, retrieval, deadline, cancellation and lease checks share the
+session execution boundary. `report_to_main` is a communication action; it cannot
+release a review or replace citation and evidence gates.
+
 ## Durable execution and recovery
 
 Conversation service entry points bind the artifact store, shared budget and durable
@@ -57,6 +85,12 @@ execution lease. Action success commits state, artifacts, task result, checkpoin
 budget and event atomically. Attempts reserve and settle separately, preserving usage
 when a task fails, is cancelled or becomes stale. Public session saves check the
 lease/version too. Direct graph calls remain an in-memory execution mode.
+
+Child observations and progress counters commit with each research action. Metadata
+or card changes invalidate dependent claims and gates inside that same commit.
+The parent's pending call is paired when the child reports; reporting and clearing
+the active delegation also share a checkpoint. Recovery resumes an active child
+before a new main decision, preserving completed operations and local counters.
 
 History entries are archived before display truncation; summaries consume only new
 events after a durable cursor. Session reads restore newer committed research
@@ -82,6 +116,9 @@ See [runtime and cache boundaries](agent-runtime-and-cache.md).
 - Validation evidence: [2026-09-22 report](validation/2026-09-22-runtime-cache.md).
   The real 3-paper commit/recovery smoke passed; the 40-reference deliverable remained
   budget-blocked, so it is not recorded as a completed end-to-end review.
+- Latest local specialist-loop regression (2026-10-16): 1,591 full-suite tests and
+  100 targeted tests passed, with 23 new specialist-loop cases. External calls were
+  mocked; no new live CNKI/LLM end-to-end or cost/performance result was established.
 
 The root ARCHITECTURE.md remains a detailed operational reference. This document is
 the stable architecture contract; update both when a structural change affects
