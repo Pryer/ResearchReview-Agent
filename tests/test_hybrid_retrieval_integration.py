@@ -25,6 +25,11 @@ def hybrid_settings(tmp_path, monkeypatch):
     base = config_module.get_settings()
     patched = base.model_copy(update={
         "retrieval_ranking_mode": "hybrid",
+        # WHY: 假客户端仍经过配置准入；测试不能依赖开发机 .env 的真实密钥和端点。
+        "retrieval_provider": "dashscope",
+        "dashscope_api_key": "test-placeholder",
+        "retrieval_embedding_url": "https://example.invalid/embedding",
+        "retrieval_rerank_url": "https://example.invalid/rerank",
         "retrieval_embedding_dimension": 2,
         "retrieval_cache_dir": str(tmp_path),
         "retrieval_bm25_top_k": 8,
@@ -303,13 +308,9 @@ def test_retrieval_loop_runs_single_final_semantic_admission(hybrid_settings, mo
 
 
 @pytest.fixture
-def hybrid_deepen_settings(tmp_path, monkeypatch):
+def hybrid_deepen_settings(hybrid_settings, monkeypatch):
     """允许 2 轮精化、大窗口，用于验证 hybrid 循环的提前停止/继续加深判定。"""
-    base = config_module.get_settings()
-    patched = base.model_copy(update={
-        "retrieval_ranking_mode": "hybrid",
-        "retrieval_embedding_dimension": 2,
-        "retrieval_cache_dir": str(tmp_path),
+    patched = hybrid_settings.model_copy(update={
         "retrieval_bm25_top_k": 20,
         "retrieval_dense_top_k": 20,
         "retrieval_cross_encoder_initial_k": 20,

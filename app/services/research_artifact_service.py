@@ -193,7 +193,7 @@ class ResearchArtifactService:
             value = stored.pop(field)
             is_text = isinstance(value, str)
             shape = "text" if is_text else "list"
-            if field in {"agent_task_results", "quarantined_generation_snapshot"}:
+            if field in {"agent_task_results", "quarantined_generation_snapshot", "main_agent_trajectory"}:
                 # WHY: 任务补丁和隔离候选可能超过单条资料上限，统一 JSON 分片
                 # 保存；候选使用仅 service 可读的独立类型，不能混入当前任务授权。
                 self.validate_payload(value, max_bytes=8 * 1024 * 1024)
@@ -241,7 +241,7 @@ class ResearchArtifactService:
         for field, manifest in (state.get("artifact_manifest") or {}).items():
             expected_type = "document_fragment" if field == "parsed_papers" else STATE_ARTIFACT_FIELDS.get(field)
             expected_shape = "documents" if field == "parsed_papers" else "text" if field == "review" else "list"
-            if field == "quarantined_generation_snapshot":
+            if field in {"quarantined_generation_snapshot", "main_agent_trajectory"}:
                 expected_shape = "json_object"
             allowed_shapes = {expected_shape} | ({"json_list"} if field == "agent_task_results" else set())
             if expected_type is None or manifest.get("shape") not in allowed_shapes:

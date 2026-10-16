@@ -668,3 +668,84 @@ def test_local_token_timeout_is_reported_as_rate_limit_not_network_timeout():
         "rate_limited",
         "RATE_LIMIT_WAIT_TIMEOUT",
     )
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 503])
+def test_arxiv_failed_phrase_does_not_retry_as_loose_query(status, monkeypatch):
+    from app.clients import arxiv_client as arxiv
+
+    monkeypatch.setattr(arxiv, "_reserve_request_slot", lambda: None)
+    sent = []
+    monkeypatch.setattr(
+        arxiv.requests, "get",
+        lambda *a, **k: sent.append(1) or Response(status, headers={"Retry-After": "120"}),
+    )
+    diagnostics = []
+    assert search_papers(
+        "action recognition", 2024, 2026, 5, sources=["arxiv"],
+        diagnostics=diagnostics, enable_dual_channel=False,
+    ) == []
+    assert len(sent) == 1
+    expected = "rate_limited" if status == 429 else (
+        "authentication_failed" if status in {401, 403} else "api_failed"
+    )
+    assert diagnostics[0].outcome == expected
+
+
+def test_arxiv_token_timeout_preserves_rate_limit_diagnostic(monkeypatch):
+    from app.clients import arxiv_client as arxiv
+    from types import SimpleNamespace
+
+    acquired, sent = [], []
+    monkeypatch.setattr(
+        "app.core.rate_limiter.get_rate_limiter",
+        lambda domain: SimpleNamespace(acquire=lambda *a, **k: acquired.append(1) or False),
+    )
+    monkeypatch.setattr(arxiv.requests, "get", lambda *a, **k: sent.append(1))
+    diagnostics = []
+    assert search_papers(
+        "action recognition", 2024, 2026, 5, sources=["arxiv"],
+        diagnostics=diagnostics, enable_dual_channel=False,
+    ) == []
+    assert sent == []
+    assert diagnostics[0].outcome == "rate_limited"
+    assert diagnostics[0].error_code == "RATE_LIMIT_WAIT_TIMEOUT"
+    assert len(acquired) == 1
+
+
+def test_arxiv_successful_empty_phrase_still_uses_loose_query(monkeypatch):
+    from app.clients import arxiv_client as arxiv
+
+    monkeypatch.setattr(arxiv, "_reserve_request_slot", lambda: None)
+    monkeypatch.setattr(get_rate_limiter("arxiv"), "acquire", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(arxiv.requests, "get", lambda url, **k: sent.append(url) or Response(200))
+    assert arxiv.search_arxiv("action recognition", 2024, 2026) == []
+    assert len(sent) == 2
+
+
+@pytest.mark.parametrize("error_type,attempts,outcome", [
+    (requests.Timeout, 3, "timeout"),
+    (requests.ConnectionError, 1, "api_failed"),
+])
+def test_arxiv_network_failure_does_not_restart_retry_budget(
+    monkeypatch, retry_clock, error_type, attempts, outcome,
+):
+    from app.clients import arxiv_client as arxiv
+
+    monkeypatch.setattr(arxiv, "_reserve_request_slot", lambda: None)
+    monkeypatch.setattr(get_rate_limiter("arxiv"), "acquire", lambda *a, **k: True)
+    sent = []
+
+    def fail(*args, **kwargs):
+        sent.append(1)
+        raise error_type("network failure")
+
+    monkeypatch.setattr(arxiv.requests, "get", fail)
+    diagnostics = []
+    assert search_papers(
+        "action recognition", 2024, 2026, 5, sources=["arxiv"],
+        diagnostics=diagnostics, enable_dual_channel=False,
+    ) == []
+    assert len(sent) == attempts
+    assert diagnostics[0].outcome == outcome

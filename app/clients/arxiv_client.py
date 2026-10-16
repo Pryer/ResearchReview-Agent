@@ -16,6 +16,7 @@ import requests
 
 from app.core.config import get_settings
 from app.core.logger import get_logger
+from app.core.rate_limiter import RateLimitAcquireTimeout
 from app.core.retry_policy import bounded_request_timeout, interruptible_sleep, retry_after_seconds, check_retrieval_execution
 from app.schemas.paper_schema import PaperMetadata
 from app.utils.title_cleaner import clean_abstract, clean_title
@@ -45,6 +46,11 @@ _COOLDOWN_UNTIL = 0.0
 
 class ArxivRateLimitError(requests.HTTPError):
     status_code = 429
+
+
+class ArxivTokenWaitTimeout(RateLimitAcquireTimeout, requests.RequestException):
+    # WHY: 保留旧调用方的 RequestException 捕获契约，同时提供统一令牌等待错误码。
+    pass
 
 
 def _enter_cooldown(seconds: float, *, retry_after: float = 0.0) -> None:
@@ -87,7 +93,7 @@ def _arxiv_get(url: str, timeout: int, max_retries: int = 3) -> requests.Respons
                 # 令牌等待超时说明本域已严重超速：直接放弃本次请求，
                 # 与串行间隔控制共同生效，避免 429 封禁。
                 logger.warning("arXiv request skipped: rate limit token wait timed out")
-                raise requests.RequestException("arXiv rate limit token wait timed out")
+                raise ArxivTokenWaitTimeout("arXiv rate limit token wait timed out")
             _reserve_request_slot()
             _check_cooldown()
             resp = requests.get(url, timeout=bounded_request_timeout(timeout))
@@ -171,7 +177,10 @@ def search_arxiv(
 
     formatted_query = _format_arxiv_query(query, force_phrase=(sort_by == "date"))
 
+    request_failed = False
+
     def _execute_query(search_q: str) -> List[PaperMetadata]:
+        nonlocal request_failed
         params = {
             "search_query": search_q,
             "start": 0,
@@ -183,23 +192,29 @@ def search_arxiv(
         try:
             resp = _arxiv_get(url, timeout=max(settings.agent_request_timeout, 30))
             return parse_arxiv_response(resp.text, start_year, end_year)
-        except requests.RequestException as e:
+        except (requests.RequestException, RateLimitAcquireTimeout) as e:
+            request_failed = True
             logger.warning("arXiv search failed (sort=%s, query=%s): %s", sort_by, search_q, e)
             status_code = getattr(getattr(e, "response", None), "status_code", None)
-            outcome = "timeout" if isinstance(e, requests.Timeout) else (
-                "authentication_failed" if status_code in {401, 403} else "api_failed"
-            )
-            error_code = "TIMEOUT" if outcome == "timeout" else (
-                f"HTTP_{status_code}" if status_code in {401, 403} else "API_ERROR"
-            )
+            status_code = status_code or getattr(e, "status_code", None)
+            if isinstance(e, RateLimitAcquireTimeout):
+                outcome, error_code = "rate_limited", e.error_code
+            elif status_code == 429:
+                outcome, error_code = "rate_limited", "HTTP_429"
+            elif isinstance(e, requests.Timeout):
+                outcome, error_code = "timeout", "TIMEOUT"
+            elif status_code in {401, 403}:
+                outcome, error_code = "authentication_failed", f"HTTP_{status_code}"
+            else:
+                outcome, error_code = "api_failed", "API_ERROR"
             _record_search_diagnostic(outcome, error_code=error_code, message=str(e))
             return []
 
     # 1. 执行精准检索
     papers = _execute_query(formatted_query)
 
-    # 2. 如果精准短语返回 0 条且原始 query 未加引号，平滑回退到松散分词检索
-    if not papers and formatted_query != f"all:{query.strip()}" and '"' not in query:
+    # WHY: 只有成功空检索才说明短语过严；失败不能用改写查询绕过重试与认证边界。
+    if not papers and not request_failed and formatted_query != f"all:{query.strip()}" and '"' not in query:
         fallback_q = f"all:{query.strip()}"
         logger.info("arXiv phrase query returned 0, falling back to loose query: %s", fallback_q)
         papers = _execute_query(fallback_q)

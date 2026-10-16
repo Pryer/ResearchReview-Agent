@@ -209,6 +209,9 @@ class AgentController:
                 candidate["agent_execution_status"] = "completed"
                 result.output_state_fingerprint = context_source_fingerprint(candidate)
                 candidate.setdefault("agent_task_results", []).append(result.model_dump(mode="json"))
+                # WHY: 观察与研究提交进入同一检查点，恢复后不会留下未配对调用或重复执行。
+                from app.agent.react_context import record_tool_observation
+                record_tool_observation(candidate, result.model_dump(mode="json"))
                 runtime.snapshot(candidate, task=task, result=result,
                                  ledger=candidate.get("agent_execution_budget") or {})
                 ledger = state.get("agent_execution_budget")

@@ -191,6 +191,22 @@ def _agent_state(state: dict[str, Any]) -> AgentStateContext:
         "status": str(item.get("status") or "unknown"),
         "error": _clean_text(item.get("error"), 180),
     } for item in steps[-8:]]
+    # ReAct observation: expose concise, verified post-action feedback, not
+    # the specialist's full working context or unbounded raw tool output.
+    # Task results are already persisted by the Controller.
+    for item in (state.get("agent_task_results") or [])[-4:]:
+        if not isinstance(item, dict):
+            continue
+        findings = item.get("findings") or []
+        recent.append({
+            "action": str(item.get("operation") or ""),
+            "status": str(item.get("status") or "unknown"),
+            "outcome": str(item.get("outcome") or "unknown"),
+            "findings": [_clean_text(f, 200) for f in findings[:3]],
+            "error": _clean_text(item.get("error"), 180),
+            "evidence_refs": [str(ref) for ref in (item.get("evidence_refs") or [])[:3]],
+        })
+    recent = recent[-8:]
     allowed = [
         str(item) for item in state.get("allowed_agent_actions") or _next_actions(state)
     ]
@@ -214,6 +230,10 @@ def _agent_state(state: dict[str, Any]) -> AgentStateContext:
         allowed_actions=list(dict.fromkeys(item for item in allowed if item))[:16],
         completed_actions=list(dict.fromkeys(item for item in completed if item))[-10:],
         recent_trajectory=recent,
+        context_budget={
+            **dict(state.get("agent_context_usage") or {}),
+            **{"last_" + key: int(value) for key, value in (state.get("agent_context_last_usage") or {}).items()},
+        },
         failure_reasons=list(dict.fromkeys(failures)),
         gate_status={
             "quality": quality.get("passed"),
@@ -402,8 +422,8 @@ def build_context_snapshot(state: dict[str, Any]) -> ContextSnapshot:
     from app.agent.context_compaction import compact_main_context, validate_context_snapshot
 
     settings = get_settings()
-    # WHY: main_context_max_chars 是整次主控请求预算；动态五字段必须为稳定
-    # system/tool 前缀与结构化动作输出预留空间，不能把三者分别按满额计算。
+    # WHY: 字符上限继续约束可重建的五字段视图；前缀/输出保留历史预留余量。
+    # 完整轨迹、system/tools 与实际输出预留另由 react_context 按 Token 预算预检。
     max_chars = max(
         2000,
         int(settings.main_context_max_chars)

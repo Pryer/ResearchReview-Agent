@@ -133,6 +133,9 @@ class ResearchAgentState(TypedDict, total=False):
     main_context_artifact_ref: str
     context_snapshot_version: int
     agent_task_results: List[Dict[str, Any]]
+    main_agent_trajectory: Dict[str, Any]
+    agent_context_usage: Dict[str, Any]
+    agent_context_last_usage: Dict[str, int]
     state_revision: int
     agent_execution_budget: Dict[str, Any]
     agent_execution_status: str

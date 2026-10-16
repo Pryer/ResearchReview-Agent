@@ -38,6 +38,7 @@ class AgentStateContext(StrictContextModel):
     artifact_summary: dict[str, int | bool | str | None] = Field(default_factory=dict)
     remaining_action_budget: int | None = None
     budget_remaining: dict[str, int] = Field(default_factory=dict)
+    context_budget: dict[str, int | str] = Field(default_factory=dict)
     source_state_version: str = ""
 
 

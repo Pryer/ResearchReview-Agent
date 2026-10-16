@@ -2185,3 +2185,30 @@ what changed and how it was validated; it is not a replacement for Git history.
 - 验证：tests/test_retrieval_failure_policy.py、test_openalex_rate_limit.py、test_rate_limiter.py、test_search.py、test_diagnostics.py、test_circuit_breaker.py 定向 98 passed（1.13s）；最终全量 1530 passed、687 warnings（21.16s），JUnit 确认 failures=0、errors=0。使用占位 DashScope 密钥与 example.invalid 端点满足已有混合检索测试配置，HTTP、LLM 和浏览器调用均模拟，未访问真实数据源。改动模块 Ruff F 检查及 git diff --check 通过。
 - 收敛审查：保留单一线程池调度和既有 submit_with_context，没有增加独立调度循环；OpenAlex 详情复用搜索失败策略，未保留过渡实现。源级冷却、局部取消寿命与停止顺序有中文 WHY；测试覆盖等待途中熔断/冷却变化、并发停止保留原始原因、排队任务不发请求、长服务端冷却、超时恢复、认证分类和两种通道完成顺序。时间模拟同时推进 monotonic 与 sleep，并清理跨用例限流状态。
 - 限制：未运行真实 LLM/CNKI/学术 API E2E；同步 HTTP 和浏览器请求无法强制即时撤回，取消可能等待配置的客户端超时。限流、冷却和熔断仍是进程内状态，不提供多进程全局配额。长服务端 Retry-After 现在会优先于本地冷却上限，应通过诊断辨识来源暂不可用；不提前探测限流窗口。此验证针对 PR #2 独立分支，未合并 Context PR #1；PR 保持 Draft。
+
+## 2026-10-16 00:55:20 +08:00 — Context Engineering、追加式轨迹与分层预算控制
+
+- 修改文件：.env.example; README.md; app/agent/context_builder.py; app/agent/controller.py; app/agent/graph.py; app/agent/main_loop.py; app/agent/main_policy.py; app/agent/react_context.py; app/agent/state.py; app/core/config.py; app/prompt/agent_system.py; app/schemas/artifact_schema.py; app/schemas/context_schema.py; app/services/llm_service.py; app/services/research_artifact_service.py; docs/agent-context-architecture.md; docs/book-guided-agent-harness.md; docs/change-log.md; tests/test_durable_runtime.py; tests/test_main_agent_loop.py; tests/test_main_agent_policy.py; tests/test_react_context.py。
+- 原因：PR 原有上下文每轮重建为单次摘要，LLM 消息验证会丢弃工具协议字段，设计中的追加轨迹、请求容量预检及 Epoch 压缩尚未落地。
+- 行为：主策略持有稳定规则和排序固定的动作目录；权威五字段作为末尾状态栏追加，原始目标及所有修订保留。原生 assistant/tool 保留调用 ID、参数和 DeepSeek 续传字段，其他提供商剥离厂商扩展；JSON 回退在会话内固定。L1 有界观察，大输出及引用数组外置分片并通过单一归档索引访问；L2 达阈值时归档完整 Epoch，保留目标、约束、当前工作状态、观察/决策账本与最近完整交互；L3 无法归档或保留集超限时在模型调用前 blocked。活动轨迹随检查点分片持久化，Controller 将结果和观察原子提交，沿用既有权限、CAS、租约、取消、幂等和质量门禁。
+- 验证：新增上下文边界与真实 SQLite 事务恢复测试；相关新测试及耐久恢复 47 passed。最终全量 1492 passed、716 warnings（21.13s）；使用 DASHSCOPE_API_KEY=unit-test-placeholder、RETRIEVAL_EMBEDDING_URL=https://example.invalid/embedding、RETRIEVAL_RERANK_URL=https://example.invalid/rerank 的测试配置，远程模型均模拟。原始 HEAD 的混合检索测试在空配置下同样 12 failed、6 passed；未修改无关检索代码或用例。新模块及改动的 LLM 服务 Ruff F 检查通过，git diff --check 通过。
+- 收敛审查：主循环只有一条；主控直接管理自身稳定前缀，专业 Agent 沿用角色适配；结果与观察同一事务，不增加重复执行分支；没有依赖实时模型的摘要器。保留集无法表达时显式停止，原始要求、引用与完整原始结果可回溯。非显然状态寿命和提交边界有中文 WHY，回归覆盖前缀、权限拒绝、工具配对、归档失败、大引用列表、约束超限和恢复时机。
+- 限制：Token 输入为 UTF-8 字节上界加消息开销的保守估算，并非提供商 tokenizer 实测；实际 usage 单独记录，窗口须配置为主备模型较小的可用值。L2 需要会话 Artifact Store，直接内存图执行达到该边界时明确阻断。历史观察/决策保留集继续增长时仍可能触发 L3。未运行真实 LLM/CNKI E2E，未测缓存命中率、成本、延迟或任务完成率，不宣称已实现推理引擎 KV Cache 或性能提升；PR 保持 Draft。
+
+## 2026-10-16 20:20:16 +08:00 — PR #1 本地复核：Sidecar 停止语义与离线测试隔离
+
+- 修改文件：app/agent/sidecar.py、tests/test_action_sidecar.py、tests/test_hybrid_retrieval_integration.py、docs/book-guided-agent-harness.md、docs/change-log.md。
+- 根因：Sidecar 的通用异常兜底把执行控制异常降级成人工确认；混合检索集成夹具仍依赖开发机 .env 的模型端点和密钥，干净检出出现 12 项配置失败。
+- 行为变化：通过既有 is_control_exception 边界原样透传预算、取消、失权、账本冲突与 provider 不可用异常；普通审查故障继续 fail-closed。混合检索夹具固定占位配置，精化夹具继承同一基础配置，不修改生产准入。
+- 测试：新增 10 项回归在修复前全部失败，修复后通过；Sidecar/混合检索定向 31 passed；干净工作区全量 1502 passed、11 项第三方弃用警告（43.24s），JUnit failures=0/errors=0；改动 Python 文件 Ruff F 与 git diff --check 通过。
+- 收敛复核：仅保留既有控制异常分类器的最小透传，确认普通故障仍需人工确认、受审查动作不执行；测试验证异常身份、主循环终态和未执行/未生成澄清，未引入绕过、重载或临时 fallback。
+- 边界：本次为模拟客户端/LLM 的本地离线回归；未执行真实 CNKI/学术 API/LLM E2E，也未证明真实缓存命中率或性能收益。
+
+## 2026-10-16 20:24:21 +08:00 — PR #2 本地复核与 PR #1 组合合并验证
+
+- 修改文件：app/clients/arxiv_client.py、tests/test_retrieval_failure_policy.py、docs/retrieval-failure-policy.md、docs/book-guided-agent-harness.md、docs/change-log.md；同时集成 PR #1 已验证提交及其文档、配置与测试。
+- 根因：arXiv 把请求失败与成功空结果同样返回 []，认证/网络失败后又以松散查询重新启动请求；令牌等待超时使用普通 RequestException，丢失限流错误码。两个 PR 各自追加的变更日志存在合并冲突。
+- 行为变化：仅成功空短语检索可回退松散查询；失败保留其原始分类及有限重试次数。令牌等待超时同时保留 RequestException 兼容性和 RATE_LIMIT_WAIT_TIMEOUT 分类，禁止未获令牌的请求。合并保留两个分支全部日志，修正文档 Markdown 硬换行以通过空白检查。
+- 验证：原 PR #2 定向 98 passed；新增 8 项 arXiv 回归（首批 6 项在修复前 4 failed、2 passed）；检索修复定向 104 passed，随后新增超时/连接失败上限回归并集成 PR #1。组合定向 184 passed（20.59s），组合全量 1568 passed（49.37s），均有 11 项第三方弃用警告，JUnit failures=0/errors=0/skipped=0。受检改动模块 Ruff F、git diff --check 通过。
+- 收敛复核：停止语义沿用既有执行控制和客户端错误分类，不添加新调度器或重复重试路径；成功空检索继续允许查询回退，既有 RequestException 捕获保持有效。失败/空结果区别和异常兼容约束附中文 WHY。用例验证从真实搜索入口得到的诊断、请求次数与零令牌时不发送请求，未修改引用、证据、质量门禁。
+- 边界：干净独立工作区、无真实凭据，HTTP/LLM/浏览器调用由测试模拟；未运行真实学术 API/CNKI/LLM E2E、缓存成本或延迟评测。原主工作区暂存内容未进入 PR 提交。

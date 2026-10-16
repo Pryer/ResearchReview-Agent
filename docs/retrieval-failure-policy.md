@@ -28,6 +28,11 @@
 未找到返回。其他 4xx 不盲目重试。网络故障与 5xx 的重试仍受动作执行期、
 源级熔断和每次 HTTP 超时约束。
 
+arXiv 仅在短语请求成功但结果为空时尝试松散查询。认证、网络、限流等失败
+不会通过改写查询再次启动请求预算。令牌等待超时保留独立的
+`RATE_LIMIT_WAIT_TIMEOUT` 分类；其异常仍兼容既有 `requests.RequestException`
+捕获边界，不会发送未获令牌的请求。
+
 ## 并发停止与部分成功
 
 `search_papers` 的检索取消作用域通过原有 `submit_with_context` 传播。
