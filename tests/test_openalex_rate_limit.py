@@ -146,7 +146,8 @@ def test_huge_retry_after_is_honored_without_blocking(monkeypatch, caplog):
         assert openalex_client.search_openalex("q", 2024, 2026) == []
 
     remaining = openalex_client._cooldown_remaining()
-    assert 41550.0 < remaining <= 41559.0
+    # WHY: monotonic 加上冷却时长再相减会产生浮点舍入；只允许纳秒级误差，不改变服务端期限。
+    assert 41550.0 < remaining <= 41559.0 + 1e-8
     assert any("exceeds cooldown ceiling" in r.message for r in caplog.records)
 
 

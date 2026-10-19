@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+from uuid import uuid4
 from typing import Any
 
 from app.core.config import get_settings
@@ -11,6 +12,25 @@ from app.core.config import get_settings
 
 class ContextBudgetExceeded(ValueError):
     pass
+
+
+def is_failure(item):
+    return bool(item.get("error") or item.get("status") in {"failed", "rejected", "blocked", "deny", "escalate"}
+                or item.get("outcome") in {"blocked", "degraded"})
+
+
+def working_memory(records, settings):
+    latest = {item.get("action"): i for i, item in enumerate(records)}
+    failures = [i for i in latest.values() if is_failure(records[i])]
+    pinned = set(sorted(failures, reverse=True)[:settings.agent_context_failure_items])
+    priority = sorted(pinned, reverse=True) + [i for i in range(len(records)-1, -1, -1) if i not in pinned]
+    selected = set()
+    for i in priority:
+        candidate = [records[j] for j in sorted(selected | {i})]
+        if len(candidate) <= settings.agent_context_memory_items and len(encode(candidate)) <= settings.agent_context_memory_chars:
+            selected.add(i)
+    return [copy.deepcopy(records[i]) for i in sorted(selected)], {
+        records[i].get("sequence") for i in pinned if i in selected}
 
 
 def encode(value: Any) -> str:
@@ -25,7 +45,8 @@ def estimate_tokens(messages: list[dict], tools: list[dict]) -> int:
     )
 
 
-def archive_payload(state: dict, kind: str, payload: dict) -> list[str]:
+def archive_payload(state: dict, kind: str, payload: dict, *, scope_id: str | None = None,
+                    observation_sequence: int | None = None, operation: str | None = None) -> list[str]:
     from app.services.research_execution_service import artifact_store
 
     store = artifact_store()
@@ -46,7 +67,8 @@ def archive_payload(state: dict, kind: str, payload: dict) -> list[str]:
         index = store.persist_payload(
             session_id=str(state["session_id"]),
             artifact_type="context_archive_index",
-            payload={"fragments": refs, "artifact_type": kind, "encoding": "json"},
+            payload={"fragments": refs, "artifact_type": kind, "encoding": "json", "scope_id": scope_id,
+                     "observation_sequence": observation_sequence, "operation": operation},
         )
         store.repo.db.flush()
         return [index]
@@ -75,6 +97,9 @@ class ReActContext:
         )
         if self.data.get("version") != 1:
             raise ContextBudgetExceeded("unsupported_trajectory_version")
+        self.data.setdefault("scope_id", uuid4().hex)
+        # WHY: 旧检查点的 memory 是全历史，长度可用于一次性迁移；之后累计序号不随裁剪回退。
+        self.data.setdefault("observation_count", len(self.data["memory"]))
 
     @property
     def container(self) -> dict:
@@ -122,11 +147,13 @@ class ReActContext:
         before = estimate_tokens(messages, tools)
         due = before + reserve >= int(window * threshold) and (
             not self.data["epoch"]
-            or len(self.data["memory"]) - self.data.get("last_compacted_turn", 0)
+            or self.data["observation_count"] - self.data.get("last_compacted_turn", 0)
             > max(0, int(settings.agent_context_recent_turns))
         )
-        if (due or before + reserve > window) and self.data["memory"]:
-            self._compact(status)
+        memory_over = (len(self.data["memory"]) > settings.agent_context_memory_items
+                       or len(encode(self.data["memory"])) > settings.agent_context_memory_chars)
+        if (due or before + reserve > window or memory_over) and self.data["memory"]:
+            self._compact(status, input_budget=window - reserve, system=system, tools=tools)
             messages = build()
         estimate = estimate_tokens(messages, tools)
         self.container["agent_context_usage"] = {
@@ -142,44 +169,53 @@ class ReActContext:
         self.data["messages"].append(status_message)
         return messages
 
-    def _compact(self, status: dict) -> None:
+    def _compact(self, status: dict, *, input_budget: int | None = None,
+                 system: str = "", tools: list[dict] | None = None) -> None:
         data = self.data
+        if data.get("pending"):
+            raise ContextBudgetExceeded("cannot_compact_pending_tool_call")
         refs = archive_payload(
             self.state,
             "context_epoch",
             {
                 "epoch": data["epoch"],
                 "messages": data["messages"],
+                "memory": data["memory"],
+                "goals": data["goals"],
+                "observation_count": data["observation_count"],
                 "previous_archive_refs": data["archive_refs"],
             },
+            scope_id=data["scope_id"],
         )
-        # WHY: 只按完整 assistant/result 交互边界保留尾部；不截断 tool_call_id 配对。
-        ends = [
-            i + 1
-            for i, item in enumerate(data["messages"])
-            if item["role"] == "tool" or (item["role"] == "user" and "observation" in _object(item))
-        ]
-        keep = max(0, int(get_settings().agent_context_recent_turns))
-        start = ends[-keep - 1] if keep and len(ends) > keep else 0
-        recent = data["messages"][start : ends[-1]] if keep and ends else []
-        # Drop status-only material before the first retained decision.
-        first = next(
-            (i for i, item in enumerate(recent) if item["role"] == "assistant"), len(recent)
-        )
-        recent = recent[first:]
-        summary = {
-            key: status[key] for key in ("state", "key_evidence", "decisions", "open_questions")
-        }
-        summary["observations"] = copy.deepcopy(data["memory"])
+        settings = get_settings()
+        # WHY: 少量尚未被同动作成功观察取代的失败经验优先于纯时间顺序；仍不能挤掉硬约束。
+        retained, pinned = working_memory(data["memory"], settings)
+        # WHY: 最新门禁/证据在紧随其后的 Status Bar 中重建，不在 checkpoint 再复制一整份动态状态。
+        summary = {}
+        summary["observation_count"] = data["observation_count"]
+        summary["history_recall"] = "recall_context(evidence_id)"
         summary["archive_refs"] = refs
-        data["messages"] = [
-            *[{"role": "user", "content": encode({"goal": goal})} for goal in data["goals"]],
-            {"role": "user", "content": encode({"context_checkpoint": summary})},
-            *copy.deepcopy(recent),
-        ]
+        # WHY: 新 Epoch 用结构化动作/观察重建，不重放旧 assistant/tool/reasoning_content。
+        # 同一 Epoch 内仍原样保留真实工具调用与 Provider 必需的协议字段。
+        latest_goal = copy.deepcopy(status.get("goal") or (data["goals"][-1] if data["goals"] else {}))
+        def rebuild():
+            summary["observations"] = copy.deepcopy(retained)
+            return [{"role": "user", "content": encode({"goal": latest_goal})},
+                    {"role": "user", "content": encode({"context_checkpoint": summary})}]
+        messages = rebuild()
+        while retained and input_budget is not None and estimate_tokens([
+            {"role": "system", "content": system}, *messages,
+            {"role": "user", "content": encode(status)},
+        ], tools or []) > input_budget:
+            removable = next((i for i, item in enumerate(retained) if item.get("sequence") not in pinned), 0)
+            retained.pop(removable)
+            messages = rebuild()
+        data["messages"] = messages
+        data["goals"] = [latest_goal]
+        data["memory"] = retained
         data["archive_refs"] = refs
         data["epoch"] += 1
-        data["last_compacted_turn"] = len(data["memory"])
+        data["last_compacted_turn"] = data["observation_count"]
 
     def proposed(self, decision, *, assistant_message: dict | None = None) -> None:
         if self.data.get("pending"):
@@ -231,14 +267,13 @@ class ReActContext:
             return
         settings = get_settings()
         limit = max(1024, int(settings.agent_context_tool_result_chars))
-        raw = encode(payload)
         refs = []
-        if len(raw) > limit:
-            # 原始任务结果也留在权威 state；有持久化存储时额外给出不可变引用。
-            from app.services.research_execution_service import artifact_store
+        # WHY: 小观察也要保存完整载荷；工作摘要被裁剪后，原始字段仍可审计回查。
+        from app.services.research_execution_service import artifact_store
 
-            if artifact_store() is not None and self.state.get("session_id"):
-                refs = archive_payload(self.state, "tool_observation", payload)
+        if artifact_store() is not None and self.state.get("session_id"):
+            refs = archive_payload(self.state, "tool_observation", payload, scope_id=self.data["scope_id"],
+                                   observation_sequence=self.data["observation_count"] + 1, operation=pending["action"])
         feedback = {
             "action": pending["action"],
             "status": payload.get("status", "unknown"),
@@ -249,6 +284,12 @@ class ReActContext:
             "output_artifact_refs": payload.get("output_artifact_refs") or [],
             "artifact_refs": refs,
         }
+        if payload.get("history") is not None:
+            feedback["history"] = payload["history"]
+        if payload.get("research_memory") is not None:
+            feedback["research_memory"] = payload["research_memory"]
+        if payload.get("delegation_status") is not None:
+            feedback["delegation_status"] = payload["delegation_status"]
         visible = encode(feedback)
         if len(visible) > limit and refs:
             # WHY: 全量引用保留在归档中，不能截断 JSON 或让大引用数组挤掉执行反馈。
@@ -271,15 +312,30 @@ class ReActContext:
             else {"role": "user", "content": encode({"observation": json.loads(visible)})}
         )
         self.data["messages"].append(message)
-        self.data["memory"].append({**feedback, "decision": copy.deepcopy(pending["decision"])})
+        self.data["observation_count"] += 1
+        self.data["memory"].append({**feedback, "sequence": self.data["observation_count"],
+                                    "decision": copy.deepcopy(pending["decision"])})
         self.data.pop("pending")
+        from app.services.research_memory_retrieval import record_failure
+        record_failure(self.state, self, self.data["memory"][-1])
 
 
-def _object(message: dict) -> dict:
+def execute_context_recall(trajectory: ReActContext, arguments: dict) -> dict:
+    from app.services.context_history_service import recall_history
+    from app.agent.execution_budget import is_control_exception
+    from app.services.durable_execution_service import active_runtime
     try:
-        return json.loads(message.get("content") or "{}")
-    except (ValueError, TypeError):
-        return {}
+        payload = recall_history(trajectory.state, trajectory, **arguments)
+    except Exception as exc:
+        if is_control_exception(exc):
+            raise
+        payload = {"status": "failed", "outcome": "blocked", "error": "context_recall_failed:" + type(exc).__name__}
+        trajectory.state.setdefault("errors", []).append({"code": "context_recall_failed", "message": type(exc).__name__})
+    trajectory.observe(payload)
+    runtime = active_runtime()
+    if runtime:
+        runtime.snapshot(trajectory.state, ledger=trajectory.state.get("agent_execution_budget") or {})
+    return payload
 
 
 def record_tool_observation(state: dict, payload: dict) -> None:

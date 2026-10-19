@@ -8,6 +8,13 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+class MemoryFeedback(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    memory_id: str = Field(min_length=1, max_length=64)
+    disposition: Literal["used", "irrelevant", "outdated"]
+    reason: str = Field(min_length=1, max_length=240)
+
+
 class AgentDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -19,6 +26,7 @@ class AgentDecision(BaseModel):
     transport: Literal["native_tool", "json"] = "json"
     tool_call_id: str | None = None
     usage: dict[str, int] = Field(default_factory=dict)
+    memory_feedback: list[MemoryFeedback] = Field(default_factory=list, max_length=5)
 
     @field_validator("evidence_refs")
     @classmethod

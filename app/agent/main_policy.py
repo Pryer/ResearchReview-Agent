@@ -10,7 +10,7 @@ from app.agent.action_registry import ACTION_REGISTRY, tool_schemas, validate_ar
 from app.agent.react_context import ContextBudgetExceeded, ReActContext, encode
 from app.core.exceptions import NativeToolsUnsupportedError
 from app.prompt.agent_system import MAIN_AGENT_SYSTEM_PROMPT
-from app.schemas.agent_decision_schema import AgentDecision
+from app.schemas.agent_decision_schema import AgentDecision, MemoryFeedback
 from app.schemas.context_schema import MainAgentContext
 
 
@@ -29,7 +29,15 @@ class MainAgentPolicy:
         self.tools = copy.deepcopy(tools if tools is not None else tool_schemas(sorted(ACTION_REGISTRY)))
         self.delegation_messages = delegation_messages
         if delegation_messages:
+            feedback_schema = MemoryFeedback.model_json_schema()
+            # WHY: 同一元数据契约随每个工具发送，省去展示标题/重复说明以免静态目录挤占轨迹预算。
+            feedback_schema.pop("title", None)
+            for field in feedback_schema["properties"].values():
+                field.pop("title", None)
             for tool in self.tools:
+                tool["function"]["parameters"]["properties"]["memory_feedback"] = {
+                    "type": "array", "maxItems": 5, "items": copy.deepcopy(feedback_schema),
+                }
                 spec = ACTION_REGISTRY.get(tool["function"]["name"])
                 if spec and spec.role:
                     tool["function"]["parameters"]["properties"]["delegation_message"] = {
@@ -89,6 +97,11 @@ class MainAgentPolicy:
                         getattr(self.llm, "last_usage", {}) or {}
                     )
                     decision = AgentDecision.model_validate_json(content)
+                if self.delegation_messages and "memory_feedback" in decision.arguments:
+                    arguments = dict(decision.arguments)
+                    feedback = arguments.pop("memory_feedback")
+                    decision = AgentDecision.model_validate({**decision.model_dump(), "arguments": arguments,
+                                                              "memory_feedback": feedback})
                 if self.delegation_messages and decision.action in ACTION_REGISTRY and ACTION_REGISTRY[decision.action].role:
                     arguments = dict(decision.arguments)
                     message = arguments.pop("delegation_message", None)
@@ -104,6 +117,9 @@ class MainAgentPolicy:
                         f"action {decision.action!r} is not allowed in current state"
                     )
                 self.argument_validator(decision.action, decision.arguments)
+                memory_ids = {item["memory_id"] for item in context.state.research_memory}
+                if any(item.memory_id not in memory_ids for item in decision.memory_feedback):
+                    raise AgentDecisionError("memory feedback references an item not presented in the current context")
                 known_refs = {ref for item in context.key_evidence for ref in item.source_refs}
                 if not set(decision.evidence_refs).issubset(known_refs):
                     raise AgentDecisionError(

@@ -1339,6 +1339,7 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
             "agent_task_results",
             "main_agent_trajectory", "agent_context_usage", "agent_context_last_usage",
             "subagent_sessions", "active_subagent",
+            "research_memory_artifact_ref", "research_memory_context", "research_memory_status", "research_memory_pending_feedback",
             "agent_orchestration_mode", "agent_operation_mode", "state_revision",
             "agent_mandatory_actions",
             "agent_execution_budget", "result_status", "clarification", "user_clarifications",

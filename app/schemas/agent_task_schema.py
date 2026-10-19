@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -56,6 +56,8 @@ class AgentTaskResult(BaseModel):
     operation: str
     status: AgentTaskStatus
     outcome: AgentTaskOutcome = AgentTaskOutcome.UNKNOWN
+    # WHY: 生命周期完成、业务结果、与主控通信状态是三个不同维度；旧记录默认 None。
+    delegation_status: Literal["completed", "needs_help", "blocked"] | None = None
     findings: list[str] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
     proposed_decisions: list[dict[str, Any]] = Field(default_factory=list)

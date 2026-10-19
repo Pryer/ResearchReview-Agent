@@ -1,4 +1,4 @@
-"""从权威研究状态构建主 Agent 的五字段工作视图。"""
+"""从权威研究状态构建最新 Agent Status Bar，与追加式 ReAct Trajectory 分离。"""
 
 from __future__ import annotations
 
@@ -230,6 +230,11 @@ def _agent_state(state: dict[str, Any]) -> AgentStateContext:
         allowed_actions=list(dict.fromkeys(item for item in allowed if item))[:16],
         completed_actions=list(dict.fromkeys(item for item in completed if item))[-10:],
         recent_trajectory=recent,
+        research_memory=list((state.get("research_memory_context") or {}).get("matches") or []),
+        memory_retrieval={**dict(state.get("research_memory_status") or {}), **{
+            key: value for key, value in (state.get("research_memory_context") or {}).items()
+            if key in {"query", "kind", "cursor", "current_cursor", "search_complete", "result_limited"}
+        }},
         agent_messages=[
             {key: message[key] for key in ("sender", "recipient", "kind", "content", "suggested_actions")}
             for session in (state.get("subagent_sessions") or {}).values()

@@ -50,8 +50,9 @@ write_deliverable.py -> deliverables/renderers path.
 Cross-layer data uses Pydantic models where a schema exists. Metadata is authoritative
 from retrieval/verification layers; LLM output cannot overwrite provenance fields.
 
-The full `ResearchAgentState` is the authoritative workflow record. The main Agent
-receives a rebuildable `MainAgentContext` containing only `goal`, `state`,
+The full `ResearchAgentState` is the authoritative workflow record. The model
+request combines Stable Prefix, ReAct Trajectory and an Agent Status Bar. The
+rebuildable `MainAgentContext` is the Status Bar payload, containing `goal`, `state`,
 `key_evidence`, `decisions`, and `open_questions`. Specialist tasks use versioned
 operation-level allowlists and typed patches; they cannot change user goals, hard
 constraints or the shared budget. See [context architecture](agent-context-architecture.md).
@@ -72,6 +73,24 @@ completed operations, round count and six recent messages with the main Agent.
 Other roles' private trajectories are not included. The main Agent receives bounded
 structured reports and can reply through a new delegation; native tools carry an
 optional `delegation_message` that is extracted before research argument validation.
+
+Compaction archives complete observations and bounds the working ledger by item,
+character and actual window limits. New epochs rebuild provider-neutral semantic
+history; native reasoning/tool protocol stays intact only within its epoch.
+`recall_context` searches the current trajectory's reachable archives by evidence
+ID/reference and marks incomplete scans. A new delegation is rejected while another
+is active; current role namespaces are serial session memory, not concurrent worker
+isolation. `status`, `outcome` and `delegation_status` distinguish lifecycle,
+business result and communication state; the main Agent explicitly consumes them.
+
+Research memory has a separate query-driven loop: the main Agent chooses
+`search_research_memory`, the service resolves the session summary and ranks related
+findings, active decisions, open questions and failure events, then bounded results
+enter `state.research_memory`. Explicit `memory_feedback` and subsequent action
+outcomes are appended as audit events. This is same-session lexical retrieval, not
+cross-session/vector search. Historical findings require revalidation; only the latest
+summary supplies decisions and questions. Memory cannot authorize current evidence.
+See the [retrieval contract](agent-context-architecture.md#research-memory-retrieval-loop).
 
 Delegation is synchronous. Per-delegation round/no-progress limits are separate,
 while token, action, retrieval, deadline, cancellation and lease checks share the
@@ -116,8 +135,8 @@ See [runtime and cache boundaries](agent-runtime-and-cache.md).
 - Validation evidence: [2026-09-22 report](validation/2026-09-22-runtime-cache.md).
   The real 3-paper commit/recovery smoke passed; the 40-reference deliverable remained
   budget-blocked, so it is not recorded as a completed end-to-end review.
-- Latest local specialist-loop regression (2026-10-16): 1,591 full-suite tests and
-  100 targeted tests passed, with 23 new specialist-loop cases. External calls were
+- Latest local context-reliability regression (2026-10-16): 1,610 full-suite tests and
+  119 targeted tests passed, with 19 new compaction/recall/outcome cases. External calls were
   mocked; no new live CNKI/LLM end-to-end or cost/performance result was established.
 
 The root ARCHITECTURE.md remains a detailed operational reference. This document is

@@ -114,10 +114,10 @@ ResearchReview-Agent/
 主控每轮选择一个任务，子 Agent 在本角色内多轮决策并汇报；无 LangGraph 依赖。
 节点函数在 `app/agent/nodes/`，原子能力在 `app/tools/`。
 
-主 Agent 基于五字段上下文每轮选择一个已注册动作；动作权限、预算、取消、提交
+主 Agent 基于 Stable Prefix、ReAct Trajectory 与最新 Agent Status Bar 每轮选择一个已注册动作；动作权限、预算、取消、提交
 版本与质量门禁仍由确定性代码裁决。历史会话（未记录模式或标记为 `legacy` 的旧
 状态）在执行入口规范为同一调度：保留原研究目标、显式约束、论文与证据卡、恢复
-历史与预算消耗，只重算与旧调度或旧证据版本绑定的派生结果。模型可见动态上下文只包含 `goal`、
+历史与预算消耗，只重算与旧调度或旧证据版本绑定的派生结果。Agent Status Bar 载荷包含 `goal`、
 `state`、`key_evidence`、`decisions`、`open_questions`；完整论文、证据和历史保留在
 权威状态与会话级 artifact 中。检索、分析和写作阶段通过带输入指纹的专业 Agent
 任务契约按动作白名单投影输入，再在隔离工作副本中执行；输出键、字段删除和类型
@@ -127,6 +127,19 @@ ResearchReview-Agent/
 汇报完成、请求协助或报告阻断；主控可通过 `delegation_message` 回复并再次委派。
 独立循环同步执行，共享研究数据和总预算；具体状态、恢复和权限边界见
 [上下文架构](docs/agent-context-architecture.md#independent-specialist-react-loops)。
+
+Compaction 将完整观察归档，工作记忆按条数、字符和实际窗口预算限制；Epoch 切换
+后以结构化决策/观察重建历史，不重放旧原生工具与思考协议。可按证据 ID/引用调用
+`recall_context` 回查本轨迹归档。当前只支持串行活动委派，新任务不得复用尚未结束
+的活动上下文；执行结束、业务结果与汇报状态分别由 `status`、`outcome`、
+`delegation_status` 表达，主控显式处理后两者，最终交付继续经过质量门禁。
+
+研究记忆通过 `research_memory_artifact_ref` 定位会话摘要。主控根据任务主动调用
+`search_research_memory`，查询结果有界注入 Status Bar 的 `state.research_memory`，
+再以 `memory_feedback` 和动作结果事件形成使用反馈。检索采用确定性中英文词项匹配，
+限当前会话；旧摘要只提供历史发现，决定/问题必须仍在最新摘要中有效。历史记录不授予
+当前证据权限，不能绕过补检索、主张验证和交付门禁。详见
+[研究记忆检索闭环](docs/agent-context-architecture.md#research-memory-retrieval-loop)。
 
 ### 3.1 autonomous 控制循环
 
@@ -230,8 +243,8 @@ pytest tests/
 [上下文架构](docs/agent-context-architecture.md)，CAS、预算和恢复细节见
 [运行机制](docs/agent-runtime-and-cache.md)。
 
-2026-10-16 独立子循环改造的全量本地回归为 1591 项通过，相关定向回归 100 项通过，
-其中新增 23 项子循环行为测试；外部调用均使用 Mock，本轮未运行真实服务全链路，
+2026-10-16 上下文可靠性修复的全量本地回归为 1610 项通过，相关定向回归 119 项通过，
+本次新增 19 项压缩/回查/结果消费测试，此前 23 项子循环测试继续覆盖；外部调用均使用 Mock，本轮未运行真实服务全链路，
 未测量额外模型调用的成本、性能或研究质量收益。
 
 历史真实服务验收：2026-09-22 全量回归为 1224 项通过；真实备用 LLM + CNKI 3 篇检索、

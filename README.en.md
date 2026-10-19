@@ -10,7 +10,7 @@ ResearchReview-Agent interprets research constraints and topic ambiguity from na
 
 - **Research request understanding:** Extracts topics, years, reference counts, scope, and deliverable types with LLM-assisted semantic parsing and deterministic validation.
 - **Multi-turn research sessions:** Persists clarifications, paper collections, generation versions, and revision history; papers can be excluded by stable ID, title, or natural-language instruction.
-- **Five-field main agent:** Each round selects one registered action from the goal, state, key evidence, decisions, and open questions.
+- **Context management:** Stable Prefix, ReAct Trajectory, Agent Status Bar and bounded Compaction support main/specialist decisions.
 - **Controlled specialist tasks:** The controller projects action inputs and validates authorization, types, identities, versions, budgets, and evidence before committing results.
 - **Independent specialist loops:** Search, Analysis and Writing retain separate ReAct contexts across delegations, choose multiple authorized actions, and exchange structured task, progress, help and completion messages with the main Agent. Delegation is synchronous; global budgets and final quality gates remain authoritative.
 - **Background task control:** Long-running jobs expose progress and support cooperative cancellation at node boundaries.
@@ -40,7 +40,13 @@ User request -> scope understanding -> main-agent task delegation
 Deliverable request -> deterministic quality gates -> complete / degraded / blocked
 ```
 
-The model context is intentionally limited to `goal`, `state`, `key_evidence`, `decisions`, and `open_questions`. Full papers, evidence, and history remain in authoritative state and database records. See [ARCHITECTURE.md](ARCHITECTURE.md) and [runtime, recovery, and cache notes](docs/agent-runtime-and-cache.md).
+The model request combines Stable Prefix, ReAct Trajectory and the latest Agent Status Bar. The status payload uses `goal`, `state`, `key_evidence`, `decisions`, and `open_questions`; it is one part of the overall context. Full papers, evidence, and history remain in authoritative state and database records. See [ARCHITECTURE.md](ARCHITECTURE.md) and [runtime, recovery, and cache notes](docs/agent-runtime-and-cache.md).
+
+Compaction archives full observations and retains at most 8 observation/decision records and 8,000 serialized characters, trimming further to fit the input window. A new epoch uses provider-neutral structured history instead of replaying old native calls or reasoning fields. Within an epoch, original tool protocol is preserved. `recall_context` retrieves bounded history by evidence ID/reference; incomplete scans are marked explicitly and history cannot authorize current evidence.
+
+The main Agent can choose `search_research_memory(query, kind, limit)` to retrieve findings, active decisions, open questions and failure experience from the current session. The service uses English terms and Chinese bigrams, returning at most three records and 1,600 serialized characters into `state.research_memory`. Older summaries contribute findings only; invalidated decisions and resolved questions cannot return. Optional `memory_feedback` distinguishes used, irrelevant and outdated items, with subsequent action outcomes recorded separately. Without feedback, records are only reported as presented. There is no cross-session or vector memory search. Compaction prioritizes up to two failures without a later successful observation for the same action, within the existing total memory budget.
+
+Only one delegation may be active. A new task cannot implicitly reuse an active role trajectory; recovery explicitly resumes the existing task. `status` describes execution lifecycle, `outcome` the business result, and `delegation_status` the completion/help/block report. The main Agent explicitly consumes these dimensions before continuing.
 
 Each specialist retains its own trajectory, communication history, usage estimates and compaction epochs across delegations and checkpoints. The latest status includes the delegated objective, fixed arguments, evidence references, completed operations and six recent messages with the main agent. Delegation is synchronous. All loops share the session budget; a specialist's completion report does not authorize final delivery.
 
@@ -165,7 +171,7 @@ pytest
 
 The repository uses mocked external LLM and retrieval boundaries for deterministic tests. Real CNKI, external LLM, and live end-to-end runs require local credentials and are not part of the default test suite.
 
-The 2026-10-16 specialist-loop change passed **1,591 tests** in the full local suite and **100 targeted tests**, including 23 new specialist-loop cases. These results do not establish live-provider end-to-end completion, cost savings or latency improvements.
+The 2026-10-18 research-memory retrieval changes passed **1,628 tests** in the full local suite and **170 targeted tests**, with 18 new retrieval, feedback, invalidation and permission cases. The earlier 19 context-reliability and 23 specialist-loop cases remain covered. These results do not establish live-provider end-to-end completion, cost savings or latency improvements.
 
 ## Project structure
 

@@ -14,7 +14,8 @@
 |------|------|
 | 研究请求理解 | LLM开放语义解析 + 规则校验，抽取主题、年份、篇数、范围与四类交付物 |
 | 多轮研究会话 | 保存澄清、论文集合、生成版本和修订历史；支持按序号/标题排除论文 |
-| 五字段主 Agent | 基于目标、状态、关键证据、决定和未决问题，每轮选择一个注册动作 |
+| 上下文管理 | Stable Prefix、ReAct Trajectory、Agent Status Bar 与有界 Compaction 支撑主从决策 |
+| 研究记忆检索 | 主控按任务查询当前会话的历史摘要和失败经验，有界注入上下文，记录采用反馈与后续结果 |
 | 独立子 Agent 循环 | Search / Analysis / Writing 各自持有跨委派上下文，多轮决策并与主控结构化通信 |
 | 专业任务边界 | Controller 按动作投影输入，校验输出白名单、类型、身份与版本后提交 |
 | 后台任务控制 | 长任务异步执行，可查询步骤与进度，并在节点边界协作式取消 |
@@ -46,8 +47,9 @@ arXiv ID 追踪证据，最终论文正文统一渲染为顺序编码或作者�
 取消、证据版本与质量门禁由确定性代码裁决。历史会话（含未记录模式或标记为
 `legacy` 的旧状态）在恢复入口统一规范为这套调度；原研究目标、显式约束、论文
 与证据卡、恢复历史与预算消耗全部保留，只重算与旧调度绑定的派生结果。
-主 Agent 的模型输入只包含 `goal`、`state`、`key_evidence`、
-`decisions`、`open_questions`，完整论文、证据和历史保存在权威状态与数据库资料中。
+主 Agent 和子 Agent 的请求由 Stable Prefix、ReAct Trajectory 和最新 Agent Status Bar
+组成。状态栏沿用 `goal`、`state`、`key_evidence`、`decisions`、`open_questions`
+五字段载荷；完整论文、证据和历史保存在权威状态与数据库资料中。
 
 ```text
 用户请求 → 需求解析 → 构建五字段 → 主 Agent 委派任务
@@ -68,7 +70,18 @@ arXiv ID 追踪证据，最终论文正文统一渲染为顺序编码或作者�
 证据核验，不代表已经测得固定节费比例。模块说明见 [ARCHITECTURE.md](ARCHITECTURE.md)，
 事务与恢复边界见 [执行、恢复与缓存说明](docs/agent-runtime-and-cache.md)。
 主控消息在同一 Context Epoch 内追加用户要求、动作、执行观察和末尾状态栏；
-窗口预算接近阈值时归档历史，保留约束、证据引用及最近完整调用后开始新 Epoch。
+窗口预算接近阈值或工作记忆超限时归档完整历史，保留最新有效约束与有界观察摘要后
+开始新 Epoch；旧原生调用及 `reasoning_content` 不跨 Epoch 重放，同一 Epoch 内
+仍保留 Provider 必需的调用与思考协议字段。工作记忆默认最多 8 条、8000 字符，
+还会按实际输入预算缩减；当前门禁和证据由最新状态栏提供。
+可用 `recall_context` 按证据 ID 或来源引用回查自身归档观察。回查只提供历史信息，
+不授予当前证据权限；达到扫描或结果上限时会明确标记未完整扫描。
+Main Agent 可用 `search_research_memory(query, kind, limit)` 查询本会话的研究发现、
+有效决定、未决问题及失败经验，结果进入 `state.research_memory`，默认最多 3 条、
+1600 JSON 字符。LLM 选择查询，服务端按中英文词项匹配；旧摘要仅召回研究发现，
+失效决定和已解决问题不会复活。后续 `memory_feedback` 区分采用、无关和过期，
+事件记录关联后续动作结果；未反馈仅代表已呈现。当前没有跨会话或向量记忆检索。
+压缩优先保留最多 2 条尚未被同动作成功观察覆盖的失败记录，仍受总工作记忆预算限制。
 `AGENT_CONTEXT_WINDOW_TOKENS` 应设为主备模型可用窗口的较小值，默认 65536；
 输入采用保守估算，实际用量来自服务商 usage。轨迹压缩需要会话 Artifact Store，
 详细配置及边界见 [上下文架构](docs/agent-context-architecture.md#react-epochs-and-context-capacity)。
@@ -78,7 +91,10 @@ arXiv ID 追踪证据，最终论文正文统一渲染为顺序编码或作者�
 通过结构化进展、完成、协助请求和阻断消息反馈。它们按需持续决策到汇报或执行边界，
 当前采用同步委派，不启动后台常驻线程或并行写入共享研究状态。
 每次委派默认最多 12 轮决策，连续 3 次无进展时返回阻断报告；总 Token、动作、检索、
-截止时间和取消仍共用会话账本。子任务完成不能替代最终质量门禁。
+截止时间和取消仍共用会话账本。当前拒绝向活跃子循环叠加新委派，恢复必须显式续接
+已有委派；未开放同角色并发。`status=completed` 只代表执行生命周期结束，
+`outcome` 和 `delegation_status` 分别报告业务结果与完成/协助/阻断通信状态；
+主控会显式消费这些状态，子任务完成不能替代最终质量门禁。
 
 ---
 
@@ -245,8 +261,10 @@ conda activate rragent
 pytest
 ```
 
-2026-10-16 独立 Subagent ReAct 循环改造的本地全量回归为 **1591 项通过**，
-其中新增 23 项子循环行为测试；相关定向回归 100 项通过。外部学术 API、CNKI 和
+2026-10-18 研究记忆检索闭环完成后的本地全量回归为 **1628 项通过**，
+本次新增 18 项检索、反馈、失效与权限边界测试；相关定向回归 170 项通过。
+此前新增的 19 项有界压缩、归档回查和结果消费测试继续通过。
+此前独立子循环改造新增的 23 项测试继续通过。外部学术 API、CNKI 和
 LLM 在这些回归中使用 Mock；本轮未执行真实服务全链路，也未测量成本或性能收益。
 
 历史真实服务验收：2026-09-22 的全量回归为 1224 项通过；真实备用 LLM → CNKI
@@ -320,6 +338,10 @@ ResearchReview-Agent/
 | `AGENT_MAIN_MAX_ROUNDS` | 单次主 Agent 循环最大决策轮数 | `24` |
 | `AGENT_SUBAGENT_MAX_ROUNDS` | 单次子 Agent 委派的最大决策轮数，检查点恢复不重置 | `12` |
 | `AGENT_SUBAGENT_NO_PROGRESS_LIMIT` | 子 Agent 连续无实质进展的动作上限 | `3` |
+| `AGENT_CONTEXT_MEMORY_ITEMS` | 压缩后的观察/决策工作记忆条数上限 | `8` |
+| `AGENT_CONTEXT_MEMORY_CHARS` | 压缩后的工作记忆 JSON 字符上限；实际窗口不足时进一步缩减 | `8000` |
+| `AGENT_CONTEXT_FAILURE_ITEMS` | 工作摘要优先保留的未恢复失败记录上限，仍受总预算限制 | `2` |
+| `RESEARCH_MEMORY_CONTEXT_CHARS` | 检索结果 JSON 字符上限，另受单次工具反馈上限的一半约束 | `1600` |
 | `AGENT_EXECUTION_ACTION_BUDGET` | 会话累计专业动作预留上限 | `64` |
 | `AGENT_MAIN_TOKEN_BUDGET` | 主决策、解析、专业任务、重试及备用共享累计 token 上限 | `10000000` |
 | `AGENT_RETRIEVAL_BUDGET` | 累计检索轮次上限 | `64` |

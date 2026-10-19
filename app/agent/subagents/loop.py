@@ -11,7 +11,7 @@ from app.agent.action_registry import (
 from app.agent.context_builder import build_main_agent_context, _goal, _stable_hash, context_source_fingerprint
 from app.agent.execution_budget import check_execution, AgentExecutionCancelled
 from app.agent.main_policy import MainAgentPolicy, AgentDecisionError
-from app.agent.react_context import ReActContext
+from app.agent.react_context import ReActContext, execute_context_recall
 from app.agent.sidecar import ActionSidecar
 from app.core.config import get_settings
 from app.prompt.agent_system import SYSTEM_PROMPTS, SUBAGENT_REACT_PROMPT
@@ -77,6 +77,9 @@ class SubagentLoop:
 
     def run(self, state, *, decision=None, handlers, should_cancel=None,
             consume_mandatory_action=False, required_first=False):
+        # WHY: 当前共享研究状态只支持串行；新委派不能冒用已有角色活动轨迹，恢复必须 decision=None。
+        if decision is not None and state.get("active_subagent"):
+            raise AgentDecisionError("another delegation is active; resume it explicitly")
         try:
             return self._run(state, decision=decision, handlers=handlers, should_cancel=should_cancel,
                              consume_mandatory_action=consume_mandatory_action, required_first=required_first)
@@ -120,7 +123,7 @@ class SubagentLoop:
         names = [name for name, spec in ACTION_REGISTRY.items() if spec.role and spec.role.value == role]
         policy = MainAgentPolicy(
             self.llm, system_prompt=SYSTEM_PROMPTS[role] + SUBAGENT_REACT_PROMPT,
-            tools=tool_schemas(names) + [{"type": "function", "function": {
+            tools=tool_schemas([*names, "recall_context"]) + [{"type": "function", "function": {
                 "name": "report_to_main", "description": "向主控汇报子任务结果、请求协助或说明阻断",
                 "parameters": SubagentReport.model_json_schema(),
             }}], argument_validator=_validate, operation=role + "_agent_decision", delegation_messages=False,
@@ -154,6 +157,7 @@ class SubagentLoop:
             if active["required_first"] and required not in active["completed_operations"]:
                 available = [name for name in available if name == required]
             available.append("report_to_main")
+            available.append("recall_context")
             context = self._context(state, role, names, available)
             active["rounds"] += 1
             ledger = state.setdefault("agent_execution_budget", {})
@@ -163,6 +167,9 @@ class SubagentLoop:
             chosen = policy.decide(context, allowed_actions=available, trajectory=trajectory)
             check_execution()
             active = _session(state, role)["active"]
+            if chosen.action == "recall_context":
+                execute_context_recall(trajectory, chosen.arguments)
+                continue
             if chosen.action == "report_to_main":
                 report = SubagentReport.model_validate(chosen.arguments)
                 last = active.get("last_result") or {}
@@ -238,6 +245,7 @@ class SubagentLoop:
             status=AgentTaskStatus.COMPLETED,
             outcome=(AgentTaskOutcome((active.get("last_result") or {}).get("outcome", "unknown"))
                      if status == "completed" else AgentTaskOutcome.BLOCKED),
+            delegation_status=status,
             findings=[message], open_questions=[] if status == "completed" else [{
                 "category": status, "question": message, "suggested_actions": list(suggestions),
             }], input_state_fingerprint=active["source_fingerprint"],

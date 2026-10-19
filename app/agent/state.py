@@ -143,6 +143,9 @@ class ResearchAgentState(TypedDict, total=False):
     agent_execution_status: str
     allowed_agent_actions: List[str]
     research_memory_artifact_ref: str
+    research_memory_context: Dict[str, Any]
+    research_memory_status: Dict[str, Any]
+    research_memory_pending_feedback: Dict[str, Any]
     research_memory_migrated: bool
     research_memory_legacy_loss_unknown: bool
 

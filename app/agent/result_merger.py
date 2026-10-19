@@ -21,6 +21,7 @@ def merge_task_result(
         raise ValueError("task result identity mismatch")
     if result.input_state_fingerprint != task.source_state_fingerprint:
         raise ValueError("task result input fingerprint mismatch")
+    # WHY: 此处检查执行生命周期；业务阻塞的诊断/隔离补丁同样要提交，不能把 outcome 当作提交许可。
     if result.status != AgentTaskStatus.COMPLETED:
         raise StaleAgentResult("task did not complete")
     validate_patch(task.operation, result.state_patch, result.removed_state_fields)

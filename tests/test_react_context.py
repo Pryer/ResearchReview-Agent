@@ -193,8 +193,9 @@ def test_threshold_compaction_archives_history_and_keeps_constraints_refs_and_pa
     assert "禁止扩大时间范围" in encode(messages)
     archive = read_archive(store, trajectory.data["archive_refs"])
     assert archive["messages"] == old_messages
-    calls = [item for item in messages if item["role"] == "assistant"]
-    assert [item["tool_calls"][0]["id"] for item in calls] == ["c4", "c5"]
+    # Epoch 切换后的历史只保留结构化语义，不重放旧 Provider 的工具/思考协议。
+    assert not any(item["role"] in {"assistant", "tool"} for item in messages)
+    assert summary["observations"][-1]["decision"]["action"] == "search_and_rank"
     usage = current["agent_context_usage"]
     assert usage["estimated_input_tokens"] < usage["before_compaction_tokens"]
     # No repeated compaction merely because one new status bar was added.

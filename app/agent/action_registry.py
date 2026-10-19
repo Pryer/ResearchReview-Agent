@@ -49,6 +49,17 @@ _ACTION_SPECS = (
     ),
     ActionSpec("validate_result", "运行确定性的主张、引用和输出验证", AgentRole.ANALYSIS,
                required_fields=("review",), output_fields=("quality_gate", "claim_verification")),
+    ActionSpec("recall_context", "按证据 ID 或来源引用回查本 Agent 已归档观察；历史不授予当前证据权限", None,
+               parameters={"type": "object", "properties": {
+                   "evidence_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                   "limit": {"type": "integer", "minimum": 1, "maximum": 3},
+               }, "required": ["evidence_id"], "additionalProperties": False}),
+    ActionSpec("search_research_memory", "按当前任务查询本会话研究摘要和失败经验；结果不是当前证据授权", None,
+               parameters={"type": "object", "properties": {
+                   "query": {"type": "string", "minLength": 1, "maxLength": 600},
+                   "kind": {"type": "string", "enum": ["all", "finding", "decision", "question", "failure"]},
+                   "limit": {"type": "integer", "minimum": 1, "maximum": 3},
+               }, "required": ["query"], "additionalProperties": False}),
     ActionSpec(
         "request_clarification", "信息不足时向用户请求一个必要澄清", None,
         parameters={
@@ -85,7 +96,7 @@ def allowed_actions(
     mode = str(state.get("agent_operation_mode") or "initial")
     if mode == "verification_only":
         return [
-            name for name in ("validate_result", "request_finish", "report_blocked")
+            name for name in ("validate_result", "recall_context", "search_research_memory", "request_finish", "report_blocked")
             if name in ACTION_REGISTRY and (ACTION_REGISTRY[name].role is None or name in handlers)
         ]
     allowed: list[str] = []
@@ -192,10 +203,22 @@ def validate_arguments(name: str, arguments: dict[str, Any]) -> None:
     missing = set(schema.get("required") or []) - set(arguments)
     if missing:
         raise ValueError(f"missing arguments for {name}: {sorted(missing)}")
+    if name == "recall_context":
+        if not isinstance(arguments["evidence_id"], str) or not arguments["evidence_id"].strip() or len(arguments["evidence_id"]) > 256:
+            raise ValueError("evidence_id must contain 1 to 256 characters")
+        if "limit" in arguments and (type(arguments["limit"]) is not int or not 1 <= arguments["limit"] <= 3):
+            raise ValueError("history limit must be between 1 and 3")
+    if name == "search_research_memory":
+        if not isinstance(arguments["query"], str) or not arguments["query"].strip() or len(arguments["query"]) > 600:
+            raise ValueError("memory query must contain 1 to 600 characters")
+        if arguments.get("kind", "all") not in {"all", "finding", "decision", "question", "failure"}:
+            raise ValueError("unknown research memory kind")
+        if "limit" in arguments and (type(arguments["limit"]) is not int or not 1 <= arguments["limit"] <= 3):
+            raise ValueError("memory result limit must be between 1 and 3")
     if name == "rewrite_sections" and (not isinstance(arguments.get("section_ids"), list) or not arguments["section_ids"] or not all(
         isinstance(item, str) and item.strip() for item in arguments["section_ids"]
     )):
         raise ValueError("rewrite_sections.section_ids must contain strings")
-    for field in ("question", "reason"):
-        if field in schema.get("required", []) and (not isinstance(arguments.get(field), str) or not arguments[field].strip()):
-            raise ValueError(f"{field} must be a nonempty string")
+    for name in ("question", "reason"):
+        if name in schema.get("required", []) and (not isinstance(arguments.get(name), str) or not arguments[name].strip()):
+            raise ValueError(f"{name} must be a nonempty string")

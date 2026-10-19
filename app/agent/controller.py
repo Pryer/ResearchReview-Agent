@@ -150,7 +150,7 @@ class AgentController:
                     raise AgentExecutionCancelled("cached task cancelled")
                 cached = AgentTaskResult.model_validate(raw)
                 state["agent_execution_status"] = "completed"
-                _update_plan_status(state, operation, "completed")
+                _update_plan_status(state, operation, "blocked" if cached.outcome.value == "blocked" else "completed")
                 if consume_mandatory_action:
                     _consume_mandatory_action(state)
                     from app.services.durable_execution_service import active_runtime

@@ -1,7 +1,7 @@
-"""主 Agent 的最小工作上下文契约。
+"""Agent Status Bar 的结构化载荷契约。
 
-完整研究状态、原始文档和执行事件保存在外部状态/资料存储中。主 Agent
-只消费这里的五个字段，避免把整个 ``ResearchAgentState`` 重复塞进模型。
+Stable Prefix、ReAct Trajectory、状态栏及 Compaction 共同组成模型上下文。
+这里的五个字段只定义最新状态栏；完整资料和归档历史保存在外部存储中。
 """
 
 from __future__ import annotations
@@ -35,6 +35,8 @@ class AgentStateContext(StrictContextModel):
     recent_trajectory: list[dict[str, Any]] = Field(default_factory=list)
     delegation: dict[str, Any] = Field(default_factory=dict)
     agent_messages: list[dict[str, Any]] = Field(default_factory=list)
+    research_memory: list[dict[str, Any]] = Field(default_factory=list)
+    memory_retrieval: dict[str, Any] = Field(default_factory=dict)
     failure_reasons: list[str] = Field(default_factory=list)
     gate_status: dict[str, Any] = Field(default_factory=dict)
     artifact_summary: dict[str, int | bool | str | None] = Field(default_factory=dict)
@@ -74,7 +76,7 @@ class OpenQuestion(StrictContextModel):
 
 
 class MainAgentContext(StrictContextModel):
-    """模型可见的完整顶层结构；严格限制为五个字段。"""
+    """最新 Agent Status Bar；沿用五字段载荷，不代表整个模型上下文。"""
 
     goal: GoalContext = Field(default_factory=GoalContext)
     state: AgentStateContext = Field(default_factory=AgentStateContext)

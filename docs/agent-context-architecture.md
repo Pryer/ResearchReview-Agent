@@ -1,5 +1,11 @@
 # Agent Context Architecture
 
+The request has four cooperating parts: Stable Prefix (role and protocol rules),
+ReAct Trajectory (real decisions and observations), Agent Status Bar (latest
+authorized state), and Compaction (bounded working memory plus archival recall).
+The five-field `MainAgentContext` below is the Status Bar payload, not the entire
+model request.
+
 ResearchReview-Agent separates authoritative research state from the context shown
 to the main Agent. The authoritative `ResearchAgentState` retains retrieval data,
 paper cards, evidence spans, validation reports, drafts, checkpoints, and recovery
@@ -113,8 +119,18 @@ rejected. Each additional child action receives its own Controller permission,
 version and budget checks, plus Sidecar review when configured. A child's completion
 means that its operation executed, not that final review quality passed.
 
+`AgentTaskResult.status=completed` describes the execution lifecycle. `outcome`
+retains business success/degradation/blocking; `delegation_status` separately
+records the completed/help/block report. Main-loop consumption explicitly adds
+blocked, degraded, unknown or help outcomes to its next Status Bar's feedback,
+including restored delegations. It can replan rather than automatically ending the
+entire research job; finish requests still require the deterministic final gates.
+
 The implementation uses synchronous delegation, not background daemon workers or
 parallel shared-state mutation. Independent contexts survive multiple delegations.
+New delegation attempts are rejected before touching an active trajectory; recovery
+must explicitly resume the existing delegation. Per-delegation parallel worker
+isolation is not implemented or claimed by the current role namespaces.
 Each delegation has `AGENT_SUBAGENT_MAX_ROUNDS` (default 12) and
 `AGENT_SUBAGENT_NO_PROGRESS_LIMIT` (default 3); these counters survive checkpoints.
 All LLM calls, retries, retrievals and committed actions share the existing session
@@ -167,9 +183,10 @@ JSON mode uses assistant JSON decisions followed by explicitly marked user
 observations. Transport/provider changes can invalidate cache prefixes; DeepSeek
 private continuation fields are omitted for other providers.
 
-L1 projects immutable bounded observations (status, outcome, findings, errors,
-evidence and output references). Full task results remain in authoritative state.
-Large results are split into immutable artifacts behind one service-only archive
+L1 projects immutable bounded observations (status, outcome, delegation status,
+findings, errors, evidence and output references). Every complete observation is
+archived when the session Artifact Store is bound, including small payloads.
+Results are split into immutable artifacts behind one service-only archive
 index, so the index list itself cannot fill the model context. Oversized reference
 lists retain their full values in that archive and expose a count plus the index;
 no truncated JSON or fabricated evidence references are used. Specialists continue
@@ -184,13 +201,40 @@ usable window among the primary and backup models. Output reserve equals
 previous-request estimates/usage. Actual prompt/completion/cache tokens come from
 provider usage, including OpenAI `prompt_tokens_details.cached_tokens`.
 
-At `AGENT_CONTEXT_COMPACT_RATIO` (default 0.8), L2 archives the entire epoch and
-starts a new one containing all goal revisions, a deterministic checkpoint with
-current evidence/decisions/questions, the compact observation/decision ledger,
-archive references and the latest complete interactions (default 2). No LLM is used
-to invent a summary. The previous archive is linked from the new archive. A short
-cooldown avoids repeated threshold compaction until more than the retained turn
-count has accumulated; a hard window overflow bypasses that cooldown.
+At `AGENT_CONTEXT_COMPACT_RATIO` (default 0.8), or when working memory exceeds its
+limit, L2 archives the entire epoch, observation records and all goal revisions.
+The new epoch retains only the latest effective goal, archive references and a
+bounded observation/decision ledger. `AGENT_CONTEXT_MEMORY_ITEMS` defaults to 8 and
+`AGENT_CONTEXT_MEMORY_CHARS` to 8000; optional records are further removed if needed
+to fit the actual system/tools/status/output-reserve budget. Current evidence,
+decisions, open questions and gates are rebuilt in the following Status Bar instead
+of being duplicated inside the checkpoint. No LLM invents a summary.
+
+Epoch history is reconstructed as structured user-data messages, not old native
+assistant/tool messages. Old provider reasoning fields and tool IDs stay in the
+archive; real calls within the new epoch retain their original protocol. This
+avoids carrying stale thinking state across epoch/provider boundaries without
+deleting protocol fields from active tool interactions. See the provider's
+[thinking/tool protocol](https://api-docs.deepseek.com/guides/thinking_mode/).
+
+The previous archive is linked from the new archive. An `observation_count` that
+never decreases controls the compaction cooldown (`AGENT_CONTEXT_RECENT_TURNS`,
+default 2); it does not use the length of the trimmed memory. Legacy checkpoints
+derive this counter once from their full memory. Hard-window and working-memory
+limits bypass the threshold cooldown. Original hard constraints remain mandatory;
+if the irreducible request cannot fit, L3 still blocks.
+
+`recall_context(evidence_id, limit=3)` is available to main and specialist loops.
+It traverses only the current trajectory's reachable service-only archive chain,
+with session ownership, trajectory scope, artifact type and payload-integrity
+checks. It can match an evidence ID or source reference, including evidence IDs
+mapped to a current paper card. It returns bounded observation summaries rather
+than raw prompts or reasoning content, and never grants current evidence access.
+The scan is capped at 128 archive indexes / 8 MiB per call and at most 3 results;
+`search_complete=false` explicitly reports an incomplete scan or result limit.
+Recall records are excluded from evidence matches so recalled content cannot
+recursively become new evidence. Corruption/missing storage is an explicit failed
+observation; execution-control exceptions still propagate unchanged.
 
 L3 blocks before model invocation if the retained set still exceeds the hard window,
 configuration is invalid, an archive fails, or a pending call is unresolved. L2
@@ -272,6 +316,61 @@ action contracts and keeps the model-facing context at the same five fields.
 Metadata/card changes invalidate dependent plans and gates within the same Controller
 commit as the specialist result and observation; removed artifacts are also
 removed from the manifest before the next checkpoint can hydrate them.
+
+## Research memory retrieval loop
+
+`research_memory_artifact_ref` is an actual retrieval input. Before each main
+decision, `prepare_memory_context` checks availability and evicts cached results when
+the task goal changes. After an explicit search, later rounds refresh the summary
+cursor and remove decisions/questions that are no longer in the latest snapshot.
+The last search `cursor` remains distinct from `current_cursor`; refreshing validity
+does not claim that a cached query scanned newly added memories.
+Full summary contents are never automatically injected on every round.
+
+```text
+Current task → main chooses search_research_memory(query, kind, limit)
+→ session-scoped summary/failure lookup → ranked bounded Status Bar records
+→ main decision + optional memory_feedback → real action → outcome audit event
+```
+
+`ResearchMemoryRetriever` resolves the summary with session, role and artifact-type
+checks. It uses normalized English terms and Chinese bigrams. The model generates
+the query; ranking is deterministic lexical overlap, with recent records preferred
+on ties. This is neither vector retrieval nor a cross-session memory store.
+
+The current summary supplies findings, active decisions and open questions. Up to
+16 summary versions (including current) contribute historical findings only;
+invalidated decisions and resolved questions cannot be resurrected from older
+versions. The latest 200 `agent_failure` events supply failure experience, including
+specialist failures. Hitting a scan horizon yields `search_complete=false`; an empty
+result cannot prove that no earlier memory exists. `result_limited` marks output
+truncation. Both flags reach `state.memory_retrieval`.
+
+Results default to at most three records and `RESEARCH_MEMORY_CONTEXT_CHARS=1600`
+JSON characters, also capped at half `AGENT_CONTEXT_TOOL_RESULT_CHARS`. Each record
+carries an immutable summary/event source, a stable memory ID and explicit historical,
+revalidation and no-evidence-authorization flags. A large Status Bar drops retrieved
+memory before explicit constraints, current evidence and blocking questions. Memory
+queries count toward main round/no-progress limits and cannot grant research progress.
+
+Main decisions may report `memory_feedback` with `memory_id`, `disposition`
+(`used`, `irrelevant`, `outdated`) and a short reason. Native calls carry it as tool
+metadata; JSON responses carry it at the top level. Validation accepts only IDs in
+the actual bounded decision context, and metadata is removed before handler calls.
+`memory_feedback` audit events distinguish presentation from declared use;
+`memory_action_outcome` links the following control/delegated action's lifecycle,
+business outcome and delegation status. Declared use does not prove causal benefit.
+Audit keys are idempotent per decision; results and pending feedback survive state
+checkpoints. Read/write failures are diagnostic, and cancellation/lease/budget stops
+remain effective. Graph-only execution without the session store does not inject
+cached research memory.
+
+Compaction prioritizes `AGENT_CONTEXT_FAILURE_ITEMS=2` recent failures whose action
+has no later successful observation, within the existing total item/character/window
+limits. Success unpins the old failure; its archived observation and failure event
+remain queryable. Historical memory never changes user constraints, evidence admission,
+claim authorization or final gates. Real-provider retrieval usefulness, cost and
+latency have not been measured.
 
 ## Configuration
 

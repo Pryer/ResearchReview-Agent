@@ -16,6 +16,9 @@ def compact_main_context(context: MainAgentContext, *, max_chars: int) -> MainAg
     """按可丢弃优先级收缩上下文，永不删除目标和显式约束。"""
     compacted = context.model_copy(deep=True)
     max_chars = max(2000, int(max_chars))
+    # WHY: 历史记忆只是辅助材料，不能挤掉当前显式要求、证据或阻断问题。
+    while _size(compacted) > max_chars and compacted.state.research_memory:
+        compacted.state.research_memory.pop()
     while _size(compacted) > max_chars and len(compacted.key_evidence) > 3:
         compacted.key_evidence.pop()
     while _size(compacted) > max_chars and len(compacted.decisions) > 2:

@@ -130,7 +130,7 @@ class Settings(BaseSettings):
     llm_control_plane_timeout: int = 120
     # 单个逻辑请求跨主/备用提供商的总 deadline，避免两边各等待完整 120 秒。
     llm_failover_total_timeout: int = 180
-    # 主 Agent 只消费 goal/state/key_evidence/decisions/open_questions。
+    # Agent Status Bar 使用 goal/state/key_evidence/decisions/open_questions 载荷。
     # 这些限制约束可重建视图，不会裁剪权威研究状态或原始证据。
     main_context_max_chars: int = 24000
     main_context_max_evidence: int = 24
@@ -145,6 +145,10 @@ class Settings(BaseSettings):
     agent_context_compact_ratio: float = Field(default=0.8, gt=0, lt=1)
     agent_context_recent_turns: int = Field(default=2, ge=0)
     agent_context_tool_result_chars: int = Field(default=4000, ge=1024)
+    agent_context_memory_items: int = Field(default=8, ge=1, le=64)
+    agent_context_memory_chars: int = Field(default=8000, ge=512)
+    agent_context_failure_items: int = Field(default=2, ge=0, le=8)
+    research_memory_context_chars: int = Field(default=1600, ge=512, le=8000)
     agent_execution_action_budget: int = 64
     # Chapter 4 Sidecar: opt-in independent tool-call safety review.
     # By default no actions are reviewed; enabling requires selecting actions.

@@ -1423,6 +1423,7 @@ class ResearchConversationService:
             source_refs=[authoritative_state.get("main_context_artifact_ref", "")],
         )
         persisted_state["research_memory_artifact_ref"] = memory.rebuild_summary(session_id)
+        authoritative_state["research_memory_artifact_ref"] = persisted_state["research_memory_artifact_ref"]
         result["research_state"] = authoritative_state
         persisted_state["editable_research_state"] = authoritative_state
         persisted_state["main_context_artifact_ref"] = authoritative_state.get(

@@ -1,4 +1,4 @@
-"""五字段驱动的主 Agent 单动作决策循环。"""
+"""Stable Prefix + ReAct Trajectory + Agent Status Bar 驱动的主控委派循环。"""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from app.agent.execution_budget import (
 from app.agent.execution import AgentCancelledError
 from app.core.exceptions import LLMInvocationError
 from app.agent.main_policy import AgentDecisionError, MainAgentPolicy
-from app.agent.react_context import ContextBudgetExceeded, ReActContext
+from app.agent.react_context import ContextBudgetExceeded, ReActContext, execute_context_recall
 from app.schemas.agent_decision_schema import AgentDecision
 from app.core.config import get_settings
 from app.database.runtime_repository import RuntimeConflict
@@ -114,7 +114,8 @@ class MainAgentLoop:
         trajectory = ReActContext(state)
         if state.get("active_subagent"):
             # WHY: 检查点可能停在子循环内；先续接其观察与汇报，再允许主控生成新决策。
-            self.specialists.run(state, handlers=handlers, should_cancel=should_cancel)
+            restored_result = self.specialists.run(state, handlers=handlers, should_cancel=should_cancel)
+            self._consume_delegation_result(state, restored_result)
         no_progress = 0
         previous_progress = _progress_fingerprint(state)
         progress_limit = max(1, int(settings.agent_main_no_progress_limit))
@@ -130,6 +131,8 @@ class MainAgentLoop:
             if (state.get("best_effort_generation") and not state.get("agent_mandatory_actions")
                     and gate.get("draft_released") and finish_validator(state)):
                 return str(state.get("result_status") or "partial")
+            from app.services.research_memory_retrieval import prepare_memory_context
+            prepare_memory_context(state)
             names = allowed_actions(state, set(handlers))
             mandatory = list(state.get("agent_mandatory_actions") or [])
             if mandatory:
@@ -187,6 +190,8 @@ class MainAgentLoop:
             state.setdefault("main_agent_decisions", []).append(
                 decision.model_dump(mode="json")
             )
+            from app.services.research_memory_retrieval import record_memory_feedback
+            record_memory_feedback(state, decision, presented_matches=snapshot.context.state.research_memory)
             if mandatory or (handoff and handoff in names):
                 trajectory.proposed(decision)
             ledger = state.setdefault("agent_execution_budget", {})
@@ -200,6 +205,7 @@ class MainAgentLoop:
                 })
                 return "blocked"
             action = decision.action
+            from app.services.research_memory_retrieval import record_memory_control_outcome
             # Review only explicitly configured actions, before Controller effects.
             # The reviewer cannot override deterministic Controller authorization.
             if (settings.agent_sidecar_enabled
@@ -211,6 +217,7 @@ class MainAgentLoop:
                 })
                 if review.verdict != "allow":
                     trajectory.observe({"status": review.verdict, "error": review.reason})
+                    record_memory_control_outcome(state, action, review.verdict, "blocked")
                     state.setdefault("main_agent_rejections", []).append({
                         "action": action,
                         "reason": "sidecar_" + review.verdict + ":" + review.reason,
@@ -225,8 +232,16 @@ class MainAgentLoop:
                         return "waiting_user"
                     # Denial becomes a new observation; no automatic re-execution.
                     continue
-            if action == "request_clarification":
+            if action == "recall_context":
+                recalled = execute_context_recall(trajectory, decision.arguments)
+                record_memory_control_outcome(state, action, recalled["status"], recalled["outcome"])
+            elif action == "search_research_memory":
+                from app.services.research_memory_retrieval import execute_memory_search
+                recalled = execute_memory_search(state, trajectory, decision.arguments)
+                record_memory_control_outcome(state, action, recalled["status"], recalled["outcome"])
+            elif action == "request_clarification":
                 trajectory.observe({"status": "waiting_user", "findings": [decision.arguments["question"]]})
+                record_memory_control_outcome(state, action, "waiting_user", "unknown")
                 state["clarification"] = {
                     "needed": True,
                     "question": decision.arguments["question"],
@@ -234,8 +249,9 @@ class MainAgentLoop:
                 }
                 state["result_status"] = "waiting_user"
                 return "waiting_user"
-            if action == "report_blocked":
+            elif action == "report_blocked":
                 trajectory.observe({"status": "blocked", "error": decision.arguments["reason"]})
+                record_memory_control_outcome(state, action, "blocked", "blocked")
                 state["generation_blocked"] = True
                 state["errors"] = list(state.get("errors") or []) + [{
                     "code": "main_agent_blocked",
@@ -243,11 +259,14 @@ class MainAgentLoop:
                 }]
                 state["result_status"] = "blocked"
                 return "blocked"
-            if action == "request_finish":
+            elif action == "request_finish":
                 if finish_validator(state):
                     trajectory.observe({"status": str(state.get("result_status") or "completed")})
+                    record_memory_control_outcome(state, action, str(state.get("result_status") or "completed"),
+                                                  "degraded" if state.get("result_status") == "partial" else "succeeded")
                     return str(state.get("result_status") or "completed")
                 trajectory.observe({"status": "rejected", "error": "finish_rejected_by_quality_gates"})
+                record_memory_control_outcome(state, action, "rejected", "blocked")
                 state.setdefault("main_agent_rejections", []).append({
                     "action": action,
                     "reason": "finish_rejected_by_quality_gates",
@@ -269,7 +288,7 @@ class MainAgentLoop:
                         consume_mandatory_action=bool(mandatory),
                         required_first=bool(handoff),
                     )
-                    trajectory.observe(result.model_dump(mode="json"))
+                    self._consume_delegation_result(state, result)
                 except AgentBudgetExceeded as exc:
                     state["result_status"] = "blocked"
                     state["generation_blocked"] = True
@@ -310,3 +329,22 @@ class MainAgentLoop:
             "message": "主 Agent 达到最大决策轮数",
         })
         return "blocked"
+
+    @staticmethod
+    def _consume_delegation_result(state, result):
+        from app.services.research_memory_retrieval import record_memory_outcome
+        record_memory_outcome(state, result)
+        # WHY: COMPLETED 只说明委派已结束；阻塞/协助报告必须反馈给下一轮主控，不能当业务成功。
+        from app.schemas.agent_task_schema import AgentTaskOutcome
+        if result.delegation_status in {"needs_help", "blocked"} or result.outcome in {
+            AgentTaskOutcome.BLOCKED, AgentTaskOutcome.DEGRADED, AgentTaskOutcome.UNKNOWN,
+        }:
+            feedback = (result.delegation_status if result.delegation_status in {"needs_help", "blocked"}
+                        else result.outcome.value)
+            state.setdefault("main_agent_rejections", []).append({
+                "action": result.operation,
+                "reason": "subagent_" + feedback,
+                "delegation_status": result.delegation_status,
+                "outcome": result.outcome.value,
+                "message": "; ".join(result.findings)[:600],
+            })

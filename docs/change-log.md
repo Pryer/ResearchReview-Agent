@@ -2231,3 +2231,44 @@ what changed and how it was validated; it is not a replacement for Git history.
 - 验证：按当前生产代码与既有 XML 报告核对描述和计数；6 份文档的 Markdown 围栏与相对文件链接检查通过，git diff --check 通过。仅修改文档，未重复运行 pytest；此前代码全量 1591 passed、定向 100 passed。保留用户原有已暂存日志。
 - 收敛审查：扫描清除本次架构变更对应的旧“仅主控循环/专业适配器/提交后再失效授权”描述；区分子 Agent 决策输入、动作执行输入和最终门禁，未修改历史日志或扩大实现声明。
 - 限制：未新增真实 CNKI/学术 API/LLM E2E 或成本性能测量；文档同步不代表服务已重启或完成线上验收。
+
+
+## 2026-10-06 22:10:52 +08:00 — 增强本地 Git 提交与推送署名防护
+
+- 修改文件：本地 `.claude/settings.local.json`、`.git/hooks/commit-msg`、新增 `.git/hooks/attribution-policy.sh` 与 `.git/hooks/pre-push`；本文件记录完成结果。Agent 规则已有禁止未授权 AI 共同作者要求，本次不重复添加。
+- 原因：原提交钩子可被跳过，已生成的违规提交没有推送前守卫；原 Claude 配置尚未显式关闭会话链接署名。
+- 行为：当前项目关闭 commit、PR 和会话链接自动署名。两个 Git 钩子共用一份识别规则；推送检查分支及提交标签的完整可达提交说明、作者和提交者，遇到 Claude 名称或 Anthropic 地址即阻断，检查失败也停止。普通共同作者、删除远端引用及无提交署名的树/blob 标签保持可用。
+- 测试与验证：隔离的本地工作仓库与 bare 远端执行真实 Git 命令，9 项集成验证全部通过：正常推送、Claude 提交拒绝、跳过提交钩子后的推送拒绝、违规祖先拒绝、Claude 作者拒绝、其他共同作者放行、带违规历史的注解标签拒绝、删除引用放行、非提交标签放行；JSON 配置有效。首轮测试运行器遭遇 Windows GBK 解码及旧 Python 清理 API 不兼容，改为字节捕获和兼容清理接口后完整复跑退出码 0，测试仓库均已删除。未连接真实研究 API。
+- 收敛审查：识别逻辑集中在共享钩子模块，检查失败不放行；非显然的身份范围和标签/历史语义有中文 WHY；保留用户文件，未修改生产代码、研究状态、GitHub 权限或远端提交。
+- 限制：钩子和 Claude 配置仅对本机当前仓库生效，不随 clone 传播；同权限程序仍能禁用钩子、修改配置或直接调用 GitHub API。完全隔离须由外部权限控制保证，不能靠模型指令或本地钩子宣称绝对不可绕过。未运行 pytest 或 CNKI/LLM E2E，仅更新本地防护与变更记录，未提交或推送。
+
+
+## 2026-10-06 22:14:02 +08:00 — 合并 Claude 用户级自动署名关闭配置
+
+- 修改文件：用户级 `~/.claude/settings.json`、本变更记录。
+- 原因：用户明确要求将当前项目的自动署名关闭设置合并到全局配置。
+- 行为：用户级 attribution 设置 commit、PR 文本为空并关闭 sessionUrl；保留所有原有其他配置，写入采用同目录临时文件原子替换及并发修改检查，不复制或记录凭据。
+- 验证：重新读取 JSON 有效，三个目标字段一致；合并前后其他配置值逐项完全相等，临时文件已移除；`git diff --check` 通过。
+- 限制：项目级或受管理的更高优先级配置仍可能覆盖用户级设置；本次不修改项目 Git 钩子、生产代码或 GitHub 状态，未运行 pytest/CNKI/LLM E2E，未提交或推送。
+
+## 2026-10-16 23:29:37 +08:00 — 修复长任务工作记忆增长、Epoch 协议重建与委派结果消费
+
+- 修改文件：`.env.example`、`ARCHITECTURE.md`、`README.en.md`、`README.md`、`app/agent/action_registry.py`、`app/agent/context_builder.py`、`app/agent/controller.py`、`app/agent/main_loop.py`、`app/agent/react_context.py`、`app/agent/result_merger.py`、`app/agent/subagents/loop.py`、`app/core/config.py`、`app/prompt/agent_system.py`、`app/schemas/agent_task_schema.py`、`app/schemas/context_schema.py`、`app/services/context_history_service.py`、`docs/agent-context-architecture.md`、`docs/agent-runtime-and-cache.md`、`docs/architecture.md`、`docs/change-log.md`、`tests/test_context_compaction_regressions.py`、`tests/test_openalex_rate_limit.py`、`tests/test_react_context.py`。
+- 根因：Compaction 把全部累计 memory 重新复制进摘要且不裁剪活跃 memory，使长历史压缩后仍线性增长；Epoch 尾部原样保留旧原生思考/工具协议。主控只检查委派生命周期，未显式消费业务阻塞/协助结果；幂等缓存复用把阻塞任务图误标为完成。旧文字把五字段状态载荷与整体上下文混同。
+- 行为：完整观察（含小载荷）保存为会话和轨迹受控归档；压缩工作记忆默认最多 8 条/8000 JSON 字符，并按实际 system/tools/状态栏/输出预留预算进一步缩减。累计观察序号与冷却不随裁剪回退；旧目标版本归档，活跃上下文仅保留最新有效目标；当前门禁/证据由最新 Status Bar 重建，避免 checkpoint 重复复制动态状态。归档失败或不可保留的硬约束超限仍明确停止。
+- 归档回查：新增只读 recall_context，可按证据 ID 或来源引用遍历当前轨迹的可达归档，检查会话、轨迹、类型和载荷完整性；最多扫描 128 个索引/8 MiB、返回 3 条有界摘要。未完整扫描明确标记，回查记录不再被当作新证据；损坏/缺失转为可诊断失败，预算/取消/失权仍透传。历史不授予当前证据权限。
+- 协议与结果：新 Epoch 用结构化决策/观察重建，不重放旧原生 assistant/tool/reasoning_content；同一 Epoch 保留真实 Provider 协议。新增可兼容旧记录的 delegation_status，主控显式区分生命周期、业务 outcome 和完成/协助/阻断汇报，包括检查点恢复；业务阻塞可进入重规划，最终交付仍由确定性门禁裁决。幂等阻塞结果维持任务图 blocked。新委派不得隐式重入活跃角色，当前仍为串行设计，未声称支持同角色并发。
+- 测试与验证：新增 19 项根因回归；定向 119 passed；最终全量 1610 passed、0 failed、0 skipped，耗时 54.28 秒，11 条第三方弃用警告。覆盖 100/300 条长历史、连续 Epoch、中文小窗口、旧计数迁移、原始观察保留、旧证据回查、跨会话/轨迹拒绝、回查控制异常与损坏、扫描上限、回查不生成新证据、Provider 字段重建、活跃委派重入和 blocked/needs_help 消费。首轮全量有 1 条既有 OpenAlex 冷却测试因 41559.00000000003 的浮点舍入失败；断言仅增加 1e-8 秒容差，生产限流逻辑未改。Ruff F、Markdown 围栏/相对链接和 git diff --check 均通过。
+- 收敛审查：删除旧 Epoch 原生交互重放分支与全 memory 摘要复制，复用现有 Artifact Store/CAS/预算边界；状态栏仍使用兼容五字段载荷，稳定前缀/轨迹/状态栏/压缩职责明确。工作记忆、累计序号、串行恢复与生命周期语义均有中文 WHY；没有用扩大窗口、关闭门禁或忽略归档错误绕过问题。保留用户原有已暂存日志，未修改研究数据。
+- 限制与未验证：真实 CNKI/学术 API/LLM E2E、Provider 压缩后实际调用、成本/延迟收益未运行；协议策略按官方文档与 Mock 回归验证。归档查询有扫描与结果上限，未实现同角色并发。当前为本地修改，未提交或推送。
+
+## 2026-10-18 23:46:49 +08:00 — 接通任务驱动的研究记忆检索、上下文注入与使用反馈
+
+- 修改文件：`.env.example`、`README.md`、`README.en.md`、`ARCHITECTURE.md`、`app/agent/action_registry.py`、`app/agent/context_builder.py`、`app/agent/context_compaction.py`、`app/agent/graph.py`、`app/agent/main_loop.py`、`app/agent/main_policy.py`、`app/agent/react_context.py`、`app/agent/state.py`、`app/core/config.py`、`app/prompt/agent_system.py`、`app/schemas/agent_decision_schema.py`、`app/schemas/context_schema.py`、`app/services/research_conversation_service.py`、新增 `app/services/research_memory_retrieval.py` 与 `tests/test_research_memory_retrieval.py`、`docs/architecture.md`、`docs/agent-context-architecture.md`、`docs/agent-runtime-and-cache.md`、本记录。
+- 根因：研究摘要只有增量落库与引用保存，没有主控按当前任务生成查询、加载相关历史并反馈使用结果的执行通路；纯时间顺序的压缩会优先挤出仍有意义的失败经验。保留上一轮完整归档与有界摘要修复，不重新复制全量 memory。
+- 行为：新增 Main Agent 控制动作 `search_research_memory(query, kind, limit)`，实际校验/加载本会话摘要引用，以中英文词项匹配研究发现、有效决定、未决问题与失败事件。最多扫描 16 个摘要版本及最近 200 个失败事件；旧摘要只提供历史发现，失效决定/已解决问题不会恢复。检索最多返回 3 条、默认 1600 JSON 字符，另受单次工具反馈字符上限一半约束；输出及扫描截断均显式标记并注入 Status Bar。任务目标变化清除工作缓存；最新摘要更新有效性，同时区分上次检索游标与当前摘要游标。无会话存储的 graph 模式不注入旧检索缓存。
+- 使用反馈：原生工具元数据或 JSON 顶层可携带 `memory_feedback`，校验仅允许本轮实际呈现的记忆 ID，执行前移除反馈元数据；事件区分已呈现与声明采用/无关/过期，并关联后续控制动作或专业委派的生命周期、业务结果及汇报状态。事件键按决策幂等，结果与待结算反馈可随检查点恢复。读取失败清除旧结果并报告诊断，辅助审计写入失败可诊断，取消/预算/失权停止信号保持有效。历史记忆不授予证据权限，不放宽显式约束或质量门禁。
+- 压缩：默认优先保留 2 条尚未被同动作成功观察覆盖的失败记录，仍服从总条数/字符/实际窗口限制；失败经历作为会话事件可按任务检索，成功后不再占优先槽但保留归档。状态栏超限先丢弃辅助历史记忆，保留现有硬约束和证据裁决。
+- 测试与验证：新增 18 项根因回归；最终定向 170 passed（22.04 秒），全量 1628 passed、0 failed、0 skipped（57.91 秒，11 条第三方弃用警告）。覆盖中英文检索、旧摘要与失效清除、会话隔离、扫描/输出上限、原生/JSON 完整主控循环、反馈伪造与证据越权拒绝、交付门禁、检查点恢复/幂等、失败优先保留与后续成功、存储诊断和取消透传。6 份说明文档围栏/相对文件链接检查通过，新增/核心修改模块 Ruff F 通过，git diff --check 通过。扩大到整个既有 `research_conversation_service.py` 的 Ruff F 检查另发现基线第 466 行 `build_scoped_query` 未定义；本次仅同步该文件的摘要引用，未改动这一无关分支。
+- 收敛审查：首轮全量 1626 passed、2 failed，定位为每个工具重复携带反馈 schema 展示标题/说明，使无 Artifact Store 的 graph 门禁 smoke 提前触发归档要求；去掉冗余展示元数据后复跑全部通过，未扩大窗口、跳过归档或降低门禁。反馈契约仍由同一 Pydantic 模型生成并校验，保持现有动作投影、Artifact Store、游标摘要与预算/CAS 模式；无探索性后备分支，关键状态寿命/游标/停止边界保留中文 WHY。原有已暂存日志与上一轮本地修复均保留。
+- 限制：当前为同会话词项检索，不是跨会话或向量语义记忆；历史扫描有界，声明采用不等于已证明实际收益。未运行真实 CNKI/外部学术 API/LLM E2E，未测量缓存、质量、成本或延迟收益；预算/取消停止后不再为辅助反馈写库。当前仅本地修改，未提交、推送或合并。

@@ -54,6 +54,16 @@ Writing 分别保存自己的追加式轨迹、通信历史、压缩 Epoch 与�
 并原子保存汇报及委派结束标记。重启恢复先续接活跃子循环，已提交动作不重放。
 尚未提交的外部调用继续遵循下述 uncertain 边界，不保证远程请求仅执行一次。
 
+`status=completed` 只表示执行结束；`outcome` 表示业务结果，`delegation_status`
+单独表示完成、请求协助或阻断。主控会把非成功业务结果显式反馈到下一轮状态栏，
+幂等复用的阻断结果仍把任务图标记为 blocked；提交诊断补丁不等于准许发布综述。
+当前活跃委派不能被新任务隐式复用，恢复需显式续接；尚未支持同角色并发。
+
+每次观察完整载荷均保存为受控归档。Compaction 后工作记忆最多 8 条、8000 字符，
+并按真实输入预算进一步缩减；累计观察序号不随裁剪重置。新 Epoch 只重建结构化
+语义历史，旧原生调用和思考协议留在归档。`recall_context` 按证据 ID/引用查询
+当前轨迹可达历史，返回有界摘要；扫描不完整会明确标记，历史不授予当前证据权限。
+
 持久化路径是 `ResearchConversationService.handle/revise`。执行期数据库对象通过
 ContextVar 传播，不进入模型上下文。直接调用 graph 的测试/脚本仍是内存执行模式。
 
@@ -170,9 +180,17 @@ Pydantic 诊断保存为结构化字段；大型任务补丁按 JSON 片段保�
 
 ## 验证入口
 
+研究记忆现由 Main Agent 按任务调用 `search_research_memory` 查询，摘要引用实际参与
+会话/角色/类型校验和加载；结果有界注入状态栏，不自动灌入整份历史。当前决定和问题
+以最新摘要为准，旧摘要只召回历史发现；最近失败事件可按任务查询。明确采用反馈与
+后续动作结果分别记录为幂等事件，并随状态恢复；未反馈只记录已呈现，不宣称已使用。
+当前只做同会话词项检索，扫描有上限且显式报告不完整。工作摘要优先保留少量未恢复
+失败，不能突破总预算；历史不能授予当前证据权限或改变质量门禁。协议和配置见
+[研究记忆检索闭环](agent-context-architecture.md#research-memory-retrieval-loop)。
+
 `tests/test_section_checkpoint_fingerprint.py`、`tests/test_cache_usage_boundaries.py`、
 `tests/test_action_contracts.py`、`tests/test_durable_runtime.py` 和
-`tests/test_research_memory.py` 覆盖复用、记账、越权补丁、真实 SQLite 并发 CAS、
+`tests/test_research_memory.py`、`tests/test_research_memory_retrieval.py` 覆盖复用、记账、越权补丁、真实 SQLite 并发 CAS、
 提交故障回滚、崩溃未决请求、取消/迟到响应、迁移、历史游标和显式恢复。
 本轮全量结果及真实 CNKI/LLM 验收结论见
 [2026-09-22 验收记录](validation/2026-09-22-runtime-cache.md)，同时追加到变更日志。
