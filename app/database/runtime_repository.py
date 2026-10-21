@@ -5,7 +5,7 @@ import json
 import threading
 import time
 from uuid import uuid4
-from sqlalchemy import select, update, or_
+from sqlalchemy import select, update, or_, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as OrmSession
 from app.database.models import (
@@ -23,6 +23,12 @@ class RuntimeConflict(RuntimeError):
 
 def dumps(value):
     return json.dumps(value, ensure_ascii=False)
+
+
+def lease_clock(db):
+    """SQLite 在语句执行时取墙上时间，包含等待写锁消耗的时间。"""
+    return ((func.julianday("now") - 2440587.5) * 86400.0
+            if db.bind.dialect.name == "sqlite" else time.time())
 
 
 class ResearchRuntimeRepository:
@@ -51,6 +57,22 @@ class ResearchRuntimeRepository:
 
     def _row(self):
         return self.db.get(Runtime, self.session_id, populate_existing=True)
+
+    def _owned_row_for_write(self, *, live=False):
+        # WHY: 先用条件 UPDATE 锁住所有权，再读写辅助账本，避免 SELECT 检查后
+        # 被新 Owner 接管。费用结算/失败清理允许同 Owner 在过期或取消后执行，
+        # 但新的研究动作仍须有效租约、正确版本且未取消。
+        changed = self.db.execute(update(Runtime).where(
+            Runtime.session_id == self.session_id, Runtime.owner == self.owner,
+        ).values(version=Runtime.version))
+        if changed.rowcount != 1:
+            if live:
+                raise RuntimeConflict("execution owner changed")
+            return None
+        row = self.check() if live else self._row()
+        if live and row.version != self.version:
+            raise RuntimeConflict("execution source version changed")
+        return row
 
     def event(self, key, kind, payload):
         self.db.add(Event(session_id=self.session_id, event_key=key,
@@ -96,7 +118,7 @@ class ResearchRuntimeRepository:
         self._start_heartbeat()
 
     def _start_heartbeat(self) -> None:
-        """启动守护线程按 ttl/4 周期续约；只续约自己拥有且未取消的租约。"""
+        """启动守护线程按 ttl/4 周期续约；只延长自己拥有、有效且未取消的租约。"""
         interval = max(0.05, self.ttl / 4)
         # WHY: 常规续约每 ttl/4 一次（一个 TTL 内 4 次机会）；单次续约遇到
         # 锁竞争/瞬时 IO 错误后按短间隔重试，而不是再等一个完整周期，否则
@@ -108,9 +130,9 @@ class ResearchRuntimeRepository:
                 try:
                     if not self._renew_lease():
                         # CAS 未命中：owner 已被接管（只能在租约过期后发生）
-                        # 或会话被请求取消；心跳必须立即停止，绝不能再续。
+                        # 或租约已过期/会话被请求取消；心跳必须立即停止，绝不能再续。
                         logger.warning(
-                            "lease heartbeat stopped: owner lost or cancelled "
+                            "lease heartbeat stopped: owner lost, expired or cancelled "
                             "(session=%s)", self.session_id)
                         return
                 except Exception:  # noqa: BLE001 - 心跳异常不能杀死执行线程
@@ -129,7 +151,7 @@ class ResearchRuntimeRepository:
         thread.start()
 
     def _renew_lease(self) -> bool:
-        """CAS 续约；仅当 owner 仍是自己且未被取消时成功。
+        """CAS 续约；仅当 owner 仍是自己、租约有效且未被取消时成功。
 
         WHY: 必须在独立短连接上执行。``self.db`` 是工作线程的请求级 Session，
         SQLAlchemy Session 不支持跨线程并发共享；心跳若复用它，与主线程频繁
@@ -138,11 +160,16 @@ class ResearchRuntimeRepository:
         续约因此静默失败，租约到期后健康长任务被误判失效、各节点降级空转。
         """
         with OrmSession(bind=self.db.bind) as heartbeat_db:
+            # WHY: SQLite 写锁可能等待到租约过期，必须在 UPDATE 执行时取时间，
+            # 不能用等锁前采样的 Python 时间把过期执行复活。此处仍是单机墙上时钟，
+            # 不承诺跨主机时钟一致性，也不以研究状态 version 阻止正常续约。
+            now = lease_clock(heartbeat_db)
             changed = heartbeat_db.execute(update(Runtime).where(
                 Runtime.session_id == self.session_id,
                 Runtime.owner == self.owner,
                 Runtime.cancelled.is_(False),
-            ).values(lease_until=time.time() + self.ttl))
+                Runtime.lease_until > now,
+            ).values(lease_until=now + self.ttl))
             heartbeat_db.commit()
             return changed.rowcount == 1
 
@@ -154,6 +181,7 @@ class ResearchRuntimeRepository:
             if row.cancelled:
                 from app.agent.execution_budget import AgentExecutionCancelled
                 raise AgentExecutionCancelled("persisted cancellation requested")
+            return row
 
     def snapshot(self, state, *, task=None, result=None, ledger=None):
         """提交检查点、任务结果、资料引用与事件；CAS 失败则全部回滚。"""
@@ -162,7 +190,7 @@ class ResearchRuntimeRepository:
             changed = self.db.execute(update(Runtime).where(
                 Runtime.session_id == self.session_id, Runtime.version == self.version,
                 Runtime.owner == self.owner, Runtime.cancelled.is_(False),
-                Runtime.lease_until > time.time(),
+                Runtime.lease_until > lease_clock(self.db),
             ).values(version=Runtime.version + 1))
             if changed.rowcount != 1:
                 raise RuntimeConflict("snapshot CAS rejected stale/cancelled execution")
@@ -195,10 +223,7 @@ class ResearchRuntimeRepository:
 
     def begin_task(self, task, ledger):
         with self.transaction():
-            self.check()
-            row = self._row()
-            if row.version != self.version:
-                raise RuntimeConflict("task source version changed")
+            row = self._owned_row_for_write(live=True)
             existing = self.db.scalar(select(Task).where(Task.session_id == self.session_id,
                 Task.idempotency_key == task.idempotency_key))
             if existing is not None:
@@ -212,8 +237,8 @@ class ResearchRuntimeRepository:
 
     def fail_task(self, task_id, status, ledger):
         with self.transaction():
-            row = self._row()
-            if row.owner != self.owner:
+            row = self._owned_row_for_write()
+            if row is None:
                 return
             changed = self.db.execute(update(Task).where(Task.task_id == task_id,
                 Task.session_id == self.session_id, Task.status == "running").values(status=status))
@@ -225,17 +250,16 @@ class ResearchRuntimeRepository:
     def reserve_attempt(self, task_id, reservation, ledger):
         attempt_id = uuid4().hex
         with self.transaction():
-            self.check()
+            row = self._owned_row_for_write(live=True)
             self.db.add(Attempt(attempt_id=attempt_id, session_id=self.session_id,
                 task_id=task_id, reserved_tokens=reservation, status="running"))
-            self._row().budget_json = dumps(ledger)
+            row.budget_json = dumps(ledger)
             self.event("attempt:" + attempt_id, "attempt_started", {"task_id": task_id})
         return attempt_id
 
     def persist_budget(self, ledger):
         with self.transaction():
-            self.check()
-            self._row().budget_json = dumps(ledger)
+            self._owned_row_for_write(live=True).budget_json = dumps(ledger)
 
     def update_token_limit(self, *, expected_limit, new_limit):
         """显式调整空闲会话额度，按原账本及版本 CAS；保留累计用量和审计事件。"""
@@ -275,7 +299,7 @@ class ResearchRuntimeRepository:
 
     def authorize_session_save(self, status):
         conditions = [Runtime.session_id == self.session_id, Runtime.owner == self.owner,
-                      Runtime.version == self.version, Runtime.lease_until > time.time()]
+                      Runtime.version == self.version, Runtime.lease_until > lease_clock(self.db)]
         if status not in {"cancelled", "failed", "blocked"}:
             conditions.append(Runtime.cancelled.is_(False))
         changed = self.db.execute(update(Runtime).where(*conditions).values(version=Runtime.version))
@@ -284,11 +308,12 @@ class ResearchRuntimeRepository:
 
     def settle_attempt(self, attempt_id, usage, ledger, *, estimated):
         with self.transaction():
-            row = self._row()
-            if row.owner != self.owner:
+            row = self._owned_row_for_write()
+            if row is None:
                 # 迟到响应不能覆盖新执行的账本；原预留已由恢复逻辑计为 uncertain。
                 return
             changed = self.db.execute(update(Attempt).where(Attempt.attempt_id == attempt_id,
+                Attempt.session_id == self.session_id,
                 Attempt.status == "running").values(status="uncertain" if estimated else "completed",
                     usage_json=dumps(usage)))
             if changed.rowcount != 1:

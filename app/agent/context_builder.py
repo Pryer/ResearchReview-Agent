@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from app.core.config import get_settings
+from app.utils.search_constraints import search_count_bounds, exact_search_title
 from app.schemas.context_schema import (
     AgentStateContext,
     ContextSnapshot,
@@ -83,6 +84,9 @@ def _clean_text(value: Any, limit: int = 360) -> str:
 def _explicit_constraints(state: dict[str, Any]) -> list[dict[str, Any]]:
     request = state.get("research_request") or {}
     constraints: list[dict[str, Any]] = []
+    title = exact_search_title(state)
+    if title:
+        constraints.append({"name": "exact_title", "value": title, "source": "user", "hard": True})
     if state.get("year_range_explicit") or request.get("year_range_explicit"):
         constraints.append({
             "name": "time_range",
@@ -92,9 +96,10 @@ def _explicit_constraints(state: dict[str, Any]) -> list[dict[str, Any]]:
             "hard": True,
         })
     if state.get("max_papers_explicit") or request.get("max_papers_explicit"):
+        bounds = search_count_bounds(state)
         constraints.append({
-            "name": "required_reference_count",
-            "value": state.get("required_reference_count") or request.get("required_reference_count"),
+            "name": "search_result_count" if bounds and bounds["maximum"] is not None else "required_reference_count",
+            "value": bounds if bounds and bounds["maximum"] is not None else state.get("required_reference_count") or request.get("required_reference_count"),
             "source": "user",
             "hard": True,
         })
@@ -112,6 +117,7 @@ def _explicit_constraints(state: dict[str, Any]) -> list[dict[str, Any]]:
 def _goal(state: dict[str, Any]) -> GoalContext:
     request = state.get("research_request") or {}
     semantic = state.get("research_semantic_frame") or {}
+    bounds = search_count_bounds(state)
     return GoalContext(
         request=str(request.get("original_query") or state.get("user_query") or ""),
         topic=_clean_text(state.get("canonical_topic") or state.get("topic"), 240),
@@ -120,7 +126,8 @@ def _goal(state: dict[str, Any]) -> GoalContext:
         constraints={
             "start_year": state.get("start_year"),
             "end_year": state.get("end_year"),
-            "required_reference_count": state.get("required_reference_count"),
+            "required_reference_count": None if bounds and bounds["maximum"] is not None else state.get("required_reference_count"),
+            **({"search_result_count": bounds} if bounds is not None else {}),
             "language": state.get("language"),
             "citation_style": state.get("citation_style"),
             "required_focuses": semantic.get("required_focuses") or [],

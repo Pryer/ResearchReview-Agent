@@ -73,6 +73,10 @@ class TestExtractYearRange:
             ("2020-2025", (2020, 2025)),
             ("2021到2024年", (2021, 2024)),
             ("2022年以后", (2022, 2025)),
+            ("检索标题为某论文的2020年论文", (2020, 2020)),
+            ("检索 2020 年发表的论文", (2020, 2020)),
+            ("2021年到2024年", (2021, 2024)),
+            ("2021 年至 2024 年", (2021, 2024)),
         ],
     )
     def test_absolute_years(self, query, expected):
@@ -82,6 +86,15 @@ class TestExtractYearRange:
     def test_no_year_returns_none(self):
         result = extract_year_range("帮我检索一些论文", current_year=2025)
         assert result is None
+
+    def test_explicit_single_year_is_preserved_in_slots(self):
+        slot = extract_slots("检索2020年检索增强生成论文，最多3篇", "search_papers", current_year=2026)
+        assert (slot.start_year, slot.end_year) == (2020, 2020)
+        assert slot.year_range_explicit
+
+    @pytest.mark.parametrize("query", ["使用模型v2020", "2020年以前的论文"])
+    def test_non_single_year_expression_is_not_coerced(self, query):
+        assert extract_year_range(query, current_year=2026) is None
 
 
 class TestExtractMaxPapers:

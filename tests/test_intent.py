@@ -47,6 +47,30 @@ class TestRuleBasedIntentRecognition:
         result = rule_based_intent_recognition("")
         assert result.intent == IntentType.GENERAL_QA.value
 
+    @pytest.mark.parametrize("query", [
+        "检索目标论文，只做论文检索，不生成综述。",
+        "搜索论文，不需要文献综述。",
+        "检索目标论文，不要撰写研究背景。",
+        "只做论文检索，标题为 A Review of Retrieval Methods，最多3篇。",
+        "Find papers; do not generate a review.",
+    ])
+    def test_negated_writing_request_does_not_override_search(self, query):
+        assert recognize_intent(query).intent == IntentType.SEARCH_PAPERS.value
+
+    @pytest.mark.parametrize("query, expected", [
+        ("检索论文，不生成综述，但撰写研究背景。", IntentType.GENERATE_INTRODUCTION),
+        ("不只是检索论文，还要生成综述。", IntentType.GENERATE_REVIEW),
+        ("只做检索和综述写作。", IntentType.GENERATE_REVIEW),
+    ])
+    def test_positive_writing_request_is_preserved(self, query, expected):
+        assert recognize_intent(query).intent == expected.value
+
+    def test_search_only_preflight_does_not_invent_writing_deliverables(self):
+        from app.agent.topic_disambiguation import analyze_topic_ambiguity
+        analysis = analyze_topic_ambiguity("检索2020年目标论文，最多3篇。只做论文检索，不生成综述。", current_year=2026)
+        assert analysis["research_request"]["task_type"] == "search_papers"
+        assert analysis["research_request"]["requested_sections"] == []
+
     def test_recognize_intent_fallback(self):
         """recognize_intent 应遵循规则优先策略。"""
         result = recognize_intent("帮我写一篇文献综述")

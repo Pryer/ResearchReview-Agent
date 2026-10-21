@@ -372,6 +372,146 @@ def test_duplicate_job_delivery_never_executes_completed_job_again(db, monkeypat
 
 # ---------- 租约心跳（2026-09-27 事故回归） ----------
 
+
+def test_expired_lease_cannot_be_revived_by_same_owner(db, monkeypatch):
+    monkeypatch.setattr(ResearchRuntimeRepository, "_start_heartbeat", lambda self: None)
+    repo = ResearchRuntimeRepository(db, "expired")
+    repo.acquire({}, {})
+    expired = time.time() - 10
+    db.execute(update(ResearchRuntimeModel).where(
+        ResearchRuntimeModel.session_id == "expired").values(lease_until=expired))
+    db.commit()
+    assert repo._renew_lease() is False
+    assert db.get(ResearchRuntimeModel, "expired", populate_existing=True).lease_until == expired
+
+
+@pytest.mark.parametrize("operation", ["renew", "snapshot", "publish"])
+def test_write_waiting_for_sqlite_writer_cannot_use_expired_lease(db, monkeypatch, operation):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from sqlalchemy import event
+    monkeypatch.setattr(ResearchRuntimeRepository, "_start_heartbeat", lambda self: None)
+    repo = ResearchRuntimeRepository(db, "waiting", ttl=10)
+    repo.acquire({}, {})
+    waiting = Event()
+    def before_execute(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("UPDATE research_runtime"):
+            waiting.set()
+    def execute():
+        if operation == "renew":
+            return repo._renew_lease()
+        if operation == "snapshot":
+            return repo.snapshot({"answer": "must not publish"})
+        with repo.transaction():
+            return repo.authorize_session_save("completed")
+    # WHY: 先持写锁，再让续约等待；锁释放时原租约已经过期，不能使用等锁前的时间。
+    with Session(db.bind) as writer:
+        expires = time.time() + 0.3
+        writer.execute(update(ResearchRuntimeModel).where(
+            ResearchRuntimeModel.session_id == "waiting").values(lease_until=expires))
+        event.listen(db.bind, "before_cursor_execute", before_execute)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(execute)
+                assert waiting.wait(2)
+                time.sleep(0.4)
+                writer.commit()
+                if operation == "renew":
+                    assert future.result(timeout=5) is False
+                else:
+                    with pytest.raises(RuntimeConflict):
+                        future.result(timeout=5)
+        finally:
+            event.remove(db.bind, "before_cursor_execute", before_execute)
+
+
+def test_expired_owner_can_account_paid_response_then_release_without_publishing(db, monkeypatch):
+    monkeypatch.setattr(ResearchRuntimeRepository, "_start_heartbeat", lambda self: None)
+    repo = ResearchRuntimeRepository(db, "expired-paid")
+    ledger = {"llm_tokens": 0, "tokens_reserved": 100}
+    repo.acquire({}, ledger)
+    attempt = repo.reserve_attempt(None, 100, ledger)
+    db.execute(update(ResearchRuntimeModel).where(
+        ResearchRuntimeModel.session_id == "expired-paid").values(lease_until=time.time() - 10))
+    db.commit()
+    paid = {"llm_tokens": 25, "tokens_reserved": 0}
+    repo.settle_attempt(attempt, {"total_tokens": 25}, paid, estimated=False)
+    assert json.loads(db.get(ResearchRuntimeModel, "expired-paid").budget_json) == paid
+    with pytest.raises(RuntimeConflict):
+        repo.snapshot({"answer": "must not publish"})
+    repo.release(paid)
+    row = db.get(ResearchRuntimeModel, "expired-paid", populate_existing=True)
+    assert row.owner is None
+    assert json.loads(row.budget_json) == paid
+
+
+@pytest.mark.parametrize("operation", ["settle", "fail", "release", "budget", "snapshot", "reserve"])
+def test_old_owner_auxiliary_writes_cannot_change_taken_over_runtime(db, monkeypatch, operation):
+    monkeypatch.setattr(ResearchRuntimeRepository, "_start_heartbeat", lambda self: None)
+    old = ResearchRuntimeRepository(db, "s")
+    ledger = {"llm_tokens": 0, "tokens_reserved": 100}
+    old.acquire({}, ledger)
+    t = task()
+    old.begin_task(t, ledger)
+    attempt = old.reserve_attempt(t.task_id, 100, ledger)
+    db.execute(update(ResearchRuntimeModel).where(
+        ResearchRuntimeModel.session_id == "s").values(lease_until=time.time() - 10))
+    db.commit()
+    with Session(db.bind) as other:
+        new = ResearchRuntimeRepository(other, "s")
+        recovered = {}
+        new.acquire({}, recovered)
+        before = other.get(ResearchRuntimeModel, "s", populate_existing=True).budget_json
+        actions = {
+            "settle": lambda: old.settle_attempt(attempt, {"total_tokens": 1}, {"llm_tokens": 1}, estimated=False),
+            "fail": lambda: old.fail_task(t.task_id, "failed", {"llm_tokens": 1}),
+            "release": lambda: old.release({"llm_tokens": 1}),
+            "budget": lambda: old.persist_budget({"llm_tokens": 1}),
+            "snapshot": lambda: old.snapshot({"answer": "stale"}),
+            "reserve": lambda: old.reserve_attempt(t.task_id, 1, {"llm_tokens": 1}),
+        }
+        if operation in {"budget", "snapshot", "reserve"}:
+            with pytest.raises(RuntimeConflict):
+                actions[operation]()
+        else:
+            actions[operation]()
+        row = other.get(ResearchRuntimeModel, "s", populate_existing=True)
+        assert row.owner == new.owner
+        assert row.budget_json == before
+        assert other.get(ResearchTaskModel, t.task_id, populate_existing=True).status == "interrupted"
+        assert other.get(ResearchAttemptModel, attempt, populate_existing=True).status == "uncertain"
+
+
+def test_budget_owner_is_rechecked_atomically_after_wait_before_update(db, monkeypatch):
+    from sqlalchemy import event
+    monkeypatch.setattr(ResearchRuntimeRepository, "_start_heartbeat", lambda self: None)
+    old = ResearchRuntimeRepository(db, "s", ttl=10)
+    old.acquire({}, {"llm_tokens": 50})
+    db.execute(update(ResearchRuntimeModel).where(
+        ResearchRuntimeModel.session_id == "s").values(lease_until=time.time() + 0.1))
+    db.commit()
+    takeover = {}
+    def before_update(conn, cursor, statement, parameters, context, executemany):
+        if takeover or not statement.startswith("UPDATE research_runtime"):
+            return
+        # WHY: 在旧执行完成读取、真正写入之前过期并接管，证明检查与写入之间没有竞态窗口。
+        takeover["started"] = True
+        time.sleep(0.15)
+        with Session(db.bind) as other:
+            new = ResearchRuntimeRepository(other, "s")
+            recovered = {}
+            new.acquire({}, recovered)
+            takeover.update(owner=new.owner, budget=dict(recovered))
+    event.listen(db.bind, "before_cursor_execute", before_update)
+    try:
+        with pytest.raises(RuntimeConflict):
+            old.persist_budget({"llm_tokens": 1})
+    finally:
+        event.remove(db.bind, "before_cursor_execute", before_update)
+    row = db.get(ResearchRuntimeModel, "s", populate_existing=True)
+    assert row.owner == takeover["owner"]
+    assert json.loads(row.budget_json) == takeover["budget"]
+
 def test_heartbeat_renews_lease_while_execution_is_alive(db):
     """健康执行即使单步超过 TTL，心跳也会持续把租约向后推。"""
     repo = ResearchRuntimeRepository(db, "hb-alive", ttl=0.9)

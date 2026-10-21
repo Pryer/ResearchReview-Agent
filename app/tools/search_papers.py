@@ -207,6 +207,14 @@ def search_papers(
                     message=f"未注册的数据源: {source}",
                 ))
             continue
+        # WHY: 调用方指定来源不能授予访问权限；旧会话恢复也必须遵守当前部署开关。
+        if source == "cnki" and not get_settings().cnki_enabled:
+            if diagnostics is not None:
+                diagnostics.append(_diagnostic_for_outcome(
+                    source, "skipped", error_code="SOURCE_DISABLED",
+                    message="CNKI 自动化访问未启用；请使用其他来源或由部署方确认授权后显式启用。",
+                ))
+            continue
         # CNKI 只检索中文关键词；若调用方显式传入不兼容来源，记录诊断。
         if source == "cnki" and not is_chinese_query(query):
             logger.debug("CNKI skipped for non-Chinese query: %s", query[:60])

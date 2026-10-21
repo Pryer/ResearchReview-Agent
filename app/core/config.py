@@ -192,6 +192,8 @@ class Settings(BaseSettings):
     # 冷却门直接跳过来源，不让研究线程等待整个冷却期。
     openalex_max_cooldown_seconds: float = 900.0
     # CNKI（知网）Selenium 客户端
+    # WHY: 请求来源列表和旧会话配置不代表访问授权；必须由部署方单独显式启用。
+    cnki_enabled: bool = False
     cnki_chromedriver_path: str = ""  # 留空则交给 Selenium Manager 自动下载
     cnki_headless: bool = False
     cnki_home_wait_seconds: float = 3.0
@@ -239,7 +241,7 @@ class Settings(BaseSettings):
     default_year_lookback: int = 3
     search_year_extension: int = 1
     max_year_lookback: int = 5
-    default_search_sources: str = "arxiv,semantic_scholar,openalex,crossref,cnki"
+    default_search_sources: str = "arxiv,semantic_scholar,openalex,crossref"
     agent_request_timeout: int = 60
     frontend_request_timeout: int = 1800  # 30 分钟，适应 CNKI 爬取时间
     # 综述写作默认尝试获取开放全文；下载失败会逐篇降级到摘要证据，

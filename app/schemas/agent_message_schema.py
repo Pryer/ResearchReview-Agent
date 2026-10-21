@@ -9,7 +9,8 @@ class SubagentReport(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     status: Literal["completed", "needs_help", "blocked"]
     message: str = Field(min_length=1, max_length=1200)
-    suggested_actions: list[str] = Field(default_factory=list, max_length=5)
+    suggested_actions: list[str] = Field(default_factory=list, max_length=5,
+        description="仅填写工具契约列出的注册动作名；自然语言建议写入 message，无动作建议时返回空列表")
 
 
 class AgentMessage(BaseModel):

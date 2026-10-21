@@ -141,6 +141,45 @@ def test_help_request_returns_to_main_and_reply_reaches_same_role():
     assert "delegation_message" not in current["subagent_sessions"]["search"]["last_delegation"]["arguments"]
 
 
+@pytest.mark.parametrize("native", [True, False])
+def test_report_contract_lists_registered_suggestions_without_granting_execution(native):
+    from app.agent.action_registry import ACTION_REGISTRY
+    class ContractAwareLLM(ScriptedLLM):
+        def check_contract(self, tools):
+            tool = next(item for item in tools if item["function"]["name"] == "report_to_main")
+            items = tool["function"]["parameters"]["properties"]["suggested_actions"]["items"]
+            assert set(items.get("enum") or []) == set(ACTION_REGISTRY)
+        def complete_tool_call(self, messages, *, tools, operation):
+            self.check_contract(tools)
+            return super().complete_tool_call(messages, tools=tools, operation=operation)
+        def complete_messages(self, messages, *, operation, **kwargs):
+            catalog = messages[0]["content"].split("核心工具目录（JSON 动作契约）：", 1)[1]
+            self.check_contract(json.loads(catalog))
+            return super().complete_messages(messages, operation=operation, **kwargs)
+    current = state()
+    llm = ContractAwareLLM({"search_agent_decision": [
+        report("needs_help", "需要证据分析角色处理", ["extract_paper_cards"])]}, native=native)
+    with budget_scope(current):
+        result = SubagentLoop(llm, AgentController()).run(
+            current, decision=AgentDecision(action="search_and_rank"), handlers={"search_and_rank": search})
+    assert result.delegation_status == "needs_help"
+    assert not current.get("candidate_papers")
+
+
+def test_natural_language_suggestion_is_rejected_then_corrected_without_new_permissions():
+    current = state()
+    llm = ScriptedLLM({"search_agent_decision": [
+        report("needs_help", "需要主控协助", ["请主控继续分析论文"]),
+        report("needs_help", "需要主控协助", ["extract_paper_cards"]),
+    ]})
+    with budget_scope(current):
+        result = SubagentLoop(llm, AgentController()).run(
+            current, decision=AgentDecision(action="search_and_rank"), handlers={"search_and_rank": search})
+    assert result.delegation_status == "needs_help"
+    assert not current.get("paper_cards")
+    assert "registered action names" in encode(llm.calls[1][1])
+
+
 @pytest.mark.parametrize("action", ["generate_deliverables", "request_finish"])
 def test_search_cannot_execute_other_role_or_release_review(action):
     current = state()
