@@ -215,6 +215,8 @@ def test_cnki_keeps_result_page_metadata_when_detail_enrichment_fails(monkeypatc
     from selenium.common.exceptions import WebDriverException
     from app.clients import cnki_client
 
+    monkeypatch.setattr(cnki_client.settings, "cnki_enabled", True)
+
     class FakeDriver:
         def quit(self):
             pass

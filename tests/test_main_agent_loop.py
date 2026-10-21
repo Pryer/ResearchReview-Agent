@@ -305,6 +305,80 @@ def test_search_finish_with_no_papers_is_blocked(monkeypatch):
     assert state["steps"][-1]["status"] == "blocked"
 
 
+def test_search_upper_limit_allows_one_known_item_without_requiring_three(monkeypatch):
+    from app.agent import graph
+    from app.agent.context_builder import build_main_agent_context
+    state = _state()
+    state.update(intent="search_papers", user_query="检索指定论文，最多3篇", max_papers_explicit=True,
+                 required_reference_count=3, ranked_papers=[{"paper_id": "p1", "title": "目标论文"}])
+    context = build_main_agent_context(state)
+    constraints = {item["name"]: item["value"] for item in context.goal.explicit_constraints}
+    assert constraints["search_result_count"] == {"minimum": 0, "maximum": 3}
+    assert "required_reference_count" not in constraints
+    assert context.goal.constraints["required_reference_count"] is None
+    monkeypatch.setattr(graph, "_get_llm", lambda: NativeDecisionLLM(["request_finish"]))
+    output = graph._run_autonomous_pipeline(state)
+    assert output["status"] == "success"
+    assert output["search_result_quality"]["requested"] == 0
+    assert "至少 3 篇" not in output["answer"]
+
+
+def test_search_upper_limit_caps_public_results_after_deduplication(monkeypatch):
+    from app.agent import graph
+    state = _state()
+    state.update(intent="search_papers", user_query="检索论文，最多2篇", max_papers_explicit=True,
+                 required_reference_count=2, ranked_papers=[
+                     {"paper_id": "p1", "title": "首篇"}, {"paper_id": "p1-copy", "title": "首篇"},
+                     {"paper_id": "p2", "title": "次篇", "authors": ["作者甲"], "doi": "10.1000/test"},
+                     {"paper_id": "p3", "title": "第三篇"}])
+    monkeypatch.setattr(graph, "_get_llm", lambda: NativeDecisionLLM(["request_finish"]))
+    output = graph._run_autonomous_pipeline(state)
+    assert output["status"] == "success"
+    assert output["search_result_quality"]["actual"] == 2
+    assert "**次篇**" in output["answer"]
+    assert "**第三篇**" not in output["answer"]
+    assert "作者甲" in output["answer"]
+    assert "10.1000/test" in output["answer"]
+
+
+def test_search_lower_and_upper_limits_both_remain_effective(monkeypatch):
+    from app.agent import graph
+    state = _state()
+    state.update(intent="search_papers", user_query="检索论文，至少2篇、最多3篇", max_papers_explicit=True,
+                 required_reference_count=2, ranked_papers=[{"paper_id": "p1", "title": "唯一论文"}])
+    monkeypatch.setattr(graph, "_get_llm", lambda: NativeDecisionLLM(["request_finish"]))
+    output = graph._run_autonomous_pipeline(state)
+    assert output["status"] == "partial"
+    assert output["search_result_quality"]["requested"] == 2
+
+
+def test_explicit_title_search_never_releases_nearby_titles(monkeypatch):
+    from app.agent import graph
+    for title_text in ['"Target Paper"', 'Target Paper']:
+        state = _state()
+        state.update(intent="search_papers", user_query=f"检索标题为 {title_text} 的2020年论文，最多3篇。",
+                     max_papers_explicit=True, required_reference_count=3,
+                     ranked_papers=[{"paper_id": "p1", "title": "Target Paper", "year": 2020},
+                                    {"paper_id": "p2", "title": "Target Paper Applications", "year": 2020}])
+        monkeypatch.setattr(graph, "_get_llm", lambda: NativeDecisionLLM(["request_finish"]))
+        output = graph._run_autonomous_pipeline(state)
+        assert output["status"] == "success"
+        assert output["search_result_quality"]["actual"] == 1
+        assert "**Target Paper Applications**" not in output["answer"]
+
+
+def test_explicit_title_with_no_match_stays_blocked(monkeypatch):
+    from app.agent import graph
+    state = _state()
+    state.update(intent="search_papers", user_query='检索标题严格等于 "Target Paper" 的论文，最多3篇。',
+                 max_papers_explicit=True, required_reference_count=3,
+                 ranked_papers=[{"paper_id": "p1", "title": "Nearby Paper"}])
+    monkeypatch.setattr(graph, "_get_llm", lambda: NativeDecisionLLM(["request_finish"]))
+    output = graph._run_autonomous_pipeline(state)
+    assert output["status"] == "blocked"
+    assert "**Nearby Paper**" not in output["answer"]
+
+
 def test_no_progress_then_real_progress_resets_counter():
     state = _state()
     llm = NativeDecisionLLM(["request_finish", "request_finish", "search_and_rank", "request_finish"])

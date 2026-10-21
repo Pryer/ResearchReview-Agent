@@ -271,9 +271,11 @@ def test_merge_search_results_does_not_mutate_source_models():
 @patch("app.tools.search_papers._search_semantic_scholar")
 @patch("app.tools.search_papers._search_cnki")
 def test_language_guards_skip_incompatible_sources_with_diagnostics(
-    mock_cnki, mock_s2, mock_arxiv
+    mock_cnki, mock_s2, mock_arxiv, monkeypatch
 ):
     """arXiv/Semantic Scholar 不接收中文检索式，CNKI 不接收英文检索式。"""
+    from app.core.config import get_settings
+    monkeypatch.setattr(get_settings(), "cnki_enabled", True)
     mock_arxiv.return_value = []
     mock_s2.return_value = []
     mock_cnki.return_value = []

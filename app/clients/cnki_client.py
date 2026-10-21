@@ -8,9 +8,9 @@
 注意：
 - 依赖本机安装 Chrome，以及一个版本匹配的 chromedriver（见
   ``settings.cnki_chromedriver_path``，留空则交给 Selenium Manager 自动下载）。
-- CNKI 有反爬/间歇性 JS alert，已由 ``dismiss_alert`` + 重试兜底处理。
-- Selenium driver 有状态，**本函数非线程安全**；调度层
-  ``app.tools.search_papers.search_papers`` 为顺序循环调用，无并发问题。
+- 默认关闭，只有部署方确认授权并设置 ``CNKI_ENABLED=true`` 后才允许启动。
+- 不隐藏自动化身份，不绕过登录、验证码、机构访问或站点限流。
+- 每次检索独立创建并关闭 driver；调用方仍须遵守来源限流。
 """
 
 from __future__ import annotations
@@ -173,6 +173,8 @@ def build_driver(
     chrome_binary: str | None = None,
     chromedriver: str | None = None,
 ) -> webdriver.Chrome:
+    if not settings.cnki_enabled:
+        raise PermissionError("CNKI automation is disabled; confirm authorization before setting CNKI_ENABLED=true")
     options = Options()
     binary = chrome_binary or find_local_chrome()
     if binary:
@@ -189,29 +191,8 @@ def build_driver(
     
     options.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
     
-    # 增强 Headless 模式的浏览器特征，避免被 CNKI 识别为爬虫
-    # 这对机构 IP 自动识别登录很重要
-    options.add_argument("--disable-blink-features=AutomationControlled")  # 移除 navigator.webdriver 标识
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])  # 移除自动化控制标识
-    options.add_experimental_option("useAutomationExtension", False)  # 禁用自动化扩展
-    
-    # 设置真实的用户代理（避免默认的 HeadlessChrome 标识）
-    if headless:
-        user_agent = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-        options.add_argument(f"--user-agent={user_agent}")
-    
-    # 窗口大小设置（模拟真实桌面环境）
     options.add_argument("--window-size=1920,1080")
-    
-    # 禁用沙箱和共享内存（某些环境需要）
-    # 注意：这会降低安全性，但对某些机构网络环境可能必要
-    # options.add_argument("--no-sandbox")
-    # options.add_argument("--disable-dev-shm-usage")
-    
+
     if chromedriver:
         service = Service(chromedriver)
         driver = webdriver.Chrome(service=service, options=options)
@@ -222,39 +203,6 @@ def build_driver(
     # 或新标签页导航；两者必须分别设置。
     driver.set_page_load_timeout(max(5, settings.cnki_page_load_timeout_seconds))
     driver.set_script_timeout(max(5, settings.cnki_page_load_timeout_seconds))
-    
-    # 进一步隐藏 WebDriver 特征
-    # 执行 JavaScript 覆盖 navigator.webdriver 属性
-    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-        "source": """
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-            
-            // 覆盖 Chrome 对象
-            window.chrome = {
-                runtime: {}
-            };
-            
-            // 覆盖 Permissions API
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications' ?
-                    Promise.resolve({ state: Notification.permission }) :
-                    originalQuery(parameters)
-            );
-            
-            // 覆盖 Plugins
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5]
-            });
-            
-            // 覆盖 Languages
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['zh-CN', 'zh', 'en']
-            });
-        """
-    })
     
     return driver
 
@@ -992,6 +940,12 @@ def search_cnki(
     Returns:
         论文元数据列表；失败或熔断时返回空列表（不抛异常，与其它 client 一致）。
     """
+    # WHY: 直接脚本调用不能绕过统一调度入口的禁用策略，且禁用不计来源故障。
+    if not settings.cnki_enabled:
+        _record_search_diagnostic("skipped", error_code="SOURCE_DISABLED",
+                                  message="CNKI 自动化访问未启用")
+        return []
+
     from app.core.circuit_breaker import get_circuit_breaker
 
     # WHY: 已知不兼容的驱动不再反复启动；直接按驱动不兼容诊断并返回空，

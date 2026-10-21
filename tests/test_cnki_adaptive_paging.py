@@ -64,6 +64,7 @@ def _install_pages(monkeypatch, pages: list[list[dict]]):
 
 @pytest.fixture(autouse=True)
 def _reset_cnki_guards(monkeypatch):
+    monkeypatch.setattr(cnki_client.settings, "cnki_enabled", True)
     get_circuit_breaker("cnki", failure_threshold=2, recovery_timeout=120.0).reset()
     # 本机测试环境未安装 selenium；翻页逻辑本身与驱动实现无关。
     monkeypatch.setattr(cnki_client, "SELENIUM_AVAILABLE", True)

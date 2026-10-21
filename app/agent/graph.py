@@ -240,10 +240,25 @@ def _run_autonomous_pipeline(
         if current.get("intent") == "search_papers":
             from app.agent.focus_coverage import required_focus_coverage
             from app.agent.nodes.base import _paper_identity_key
+            from app.utils.search_constraints import search_count_bounds, exact_search_title
 
             papers = list(current.get("ranked_papers") or [])
+            requested_title = exact_search_title(current)
+            if requested_title:
+                # WHY: 指定题名是交付边界，候选相关度不能把相邻论文变成同名命中。
+                normalize_title = lambda value: " ".join(str(value or "").split()).casefold()
+                papers = [paper for paper in papers if normalize_title(paper.get("title")) == normalize_title(requested_title)]
+                current["ranked_papers"] = papers
+            bounds = search_count_bounds(current)
+            if bounds["maximum"] is not None:
+                # WHY: 上限针对去重后的最终返回列表，完整候选池仍保留供溯源审查。
+                unique = {}
+                for paper in papers:
+                    unique.setdefault(_paper_identity_key(paper), paper)
+                papers = list(unique.values())[:bounds["maximum"]]
+                current["ranked_papers"] = papers
             actual = len({_paper_identity_key(paper) for paper in papers})
-            requested = int(current.get("required_reference_count") or 0) if current.get("max_papers_explicit") else 0
+            requested = bounds["minimum"]
             coverage = required_focus_coverage(current.get("research_semantic_frame") or {}, papers)
             issues = []
             if not actual:
@@ -256,6 +271,8 @@ def _run_autonomous_pipeline(
             current["search_result_quality"] = {
                 "passed": not issues,
                 "requested": requested,
+                "maximum": bounds["maximum"],
+                "exact_title": requested_title,
                 "actual": actual,
                 "issues": issues,
                 "warnings": ["部分检索源失败，结果可能不完整"] if current.get("search_failed") else [],

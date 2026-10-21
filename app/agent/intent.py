@@ -113,7 +113,26 @@ def rule_based_intent_recognition(user_query: str) -> IntentResult:
             reason="空请求",
         )
 
-    query_lower = user_query.lower()
+    classification_query = user_query
+    # WHY: 否定的交付物不是任务请求；只在明确否定句式中屏蔽匹配，原始文本
+    # 仍完整交给后续范围理解。不能让“不生成综述”触发写作和最低引用门禁。
+    writing_target = r"(?:文献综述|综述|研究现状|相关工作|研究背景|引言|survey|review|related\s+work|introduction)"
+    classification_query = re.sub(
+        r"(?:^|(?<=[，。；,;\n]))\s*(?:先|暂时|请)?(?:不需要|不要|不需|不用|无需|禁止|勿|不)\s*"
+        r"(?:(?:生成|撰写|写作?|输出)\s*)?(?:任何|一篇|一个)?" + writing_target,
+        "", classification_query, flags=re.I,
+    )
+    classification_query = re.sub(
+        r"\b(?:do\s+not|don't|no\s+need\s+to)\s+(?:generate|write|produce)\s+"
+        r"(?:(?:a|any)\s+)?(?:literature\s+)?" + writing_target + r"\b", "", classification_query, flags=re.I,
+    )
+    search_only = re.search(r"(?:(?:只|仅)(?:做|进行|需要|要)?(?:论文|文献)?(?:检索|搜索)|\bonly\s+(?:search|retrieve|find)\b)\s*(?=$|[，。；,;.!?！？\n])", classification_query, re.I)
+    positive_writing = re.search(r"(?:生成|撰写|写|输出)\s*(?:一篇|一个)?" + writing_target
+                                + r"|\b(?:generate|write|produce)\s+(?:a\s+)?" + writing_target, classification_query, re.I)
+    if search_only and not positive_writing:
+        return IntentResult(intent=IntentType.SEARCH_PAPERS.value, confidence=0.99,
+                            reason="用户明确仅检索论文；题名或否定交付物不改变顶层任务")
+    query_lower = classification_query.lower()
     best_intent = IntentType.GENERAL_QA
     best_score = 0.0
     best_reason = "无明确匹配规则"
@@ -131,7 +150,7 @@ def rule_based_intent_recognition(user_query: str) -> IntentResult:
 
     # 本项目默认服务于学术调研。用户只输入一个边界明确的研究主题时，
     # 不能因为缺少“调研/综述”等动作词就降级为 general_qa。
-    if best_score == 0.0 and _looks_like_bare_research_topic(user_query):
+    if best_score == 0.0 and _looks_like_bare_research_topic(classification_query):
         best_intent = IntentType.GENERATE_REVIEW
         best_score = 0.72
         best_reason = "未包含动作词，按裸学术主题默认执行文献调研"

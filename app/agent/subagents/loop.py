@@ -22,8 +22,10 @@ from app.schemas.agent_task_schema import AgentRole, AgentTaskResult, AgentTaskS
 def _validate(name, arguments):
     if name == "report_to_main":
         report = SubagentReport.model_validate(arguments)
-        if not report.message.strip() or any(action not in ACTION_REGISTRY for action in report.suggested_actions):
-            raise ValueError("invalid report message or suggested action")
+        if not report.message.strip():
+            raise ValueError("report message must not be blank")
+        if any(action not in ACTION_REGISTRY for action in report.suggested_actions):
+            raise ValueError("suggested_actions must contain registered action names; put prose in message or use []")
     else:
         validate_arguments(name, arguments)
 
@@ -121,11 +123,15 @@ class SubagentLoop:
             raise AgentDecisionError("persisted delegation role does not own operation")
         trajectory = ReActContext(state, namespace=role)
         names = [name for name, spec in ACTION_REGISTRY.items() if spec.role and spec.role.value == role]
+        report_parameters = SubagentReport.model_json_schema()
+        # WHY: 汇报可以建议其他角色的注册动作，但不能执行它们；Schema 与运行时
+        # 校验同源，避免模型按普通字符串 Schema 填自然语言后被反复拒绝。
+        report_parameters["properties"]["suggested_actions"]["items"]["enum"] = sorted(ACTION_REGISTRY)
         policy = MainAgentPolicy(
             self.llm, system_prompt=SYSTEM_PROMPTS[role] + SUBAGENT_REACT_PROMPT,
             tools=tool_schemas([*names, "recall_context"]) + [{"type": "function", "function": {
                 "name": "report_to_main", "description": "向主控汇报子任务结果、请求协助或说明阻断",
-                "parameters": SubagentReport.model_json_schema(),
+                "parameters": report_parameters,
             }}], argument_validator=_validate, operation=role + "_agent_decision", delegation_messages=False,
         )
         settings = get_settings()

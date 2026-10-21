@@ -2245,7 +2245,7 @@ def _assemble_answer(state: "ResearchAgentState") -> str:
             parts.append(prefix + "；".join(search_quality["issues"]) + "。")
         if search_quality.get("warnings"):
             parts.append("；".join(search_quality["warnings"]) + "。")
-        topic = state.get("topic") or state.get("user_query", "")
+        topic = state.get("canonical_topic") or state.get("topic") or state.get("user_query", "")
         parts.append(f"# {topic} 相关论文\n")
         if not papers:
             parts.append("未检索到相关论文。")
@@ -2257,6 +2257,10 @@ def _assemble_answer(state: "ResearchAgentState") -> str:
             url = paper.get("url") or paper.get("pdf_url") or ""
             reason = paper.get("ranking_reason") or paper.get("relevance_reason") or ""
             line = f"{i}. **{title}** ({year}, {venue})"
+            if paper.get("authors"):
+                line += "\n   作者：" + "、".join(str(author) for author in paper["authors"])
+            if paper.get("doi"):
+                line += "\n   DOI：" + str(paper["doi"])
             if url:
                 line += f"\n   {url}"
             if reason:

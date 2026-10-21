@@ -957,6 +957,9 @@ def test_search_node_keeps_chinese_keyword_when_first_keyword_is_english(monkeyp
 
 
 def test_search_node_calls_cnki_once_with_pure_chinese_core_query(monkeypatch):
+    from app.core.config import get_settings
+    monkeypatch.setattr(get_settings(), "default_search_sources", "arxiv,semantic_scholar,openalex,crossref,cnki")
+    monkeypatch.setattr(get_settings(), "cnki_enabled", True)
     from app.agent.nodes import search_node
 
     calls: list[tuple[str, list[str]]] = []
@@ -991,6 +994,9 @@ def test_search_node_calls_cnki_once_with_pure_chinese_core_query(monkeypatch):
 
 def test_search_node_upgrades_cnki_with_topic_anchor_keyword(monkeypatch):
     """同一批内含主题核心词的锚点词应独占 CNKI 检索位。"""
+    from app.core.config import get_settings
+    monkeypatch.setattr(get_settings(), "default_search_sources", "arxiv,semantic_scholar,openalex,crossref,cnki")
+    monkeypatch.setattr(get_settings(), "cnki_enabled", True)
     from app.agent.nodes import search_node
 
     calls: list[tuple[str, list[str]]] = []
@@ -1022,6 +1028,9 @@ def test_search_node_upgrades_cnki_with_topic_anchor_keyword(monkeypatch):
 
 def test_search_node_cnki_anchor_upgrade_works_across_rounds(monkeypatch):
     """锚点词出现在后续 refine 轮次时，仍应允许一次 CNKI 升级检索。"""
+    from app.core.config import get_settings
+    monkeypatch.setattr(get_settings(), "default_search_sources", "arxiv,semantic_scholar,openalex,crossref,cnki")
+    monkeypatch.setattr(get_settings(), "cnki_enabled", True)
     from app.agent.nodes import search_node
 
     calls: list[tuple[str, list[str]]] = []
@@ -1210,6 +1219,9 @@ def test_search_node_promotes_topic_anchor_into_first_batch(monkeypatch):
 
 def test_search_node_keeps_wide_classroom_behavior_log_query_and_routes_cnki(monkeypatch):
     """课堂行为日志场景：主题召回不被范围精确词降级，宽查询仍保留。"""
+    from app.core.config import get_settings
+    monkeypatch.setattr(get_settings(), "default_search_sources", "arxiv,semantic_scholar,openalex,crossref,cnki")
+    monkeypatch.setattr(get_settings(), "cnki_enabled", True)
     from app.agent.nodes import search_node
 
     calls: list[tuple[str, list[str]]] = []

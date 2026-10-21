@@ -8,8 +8,9 @@ from app.core.circuit_breaker import get_circuit_breaker, CircuitState
 
 
 @pytest.fixture(autouse=True)
-def _reset_cnki_driver_state():
+def _reset_cnki_driver_state(monkeypatch):
     """每个用例前后清除进程级驱动不兼容短路标志，避免跨用例泄漏。"""
+    monkeypatch.setattr(cnki_client.settings, "cnki_enabled", True)
     cnki_client._reset_driver_incompatibility()
     yield
     cnki_client._reset_driver_incompatibility()

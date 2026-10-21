@@ -233,6 +233,7 @@ def extract_year_range(
     - "近五年" / "近3年" / "最近十年"
     - "2021-2025" / "2021~2025" / "2021年到2025年"
     - "2023年起" / "2020年以后"
+    - "2020年"（单个明确发表年份）
     """
     # "近N年"
     m = re.search(r"近[最]?([一二三四五六七八九十\d]+)年", user_query)
@@ -254,14 +255,21 @@ def extract_year_range(
         return (current_year - n + 1), current_year
 
     # "YYYY-YYYY"
-    m = re.search(r"(20\d{2})\s*[-~—到]\s*(20\d{2})", user_query)
+    m = re.search(r"(?<!\d)(20\d{2})\s*年?\s*[-~—–到至]\s*(20\d{2})(?!\d)", user_query)
     if m:
         return int(m.group(1)), int(m.group(2))
 
     # "YYYY年以后/起"
-    m = re.search(r"(20\d{2})年?(以后|起|以来|之后)", user_query)
+    m = re.search(r"(?<!\d)(20\d{2})\s*年?\s*(以后|起|以来|之后)", user_query)
     if m:
         return int(m.group(1)), current_year
+
+    # WHY: 明确单年也是硬约束，不能回退成默认近三年；保留“以前”等
+    # 未支持开放区间的原有处理，且不把型号或多个离散年份猜成单年。
+    years = re.findall(r"(?<!\d)(20\d{2})\s*年(?!\s*(?:前|后|以|之|起|至|到))", user_query)
+    if len(set(years)) == 1:
+        year = int(years[0])
+        return year, year
 
     return None
 
