@@ -1508,7 +1508,7 @@ def test_exhausted_best_effort_generation_can_be_disabled(monkeypatch):
     )
 
     assert result["status"] == "blocked"
-    assert "任务级预算上限" in result["answer"]
+    assert "任务级恢复预算已耗尽" in result["answer"]
 
 
 def test_request_strict_policy_overrides_enabled_best_effort_default(monkeypatch):
@@ -1584,7 +1584,7 @@ def test_exhausted_best_effort_generation_runs_at_most_once(monkeypatch):
     )
 
     assert result["status"] == "blocked"
-    assert "任务级预算上限" in result["answer"]
+    assert "任务级恢复预算已耗尽" in result["answer"]
 
 
 def test_generation_runtime_error_does_not_enter_quality_recovery():
@@ -2039,3 +2039,140 @@ def test_quality_clarification_preserves_authoritative_required_count():
     assert clarification["requested"] == 40
     # 普通门禁失败不得推断检查点缺失。
     assert "检查点" not in clarification["question"]
+
+
+_STRICT_QUALITY_QUERY = (
+    "只检索标题严格等于 ZeroEvidence 的2024—2026年论文，至少引用3篇。"
+    "若不足必须明确报告，不能扩大标题、年份或降低篇数。"
+)
+
+
+def test_strict_quality_options_exclude_forbidden_changes():
+    result = _quality_blocked_result(available=0)
+    prompt = ResearchConversationService._quality_clarification(result, _STRICT_QUALITY_QUERY)
+    text = prompt["question"] + str(prompt["recovery_options"])
+    for forbidden in ("接受当前篇数", "扩大时间范围", "放宽主题范围"):
+        assert forbidden not in text
+
+
+def test_strict_exhausted_recovery_persists_blocked_without_budget_misdiagnosis():
+    db = _db_session()
+    service = ResearchConversationService(db)
+    result = _quality_blocked_result(available=0)
+    final = service._persist_or_pause_result("strict-empty", _STRICT_QUALITY_QUERY, {}, result)
+    assert final["status"] == "blocked"
+    assert final["clarification"] is None
+    assert not final["references"]
+    assert final["quality_gate"]["passed"] is False
+    assert "预算上限" not in final["answer"]
+    saved = ResearchSessionRepository(db).get("strict-empty")
+    assert saved["status"] == "blocked"
+    assert saved["state"]["result_snapshot"]["status"] == "blocked"
+
+
+def test_strict_zero_card_task_can_auto_search_in_original_scope(monkeypatch):
+    db = _db_session()
+    service = ResearchConversationService(db)
+    result = _quality_blocked_result(available=0)
+    result["research_state"]["allow_evidence_expansion"] = True
+    seen = []
+    def continue_search(session_id, query, state, editable):
+        seen.append((query, editable))
+        return {"status": "blocked", "answer": "bounded search executed"}
+    monkeypatch.setattr(service, "_continue_retrieval_and_persist", continue_search)
+    service._persist_or_pause_result("strict-search", _STRICT_QUALITY_QUERY, {}, result)
+    assert len(seen) == 1
+    assert seen[0][0] == _STRICT_QUALITY_QUERY
+    assert seen[0][1]["active_quality_recovery"]["action"] == "TARGETED_SEARCH"
+
+
+def test_strict_material_request_is_specific_not_scope_relaxation():
+    service = ResearchConversationService(_db_session())
+    result = _quality_blocked_result(available=0)
+    result["quality_gate"]["blocking_issues"].append({
+        "code": "missing_user_material", "message": "请提供指定论文的方法章节原文",
+    })
+    final = service._persist_or_pause_result("strict-material", _STRICT_QUALITY_QUERY, {}, result)
+    assert final["status"] == "needs_clarification"
+    assert "方法章节原文" in final["answer"]
+    assert "扩大时间" not in final["answer"]
+
+
+def test_old_quality_session_rechecks_authorization_before_execution(monkeypatch):
+    service = ResearchConversationService(_db_session())
+    result = _quality_blocked_result()
+    state = {"editable_research_state": result["research_state"], "result_snapshot": result}
+    def forbidden_execution(*args):
+        raise AssertionError("unauthorized recovery executed")
+    monkeypatch.setattr(service, "_regenerate_and_persist", forbidden_execution)
+    final = service._resume_after_quality_decision(
+        "old-strict", {"original_query": _STRICT_QUALITY_QUERY}, state,
+        service._quality_clarification(result), "接受当前篇数",
+    )
+    assert final["status"] == "blocked"
+    assert state["editable_research_state"]["required_reference_count"] == 3
+
+
+def test_explicit_new_count_requirement_is_recorded_and_revalidated(monkeypatch):
+    service = ResearchConversationService(_db_session(), llm=ClearTopicLLM())
+    result = _quality_blocked_result()
+    state = {"editable_research_state": result["research_state"], "result_snapshot": result}
+    captured = []
+    def regenerate(session_id, query, state, editable):
+        captured.append(editable)
+        return {"status": "blocked"}
+    monkeypatch.setattr(service, "_regenerate_and_persist", regenerate)
+    service._resume_after_quality_decision(
+        "new-count", {"original_query": _STRICT_QUALITY_QUERY}, state,
+        service._quality_clarification(result), "修改要求，接受当前篇数，引用2篇",
+    )
+    assert captured[0]["required_reference_count"] == 2
+    assert captured[0]["quality_constraint_changes"][0]["action"] == "accept_available"
+
+
+def test_ending_unsatisfied_research_does_not_become_completed():
+    db = _db_session()
+    service = ResearchConversationService(db)
+    result = _quality_blocked_result()
+    final = service._resume_after_quality_decision(
+        "ended-quality", {"original_query": "研究背景至少3篇"},
+        {"result_snapshot": result}, service._quality_clarification(result), "结束任务",
+    )
+    assert final["status"] == "blocked"
+    assert final["termination_reason"] == "user_ended_unsatisfied_research"
+    assert final["quality_gate"]["passed"] is False
+    assert ResearchSessionRepository(db).get("ended-quality")["status"] == "blocked"
+
+
+def test_constraint_authorization_only_changes_explicit_dimension():
+    from app.agent.quality_recovery_policy import forbidden_quality_actions, explicit_constraint_change
+    state = {"user_query": _STRICT_QUALITY_QUERY}
+    assert "accept_available" in forbidden_quality_actions(state)
+    assert not explicit_constraint_change("继续", "accept_available")
+    state["quality_constraint_changes"] = [{"action": "accept_available", "source_text": "修改要求，接受2篇"}]
+    denied = forbidden_quality_actions(state)
+    assert "accept_available" not in denied
+    assert "expand_time_range" in denied and "broaden_scope" in denied
+
+
+
+def test_old_quality_retry_cannot_restart_exhausted_recovery():
+    service = ResearchConversationService(_db_session())
+    result = _quality_blocked_result()
+    result["research_state"]["quality_recovery_attempts"] = 100
+    final = service._resume_after_quality_decision(
+        "exhausted-retry", {"original_query": _STRICT_QUALITY_QUERY},
+        {"editable_research_state": result["research_state"], "result_snapshot": result},
+        service._quality_clarification(result), "保持条件继续检索",
+    )
+    assert final["status"] == "blocked"
+    assert "恢复预算已耗尽" in final["answer"]
+
+
+def test_zero_usable_count_does_not_fall_back_to_raw_card_count():
+    result = _quality_blocked_result()
+    result["quality_gate"]["blocking_issues"][0]["available"] = 0
+    result["generation_readiness"]["usable_reference_count"] = 0
+    clarification = ResearchConversationService._quality_clarification(result)
+    assert clarification["available"] == 0
+    assert clarification["evidence_pool_available"] == 2

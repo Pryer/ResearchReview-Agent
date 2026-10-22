@@ -282,3 +282,29 @@ def test_regenerate_research_agent_signature_matches_service_call_sites():
         f"research_conversation_service.py 传给 regenerate_research_agent 的参数 "
         f"{unsupported} 不在函数真实签名 {real_params} 中，会导致 TypeError"
     )
+
+
+
+def test_user_ends_quality_failure_job_and_session_remain_blocked(monkeypatch):
+    engine = create_engine('sqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    maker = sessionmaker(bind=engine)
+    with maker() as db:
+        ResearchJobRepository(db).create('ended-job', 'ended-session', {'user_query': '结束任务'})
+        db.commit()
+    monkeypatch.setattr('app.services.research_job_service.SessionLocal', maker)
+    def end_quality(self, request):
+        return self._resume_after_quality_decision(
+            'ended-session', {'original_query': '至少引用3篇'},
+            {'result_snapshot': {'quality_gate': {'passed': False, 'draft_released': False}}},
+            {'kind': 'quality_decision'}, '结束任务',
+        )
+    monkeypatch.setattr(ResearchConversationService, 'handle', end_quality)
+    ResearchJobService._run_job('ended-job')
+    with maker() as db:
+        job = ResearchJobRepository(db).get('ended-job')
+        session = ResearchSessionRepository(db).get('ended-session')
+        assert job['status'] == session['status'] == 'blocked'
+        assert job['result']['status'] == session['state']['result_snapshot']['status'] == 'blocked'
+        assert job['result']['quality_gate']['draft_released'] is False
+    engine.dispose()

@@ -563,6 +563,16 @@ def decide_generation_recovery(
         action = RecoveryAction.REQUEST_USER_INPUT
         reason = "当前约束下没有剩余的自动恢复动作"
 
+    from app.agent.quality_recovery_policy import concrete_quality_input, forbidden_quality_actions
+
+    denied = forbidden_quality_actions(state)
+    missing_input = concrete_quality_input([item.model_dump(mode="json") for item in issues])
+    if action == RecoveryAction.REQUEST_USER_INPUT and not missing_input:
+        # WHY: 无自动动作不等于缺少用户输入。只有合法的改约决策仍待用户
+        # 确认时才可询问；所有放宽都被禁止时应保留证据缺口并终止恢复。
+        if all(name in denied for name in ("accept_available", "expand_time_range", "broaden_scope")):
+            action = RecoveryAction.DEGRADE
+            reason = "当前约束下的合法恢复路径已耗尽，且没有需要用户补充的具体信息"
     requires_input = action == RecoveryAction.REQUEST_USER_INPUT
     action_key = hashlib.sha256(
         json.dumps({
@@ -586,7 +596,7 @@ def decide_generation_recovery(
         progress=progress,
         action_fingerprint=action_key,
         requires_user_input=requires_input,
-        user_input_reason=reason if requires_input else "",
+        user_input_reason=(missing_input or reason) if requires_input else "",
         remaining_budget=remaining,
     )
 
