@@ -16,6 +16,9 @@ from app.agent.query_rewrite import rewrite_research_query
 from app.database.repositories import ResearchSessionRepository
 from app.schemas.agent_schema import AgentRequest, ResearchRevisionRequest
 from app.services.research_execution_service import with_artifact_store
+from app.agent.quality_recovery_policy import (
+    concrete_quality_input, explicit_constraint_change, forbidden_quality_actions,
+)
 
 # 质量决策问句的选项词表：问句措辞与解析判据同源。
 # WHY: 问句曾提供"基于现有证据保守重写"，但解析器里 force_generate 的宽口径
@@ -186,13 +189,13 @@ class ResearchConversationService:
         if existing_session and existing_session.get("status") == "blocked":
             saved_state = dict(existing_session.get("state") or {})
             snapshot = dict(saved_state.get("result_snapshot") or {})
-            clarification = self._quality_clarification(snapshot)
+            clarification = self._quality_clarification(snapshot, existing_session["original_query"], saved_state)
             decision = self._parse_quality_decision(
                 request.user_query, clarification or {}
             )
-            if clarification and decision and decision.get("action") == "force_generate":
-                # WHY: blocked 会话中的“生成可用草稿”是对原任务的交付策略，
-                # 不是一个以该短句为主题的新检索请求；复用保存的证据和约束。
+            if clarification and decision:
+                # WHY: blocked 会话中的恢复回答属于原任务；复用保存的证据和
+                # 约束，执行前仍须重新授权，不能把恢复短句当成新研究主题。
                 return self._resume_after_quality_decision(
                     session_id=str(request.session_id),
                     session=existing_session,
@@ -747,6 +750,8 @@ class ResearchConversationService:
                 "我无法把这句话映射为可执行的恢复动作。请按上一条消息明确提供"
                 "所需输入或访问条件；如果不再继续，请说明结束任务。"
             )
+            if clarification.get("required_user_input"):
+                question = f"继续执行仍需要：{clarification['required_user_input']}。请提供对应材料，或结束任务。"
             updated = {
                 **clarification,
                 "question": question,
@@ -769,7 +774,9 @@ class ResearchConversationService:
             message = "已按你的决定结束本次任务；未通过质量门禁的正文不会作为正式结果交付。"
             snapshot.update({
                 "session_id": session_id,
-                "status": "completed",
+                "status": "blocked",
+                "clarification": None,
+                "termination_reason": "user_ended_unsatisfied_research",
                 "answer": message,
             })
             history.append({"role": "assistant", "content": message, "type": "quality_decision"})
@@ -777,7 +784,7 @@ class ResearchConversationService:
             state["result_snapshot"] = snapshot
             self.repo.save(
                 session_id=session_id,
-                status="completed",
+                status="blocked",
                 original_query=session["original_query"],
                 state=state,
             )
@@ -785,6 +792,42 @@ class ResearchConversationService:
             return snapshot
 
         editable = dict(state.get("editable_research_state") or {})
+        from app.agent.generation_recovery import recovery_action_count
+        from app.core.config import get_settings
+        from app.agent.evidence_recovery import route_recovery_stop_reason
+
+        stop_reason = (
+            "任务级恢复预算已耗尽"
+            if recovery_action_count(editable or state) >= int(get_settings().recovery_total_action_budget)
+            # WHY: 明确选择补检索可撤销旧的“不扩证”决定，但不能重置检索轮次或总预算。
+            else route_recovery_stop_reason({**editable, "allow_evidence_expansion": True})
+            if decision["action"] in {"retry_search", "include_more_types"} else ""
+        )
+        if stop_reason:
+            return self._persist_exhausted_quality_result(
+                session_id=session_id, original_query=session["original_query"], state=state,
+                result=dict(state.get("result_snapshot") or {}),
+                decision={"reason": stop_reason, "issues": clarification.get("blocking_issues") or []},
+                history=history,
+            )
+        denied = forbidden_quality_actions({**state, **editable}, session["original_query"])
+        action = decision["action"]
+        if action in denied:
+            if explicit_constraint_change(answer, action):
+                changes = list(editable.get("quality_constraint_changes") or state.get("quality_constraint_changes") or [])
+                changes.append({"action": action, "source_text": answer})
+                editable["quality_constraint_changes"] = changes
+                state["quality_constraint_changes"] = changes
+                # WHY: 改约后旧恢复决策不再代表当前授权；历史及总预算仍保留。
+                editable.pop("active_quality_recovery", None)
+                editable.pop("quality_recovery_decision", None)
+            else:
+                return self._persist_exhausted_quality_result(
+                    session_id=session_id, original_query=session["original_query"],
+                    state=state, result=dict(state.get("result_snapshot") or {}),
+                    decision={"reason": denied[action], "issues": clarification.get("blocking_issues") or []},
+                    history=history,
+                )
         recovery_attempts = int(
             editable.get("quality_recovery_attempts")
             or state.get("quality_recovery_attempts")
@@ -1194,7 +1237,9 @@ class ResearchConversationService:
         return None
 
     @staticmethod
-    def _quality_clarification(result: dict[str, Any]) -> dict[str, Any] | None:
+    def _quality_clarification(
+        result: dict[str, Any], original_query: str = "", state: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         gate = result.get("quality_gate") or {}
         if gate.get("passed") is not False:
             return None
@@ -1231,12 +1276,12 @@ class ResearchConversationService:
             or result.get("required_reference_count")
             or 0
         )
-        available = int(
-            (count_issue or {}).get("available")
-            or (count_issue or {}).get("actual")
-            or (result.get("generation_readiness") or {}).get("usable_reference_count")
-            or len(result.get("paper_cards") or [])
-        )
+        # WHY: 0 是已核验的有效计数，不能用 or 回退成原始卡片数。
+        available = next((int(value) for value in (
+            (count_issue or {}).get("available"), (count_issue or {}).get("actual"),
+            (result.get("generation_readiness") or {}).get("usable_reference_count"),
+            len(result.get("paper_cards") or []),
+        ) if value is not None), 0)
         evidence_pool_available = len(result.get("paper_cards") or [])
         if count_issue and phase == "post_generation" and evidence_pool_available >= requested:
             question = (
@@ -1279,6 +1324,20 @@ class ResearchConversationService:
                 f"{_quality_option_label('best_effort_draft')}，"
                 f"或{_quality_option_label('stop')}。"
             )
+        policy_state = {**(state or {}), **((state or {}).get("editable_research_state") or {}),
+                        **(result.get("research_state") or {})}
+        denied = forbidden_quality_actions(policy_state, original_query)
+        options = None
+        if denied:
+            # 展示与执行共用授权判断；旧 gate 的自由文本选项不能绕过过滤。
+            options = [label for action, label, _ in _QUALITY_DECISION_OPTIONS.values()
+                       if action not in denied and action in {"accept_available", "expand_time_range", "broaden_scope", "stop"}]
+            options = list(dict.fromkeys(options))
+            missing = concrete_quality_input(issues)
+            question = (f"当前可用证据 {available}/{requested}，未满足交付要求。"
+                        + (f"继续需要：{missing}。" if missing else "当前要求保持不变。"))
+            if not missing:
+                question += "可执行的恢复将先在原约束和预算内进行。"
         return {
             "kind": "quality_decision",
             "slot": "quality_decision",
@@ -1288,7 +1347,7 @@ class ResearchConversationService:
             "available": available,
             "evidence_pool_available": evidence_pool_available,
             "blocking_issues": issues,
-            "recovery_options": gate.get("recovery_options") or [],
+            "recovery_options": options if options is not None else gate.get("recovery_options") or [],
             "turn_count": 1,
             "recovery_attempts": 0,
             "resume_from": "generation_readiness" if phase == "pre_generation" else "post_generation_repair",
@@ -1439,7 +1498,7 @@ class ResearchConversationService:
             self.db.commit()
             return self._clarification_result(session_id, persisted_state, main_clarification, question)
         clarification = (
-            self._quality_clarification(result)
+            self._quality_clarification(result, original_query, persisted_state)
             if result.get("status") not in {"failed", "cancelled"}
             and not _has_hard_execution_stop(result)
             else None
@@ -1520,6 +1579,10 @@ class ResearchConversationService:
         from app.schemas.recovery_schema import RecoveryAction, RecoveryStatus
 
         private_state = result.get("research_state") or {}
+        private_state.setdefault("user_query", original_query)
+        private_state["quality_original_query"] = original_query
+        if state.get("quality_constraint_changes"):
+            private_state["quality_constraint_changes"] = state["quality_constraint_changes"]
         # 兼容修复前保存的会话：旧 research_state 没有携带引用表和逐句验证，
         # 但本轮 result 顶层仍有这些可信产物。恢复前把它们补进私有状态，确保
         # 候选版本退化时能事务式回到完整旧稿，而不是正文和引用表各回一半。
@@ -1587,6 +1650,19 @@ class ResearchConversationService:
                 history=history,
             )
         if decision.action == RecoveryAction.REQUEST_USER_INPUT:
+            denied = forbidden_quality_actions(private_state, original_query)
+            missing = concrete_quality_input(decision_data["issues"])
+            if missing:
+                clarification.update(question=f"继续执行需要：{missing}。请提供对应材料或访问条件。",
+                                     recovery_options=["提供所需材料或访问条件", "结束任务"],
+                                     required_user_input=missing)
+                return None
+            if denied:
+                labels = [label for action, label, _ in _QUALITY_DECISION_OPTIONS.values()
+                          if action not in denied and action in {"accept_available", "expand_time_range", "broaden_scope", "stop"}]
+                clarification.update(question="当前证据未达到原要求。你可以明确选择：" + "、".join(labels) + "。",
+                                     recovery_options=labels)
+                return None
             requested = int(clarification.get("requested") or 0)
             available = int(clarification.get("available") or 0)
             gap = max(requested - available, 0)
@@ -1663,7 +1739,7 @@ class ResearchConversationService:
         from app.schemas.recovery_schema import GenerationRecoveryDecision, RecoveryAction
 
         editable = dict(state.get("editable_research_state") or result.get("research_state") or {})
-        if not editable or not editable.get("paper_cards"):
+        if not editable or (not editable.get("paper_cards") and decision.get("action") != RecoveryAction.TARGETED_SEARCH.value):
             return None
         decision_obj = GenerationRecoveryDecision.model_validate(decision)
         start_recovery_action(editable, decision_obj)
@@ -1870,7 +1946,7 @@ class ResearchConversationService:
         if private_state.get("quarantined_draft") or result.get("draft_available"):
             saved_items.append("隔离草稿")
         shortfall = int(vector.get("valid_reference_shortfall") or 0)
-        parts = ["自动恢复已达到任务级预算上限。"]
+        parts = [str(decision.get("reason") or "当前约束下无法继续质量恢复") + "。"]
         if saved_items:
             parts.append("系统已保存" + "和".join(saved_items) + "。")
         if shortfall:
@@ -1883,6 +1959,7 @@ class ResearchConversationService:
             "status": "blocked",
             "answer": answer,
             "quality_recovery_decision": decision,
+            "clarification": None,
         })
         history.append({
             "role": "assistant",
@@ -2068,19 +2145,16 @@ class ResearchConversationService:
         # 进入澄清流程，而不是把未达标结果标记为 completed。硬性执行停止
         # （预算/截止/失权）优先按停止原因结算，不得转成质量澄清。
         clarification = (
-            self._quality_clarification(result)
+            self._quality_clarification(result, session["original_query"], state)
             if not _has_hard_execution_stop(result)
             else None
         )
         if clarification:
             revision_status = "needs_clarification"
         else:
-            revision_gate = result.get("quality_gate") or {}
-            revision_status = (
-                "partial"
-                if revision_gate.get("passed") is False and revision_gate.get("partial_success")
-                else "completed"
-            )
+            from app.agent.graph import derive_result_status
+
+            revision_status = derive_result_status(result)
         result.update(
             {
                 "session_id": request.session_id,
@@ -2126,6 +2200,13 @@ class ResearchConversationService:
             "revision_history": revisions,
             "revision_number": revision_number,
         }
+        if clarification:
+            automatic = self._auto_recover_actionable_result(
+                session_id=request.session_id, original_query=session["original_query"],
+                state=persisted, result=result, clarification=clarification, history=history,
+            )
+            if automatic is not None:
+                return automatic
         self.repo.save(
             session_id=request.session_id,
             status=revision_status,

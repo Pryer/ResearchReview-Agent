@@ -120,6 +120,8 @@ class ResearchAgentState(TypedDict, total=False):
     refresh_existing_evidence: bool
     best_effort_generation: bool
     best_effort_on_failure: bool
+    quality_original_query: str
+    quality_constraint_changes: list[dict[str, Any]]
     best_effort_policy_source: str
     automatic_best_effort_attempted: bool
     automatic_best_effort_generation: bool
