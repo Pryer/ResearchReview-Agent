@@ -411,7 +411,7 @@ ResearchReview-Agent/
 - [docs/evidence-model.md](docs/evidence-model.md)：PaperMetadata、Evidence、Claim、Citation 的关系。
 - [docs/quality-gates.md](docs/quality-gates.md)：能力、路线、主张、交付物和生成质量门禁。
 - [docs/lessons-learned.md](docs/lessons-learned.md)：历史缺陷、根因和防回归经验。
-- [docs/change-log.md](docs/change-log.md)：每次完成修改后的时间戳变更记录。
+- [CHANGELOG.md](CHANGELOG.md)：公开变更摘要与验证边界；详细开发流水仅本地保存。
 - [examples/](examples/)：不依赖真实外部服务的标准请求案例。
 
 ### 可验证综述生成

@@ -248,7 +248,7 @@ Quality-gate failures trigger bounded recovery: the agent may recompute state, r
 - [docs/research-workflow.md](docs/research-workflow.md): workflow stages and branch guarantees.
 - [docs/evidence-model.md](docs/evidence-model.md): relationships between metadata, evidence, claims, and citations.
 - [docs/quality-gates.md](docs/quality-gates.md): capability, route, claim, deliverable, and generation gates.
-- [docs/change-log.md](docs/change-log.md): append-only record of completed changes.
+- [CHANGELOG.md](CHANGELOG.md): public change summary and validation boundaries; detailed development journals stay local.
 - [examples/](examples/): standard requests that do not require live external services.
 
 ## Compliance
