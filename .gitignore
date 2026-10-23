@@ -55,3 +55,10 @@ logs/
 # 系统
 .DS_Store
 Thumbs.db
+
+# 仅本地保存的私人材料、开发流水及发布前备份
+.local-docs/
+/docs/job-search-closeout-plan.md
+/docs/interview-project-evidence.md
+/docs/change-log.md
+/change.md

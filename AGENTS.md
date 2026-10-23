@@ -75,6 +75,11 @@ Each entry must include:
 - tests and validation results;
 - known limitations or unverified areas.
 
+The detailed `docs/change-log.md` is local-only and ignored by Git because it may
+contain development context and personal schedules. If absent in a fresh clone,
+create it before appending. Keep public, reader-facing changes in `CHANGELOG.md`.
+Do not force-add local-only documents.
+
 Append to the existing file; do not rewrite or delete earlier entries. Do not record
 secrets, API keys, private user data, full prompts, or large debug traces. This is an
 Agent completion requirement; it is not a claim that Git automatically logs every

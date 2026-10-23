@@ -112,7 +112,7 @@ pytest -q tests/test_action_sidecar.py tests/test_agent_context.py tests/test_ma
 pytest -q
 ```
 
-第 7 章要求区分边界集和保留集。新增 `tests/test_react_context.py` 与真实 SQLite 事务恢复回归覆盖这些边界；验证结果记录于 `docs/change-log.md`。离线测试通过不能等同于真实缓存收益或科研任务成功率已经验证。
+第 7 章要求区分边界集和保留集。新增 `tests/test_react_context.py` 与真实 SQLite 事务恢复回归覆盖这些边界；公开验证边界见 [变更摘要](../CHANGELOG.md)；详细开发流水仅本地保存。离线测试通过不能等同于真实缓存收益或科研任务成功率已经验证。
 
 ## 7. 不做的事情
 
