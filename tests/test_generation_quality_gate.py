@@ -2845,7 +2845,8 @@ def _coverage_card(paper_id: str, text: str) -> dict:
         "research_problem": text,
         "field_evidence": {"research_problem": [evidence_id]},
         "evidence_spans": [
-            {"evidence_id": evidence_id, "text": text, "source_type": "abstract"}
+            {"evidence_id": evidence_id, "text": text, "source_type": "abstract",
+             "char_start": 0, "char_end": len(text)}
         ],
         "field_claims": {
             "research_problem": [

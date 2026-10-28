@@ -29,6 +29,10 @@ claim is cited.
 The implementation contracts are in app/schemas/paper_schema.py,
 app/schemas/verification_schema.py, and app/schemas/global_evidence_schema.py.
 
+Full-text model extraction uses bounded source chunks and records actual processing
+coverage. See [有界全文分块抽取](full-text-extraction.md) for position semantics,
+limits, and the distinction between processing coverage and evidence completeness.
+
 ## Evidence Flow
 
 retrieved metadata/PDF
@@ -67,3 +71,17 @@ banner alone is not a release.
 Evidence provenance must survive extraction, clustering, writing, repair, and
 serialization. When evidence is insufficient, weaken/remove the claim, retrieve
 more evidence within bounds, or report the limitation.
+
+## Independent Source and Verification Context
+
+Extracted PaperCard fields never serve as their own source evidence. Content spans
+must identify an abstract/full-text/table source and a valid position, page or URL;
+new extraction additionally reads the original slice and stores source/span hashes.
+Historical `explicitly_reported` flags are reauthorized at field, planning, theme
+synthesis and writer boundaries. Lexical similarity only selects candidates.
+
+Display text is capped at 360 characters; semantic verification receives the complete
+selected spans within the configured per-claim context budget. Missing independent
+sources or insufficient context remain hard failures, including best-effort output.
+Verifier/policy/source/context changes invalidate prior verification reuse. Details,
+compatibility limits and regression coverage: [Evidence correctness](evidence-correctness.md).

@@ -448,3 +448,45 @@ def test_delegation_metadata_does_not_mutate_registry_or_execution_contract():
     assert decision.reason == "补充有来源的论文"
     assert decision.arguments == {}
     assert tool_schemas(["search_and_rank"]) == before
+
+
+def test_rules_metadata_change_hands_back_to_analysis_before_another_fetch(store):
+    current = state()
+    current.update(intent="generate_introduction", ranked_papers=[{"paper_id": "p1"}],
+                   paper_details=[{"paper_id": "p1", "abstract": "old"}],
+                   paper_cards=[{"paper_id": "p1"}], claim_plans=[{"claim_id": "stale"}])
+    llm = ScriptedLLM({"main_agent_decision": ["fetch_metadata", "request_finish"],
+                      "search_agent_decision": ["fetch_metadata", report()],
+                      "analysis_agent_decision": ["extract_paper_cards", report()]})
+    calls = []
+    def refresh(s, a):
+        calls.append("fetch")
+        s["paper_details"] = [{"paper_id": "p1", "abstract": "changed"}]
+    def extract(s, a):
+        calls.append("extract")
+        assert not s.get("claim_plans")
+        assert s["pending_card_rebuild_ids"] == ["p1"]
+        s["paper_cards"] = [{"paper_id": "p1", "evidence_source": "abstract"}]
+    status = MainAgentLoop(llm).run(current, handlers={"fetch_metadata": refresh, "extract_paper_cards": extract},
+                                   finish_validator=lambda s: calls == ["fetch", "extract"])
+    assert status == "completed" and calls == ["fetch", "extract"]
+    assert current["pending_card_rebuild_ids"] == []
+    search_context = json.loads([msg for op, msg in llm.calls if op == "search_agent_decision"][1][-1]["content"])
+    assert "fetch_metadata" not in search_context["state"]["allowed_actions"]
+    restored = store.hydrate_state("s", store.externalize_state("s", current))
+    assert restored["pending_card_rebuild_ids"] == []
+
+
+def test_pending_rebuild_survives_externalization_and_resumes_analysis(store):
+    current = state()
+    current.update(intent="generate_introduction", paper_details=[{"paper_id": "p1", "abstract": "new"}],
+                   paper_cards=[], pending_card_rebuild_ids=["p1"])
+    restored = store.hydrate_state("s", store.externalize_state("s", current))
+    llm = ScriptedLLM({"main_agent_decision": ["request_finish"],
+                      "analysis_agent_decision": ["extract_paper_cards", report()]})
+    def extract(s, a):
+        s["paper_cards"] = [{"paper_id": "p1", "evidence_source": "abstract"}]
+    assert MainAgentLoop(llm).run(restored, handlers={"extract_paper_cards": extract},
+                                 finish_validator=lambda s: bool(s.get("paper_cards"))) == "completed"
+    assert restored["pending_card_rebuild_ids"] == []
+    assert [op for op, _ in llm.calls].count("main_agent_decision") == 1

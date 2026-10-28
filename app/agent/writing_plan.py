@@ -15,6 +15,7 @@ from app.schemas.deliverable_schema import (
     WritingSection,
 )
 from app.tools.cluster_papers import semantic_route_label
+from app.services.evidence_support import authorized_field_claim
 
 _FALLBACK_THEME_RE = re.compile(r"其他|其它|未分类|兜底|other|misc", re.I)
 
@@ -247,7 +248,7 @@ def _induce_background_outline(
             }
             for field, values in (card.get("field_claims") or {}).items()
             for claim in values or []
-            if isinstance(claim, dict) and claim.get("explicitly_reported")
+            if authorized_field_claim(card, claim)
         ][:12]
         evidence_summary.append({
             "paper_id": paper_id,
@@ -532,7 +533,7 @@ def _all_claim_ids(cards: list[dict[str, Any]], allowed_ids: list[str]) -> list[
         str(claim.get("evidence_id"))
         for card in cards if str(card.get("paper_id")) in allowed
         for claims in (card.get("field_claims") or {}).values()
-        for claim in claims if claim.get("explicitly_reported") and claim.get("evidence_id")
+        for claim in claims if authorized_field_claim(card, claim) and claim.get("evidence_id")
     ))
 
 

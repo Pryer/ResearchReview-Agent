@@ -184,8 +184,10 @@ def extract_card_node(
         # WHY: 增量详情可能重新确认同一篇论文；旧卡的关系与交付物资格
         # 属于上一版详情，不能仅凭 paper_id 继续复用。
         hybrid_mode = (state.get("retrieval_profile") or {}).get("mode") == "hybrid"
+        # WHY: Controller 已按当前详情移除失效卡；失效重建也复用仍有效的卡，
+        # 避免为重建少量论文再次消耗整池提取预算，不复用已被移除的旧卡。
         existing_cards = [card for card in (state.get("paper_cards") or [])
-                          if state.get("incremental_retrieval")
+                          if (state.get("incremental_retrieval") or state.get("pending_card_rebuild_ids"))
                           and _paper_identity_key(card) in detail_by_key
                           and str(card.get("paper_id") or "") not in refreshed_ids
                           and (not hybrid_mode or (
@@ -234,7 +236,10 @@ def extract_card_node(
         raise AgentCancelledError(str(exc)) from exc
     except Exception as e:
         from app.agent.exceptions import LLMGenerationError
+        from app.agent.execution_budget import is_control_exception
 
+        if is_control_exception(e):
+            raise
         error = LLMGenerationError(str(e), step="extract_card", original_error=e)
         logger.error("extract_card_node failed: %s", error.message)
         state.setdefault("errors", []).append(f"extract_card: {e}")

@@ -21,6 +21,12 @@ def _card(paper_id: str, problem: str, method: str) -> dict:
         "evidence_source": "abstract",
         "evidence_state": {"access_level": "abstract", "verification_status": "source_verified"},
         "unsupported_fields": ["limitations", "ablation_results"],
+        "evidence_spans": [
+            {"evidence_id": f"{paper_id}:problem", "text": problem,
+             "source_type": "abstract", "char_start": 0, "char_end": len(problem)},
+            {"evidence_id": f"{paper_id}:method", "text": method,
+             "source_type": "abstract", "char_start": 0, "char_end": len(method)},
+        ],
         "field_claims": {
             "research_problem": [{
                 "claim": problem, "source_text": problem, "source_section": "abstract",
@@ -326,9 +332,12 @@ def test_writer_receives_authoritative_bibliographic_fields(monkeypatch):
             "peer_review_status": "likely_peer_reviewed",
             "publication_type": "conference_paper",
             "evidence_state": {"access_level": "abstract"},
+            "evidence_spans": [{"evidence_id":"p1:method","text":"We adopt YOLOv10 for classroom behavior detection.",
+                                "source_type":"abstract","char_start":0,
+                                "char_end":len("We adopt YOLOv10 for classroom behavior detection.")}],
             "field_claims": {
                 "method": [{
-                    "claim": "采用 YOLOv10 检测课堂行为",
+                    "claim": "We adopt YOLOv10 for classroom behavior detection.",
                     "source_text": "We adopt YOLOv10 for classroom behavior detection.",
                     "source_section": "abstract",
                     "evidence_id": "p1:method",

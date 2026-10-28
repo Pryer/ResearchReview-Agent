@@ -287,12 +287,19 @@ def check_generation_readiness(state: dict[str, Any]) -> GenerationReadinessResu
             "requested": requested,
             "available": len(eligible_ids),
         })
+        from app.agent.quality_recovery_policy import forbidden_quality_actions
+
+        denied = forbidden_quality_actions(state)
+        # WHY: readiness 会直接进入 API 和门禁说明；不能只过滤澄清问句，
+        # 也不能把结构化建议当作对明确约束的改约授权。
+        if "expand_time_range" not in denied:
+            recovery.append("扩大检索年份范围")
         recovery.extend([
-            "扩大检索年份范围",
             "在保持主题边界的前提下补充同义词和数据库",
             "提供符合原范围的补充论文或可访问证据",
-            f"确认接受少于 {requested} 篇后重新提交",
         ])
+        if "accept_available" not in denied:
+            recovery.append(f"确认接受少于 {requested} 篇后重新提交")
     elif (
         state.get("max_papers_explicit", False)
         and requested

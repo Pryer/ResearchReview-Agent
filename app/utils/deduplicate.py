@@ -11,6 +11,15 @@ from app.utils.title_cleaner import clean_title
 logger = get_logger(__name__)
 
 
+def _identity_conflict(left, right):
+    # WHY: 弱标题及不完整桥接记录不能覆盖已知强标识冲突；关系不等于同一引用身份。
+    if left.get("doi") and right.get("doi") and str(left["doi"]).strip().lower() == str(right["doi"]).strip().lower():
+        return False
+    return any(left.get(key) and right.get(key)
+               and str(left[key]).strip().lower() != str(right[key]).strip().lower()
+               for key in ("doi", "arxiv_id"))
+
+
 def normalize_title(title: str) -> str:
     """标题归一化。"""
     if not title:
@@ -95,6 +104,7 @@ def deduplicate_papers(
     key_to_index: Dict[str, int] = {}          # "doi:x" / "arxiv:y" → 存活索引
     title_entries: list[tuple[str, int]] = []  # (normalized_title, 存活索引)
     result_indices: list[int] = []
+    ambiguous_keys: set[str] = set()
 
     def _remap_owner(from_idx: int, to_idx: int) -> None:
         """把 from_idx 名下的全部键与标题变体改挂到 to_idx。"""
@@ -114,10 +124,17 @@ def deduplicate_papers(
             *(f"arxiv:{value}" for value in [arxiv_id] if value),
         ]
 
-        owners = {key_to_index[key] for key in keys if key in key_to_index}
-        if norm:
+        for key in keys:
+            if key in key_to_index and _identity_conflict(paper,papers[key_to_index[key]]):
+                ambiguous_keys.add(key)
+        owners = {key_to_index[key] for key in keys if key in key_to_index and key not in ambiguous_keys
+                  and not _identity_conflict(paper,papers[key_to_index[key]])}
+        if norm and not (keys and all(key in ambiguous_keys for key in keys)):
             for seen_title, idx in title_entries:
                 if title_similarity(norm, seen_title) >= similarity_threshold:
+                    if _identity_conflict(paper,papers[idx]) or any(_identity_conflict(papers[idx],papers[o]) for o in owners):
+                        paper.setdefault("_possible_duplicate_ids",[]).append(str(papers[idx].get("paper_id") or ""))
+                        continue
                     owners.add(idx)
                     break
 
@@ -131,13 +148,15 @@ def deduplicate_papers(
                 result_indices.remove(owner)
             _merge_paper(papers, keep_idx, i)
             for key in keys:
-                key_to_index[key] = keep_idx
+                if key not in ambiguous_keys:
+                    key_to_index[key] = keep_idx
             if norm:
                 title_entries.append((norm, keep_idx))
             continue
 
         for key in keys:
-            key_to_index[key] = i
+            if key not in ambiguous_keys:
+                key_to_index[key] = i
         if norm:
             title_entries.append((norm, i))
         result_indices.append(i)

@@ -13,6 +13,7 @@ GOAL = fields("""user_query session_id user_operation_sequence agent_orchestrati
 user_clarifications intent intent_context_role confidence topic canonical_topic start_year end_year
 max_papers required_reference_count year_range_explicit strict_year_range max_papers_explicit
 requested_sections core_deliverables user_paper_profile research_request research_plan research_semantic_frame research_query_rewrite
+quality_original_query quality_constraint_changes
 selected_scope language citation_style workflow our_work background existing_limitations verified_results target_length
 state_schema_version state_revision evidence_snapshot_version evidence_snapshot_fingerprint writing_version""")
 TRACE = fields("steps errors step_metrics contract_violations state_invariant_check")
@@ -27,7 +28,7 @@ incremental_search_new_candidates incremental_new_paper_ids incremental_new_pape
 candidate_papers ranked_papers source_diagnostics screening_report last_search_new_results retrieval_eligible_count
 screening_report_low_pass_protection english_screening_recovery english_screening_recovery_attempted
 cnki_anchor_query_used citation_shortfall_count""")
-MATERIAL = fields("paper_details pdf_paths parsed_papers paper_cards evidence_quality_report")
+MATERIAL = fields("paper_details pdf_paths parsed_papers paper_cards pending_card_rebuild_ids evidence_quality_report")
 ANALYSIS = fields("""provisional_framework validated_routes route_decisions route_validation_report
 clusters dynamic_taxonomy taxonomy_validation taxonomy_remediation theme_synthesis claim_plans
 claim_evidence_gate claim_alignment claim_citation_consistency global_evidence_gate evidence_gap_report
@@ -76,7 +77,7 @@ CONTRACTS = {
         SEARCH | fields("generation_blocked research_semantic_frame")),
     "fetch_metadata": contract(SEARCH | MATERIAL | fields("validated_routes generation_readiness recovery_decision"),
         SEARCH | MATERIAL),
-    "extract_paper_cards": contract(MATERIAL | fields("incremental_retrieval incremental_new_paper_ids"), fields("paper_cards")),
+    "extract_paper_cards": contract(MATERIAL | fields("incremental_retrieval incremental_new_paper_ids"), fields("paper_cards pending_card_rebuild_ids")),
     "validate_routes": contract(MATERIAL | ANALYSIS | RECOVERY | fields("ranked_papers"), ANALYSIS | fields("paper_cards paper_details")),
     "cluster_papers": contract(MATERIAL | ANALYSIS | RECOVERY | fields("ranked_papers"), ANALYSIS | fields("paper_cards paper_details")),
     "plan_claims": contract(MATERIAL | ANALYSIS | RECOVERY | fields("ranked_papers"),

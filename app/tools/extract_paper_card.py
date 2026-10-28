@@ -7,10 +7,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from typing import Any, Callable, Dict, List, Optional
 
 from app.core.exceptions import PaperCardExtractionError
+from app.schemas.vector_schema import VectorIntegrityError, VectorStoreUnavailable
+from app.services.evidence_support import authorized_field_claim, literal_support
 from app.core.logger import get_logger
 from app.schemas.paper_schema import (
     AccessLevel,
@@ -39,6 +42,7 @@ def extract_paper_card(
     parsed_text: Optional[Dict[str, Any]] = None,
     llm=None,
     topic: str = "",
+    *, should_cancel: Optional[Callable[[], bool]] = None,
 ) -> PaperCard:
     """抽取单篇论文的结构化卡片。
 
@@ -57,6 +61,8 @@ def extract_paper_card(
     # PDF 解析结果，也不得把它升级为全文证据。
     from app.tools.download_pdf import is_cnki_paper
 
+    if should_cancel and should_cancel():
+        raise InterruptedError("卡片抽取已取消")
     if is_cnki_paper(paper):
         if parsed_text and parsed_text.get("full_text"):
             logger.info(
@@ -72,7 +78,7 @@ def extract_paper_card(
         # 只对有全文或有摘要的论文调 LLM 抽卡片；
         # 无摘要（如 CrossRef 中文期刊常缺摘要）直接走规则抽取，避免无效 LLM 调用。
         if has_full_text and llm:
-            card = extract_from_full_text(paper, parsed_text, llm, topic)
+            card = extract_from_full_text(paper, parsed_text, llm, topic, should_cancel=should_cancel)
         elif has_abstract and llm:
             card = extract_from_abstract(paper, llm, topic)
         else:
@@ -83,10 +89,18 @@ def extract_paper_card(
 
         if validate_paper_card(card):
             return card
+        if card.extraction_coverage is not None:
+            return card.model_copy(update={
+                "quality_status": "invalid", "field_claims": {}, "field_evidence": {},
+                "quality_issues": [*card.quality_issues, "extraction:invalid_card_structure"],
+            })
         # 验证失败时降级到规则抽取
         fallback = _deduplicate_card_fields(_extract_rule_based(paper, parsed_text, topic))
         return _quality_gate(_attach_evidence(fallback, paper, parsed_text))
     except Exception as e:
+        from app.agent.execution_budget import is_control_exception
+        if isinstance(e, (InterruptedError, VectorIntegrityError, VectorStoreUnavailable)) or is_control_exception(e):
+            raise
         logger.warning("PaperCard extraction failed for %s: %s", paper.get("paper_id"), e)
         fallback = _deduplicate_card_fields(_extract_rule_based(paper, parsed_text, topic))
         return _quality_gate(_attach_evidence(fallback, paper, parsed_text))
@@ -97,26 +111,108 @@ def extract_from_full_text(
     parsed_text: Dict[str, Any],
     llm,
     topic: str = "",
+    *, should_cancel: Optional[Callable[[], bool]] = None,
 ) -> PaperCard:
-    """基于全文用 LLM 生成 PaperCard。"""
-    from app.prompt.paper_card import PAPER_CARD_EXTRACTION_PROCTION_PROMPT
+    """逐块摘录后确定性聚合；保留原文与处理覆盖，不追加聚合模型调用。"""
+    from app.core.config import get_settings
+    from app.agent.execution_budget import check_execution, is_control_exception
+    from app.prompt.paper_card import CHUNK_FIELD_EXTRACTION_PROMPT
+    from app.schemas.paper_schema import ExtractionCoverage, ExtractionChunkRecord
+    from app.tools.chunk_pdf import chunk_pdf
+    from app.tools.chunk_retriever import retrieve_chunks
 
-    full_text = parsed_text.get("full_text", "")
-    # 截断避免超长
-    if len(full_text) > 8000:
-        full_text = full_text[:8000] + "\n...[truncated]"
-
-    prompt = PAPER_CARD_EXTRACTION_PROCTION_PROMPT.format(
-        evidence_label="[有全文，基于全文抽取]",
-        title=paper.get("title", ""),
-        full_text_or_json=full_text,
-        paper_id=paper.get("paper_id", "unknown"),
-        evidence_source="full_text",
-    )
-
-    response = llm.complete(prompt, response_format="json")
-    data = _safe_parse_json(response)
-    return _dict_to_card(data, paper, "full_text", topic)
+    settings = get_settings()
+    chunks = chunk_pdf(parsed_text, max_chars=settings.card_extraction_chunk_chars,
+                       paper_id=str(paper.get("paper_id") or ""))
+    retrieval = retrieve_chunks(str(paper.get("paper_id") or ""), chunks,
+                                settings=settings, topic=topic, should_cancel=should_cancel, parsed_text=parsed_text)
+    by_id = {chunk["chunk_id"]: chunk for chunk in chunks}
+    selected = set(retrieval.selected_chunk_ids)
+    # WHY: 先按检索/章节计划执行，诊断仍覆盖全部块；Top-K 命中本身不构成证据。
+    chunks = [by_id[i] for i in retrieval.selected_chunk_ids] + [
+        chunk for chunk in chunks if chunk["chunk_id"] not in selected]
+    fields = ("research_problem", "study_design", "sample_size", "data_modalities",
+              "behavior_categories", "method", "dataset", "metrics", "results",
+              "contributions", "limitations")
+    values = {name: [] for name in fields}
+    spans, mapping, records = [], {}, []
+    calls = 0
+    stopped = False
+    issues = ["chunk_retrieval:degraded"] if retrieval.degraded else []
+    for chunk in chunks:
+        check_execution()
+        if should_cancel and should_cancel():
+            raise InterruptedError("卡片抽取已取消")
+        status, reason = "processed", None
+        if chunk["excluded"]:
+            status, reason = "excluded", "reference_section"
+        elif stopped or chunk["chunk_id"] not in selected or calls >= settings.card_extraction_max_chunks:
+            status, reason = "skipped", "provider_failure" if stopped else "chunk_call_limit"
+        else:
+            calls += 1
+            try:
+                response = llm.complete(CHUNK_FIELD_EXTRACTION_PROMPT.format(
+                    title=paper.get("title", ""), text=chunk["text"]), response_format="json")
+                check_execution()
+                data = _safe_parse_json(response)
+                if (not isinstance(data, dict) or not any(name in data for name in fields)
+                        or any(not isinstance(data[name], list)
+                               or any(not isinstance(q, str) for q in data[name])
+                               for name in fields if name in data)):
+                    raise ValueError("invalid chunk extraction response")
+            except Exception as exc:
+                if isinstance(exc, InterruptedError) or is_control_exception(exc):
+                    raise
+                logger.warning("Chunk extraction failed: %s chunk=%s error=%s",
+                               paper.get("paper_id"), chunk["chunk_id"], type(exc).__name__)
+                status, reason, stopped = "failed", type(exc).__name__, True
+                data = {}
+            for field in fields:
+                quotes = data.get(field, [])
+                if not isinstance(quotes, list):
+                    continue
+                if len(quotes) > 3:
+                    issues.append("extraction:field_quote_limit")
+                for quote in quotes[:3]:
+                    if not isinstance(quote, str) or not 15 <= len(quote.strip()) <= 1000:
+                        issues.append("extraction:rejected_quote")
+                        continue
+                    quote = quote.strip()
+                    start = chunk["text"].find(quote)
+                    if start < 0:
+                        issues.append("extraction:quote_not_in_source")
+                        continue
+                    if quote in values[field]:
+                        continue
+                    values[field].append(quote)
+                    evidence_id = f"{paper.get('paper_id')}:chunk:{len(spans)}"
+                    spans.append(EvidenceSpan(
+                        evidence_id=evidence_id, text=quote, page=chunk["page"],
+                        section=chunk["section"], source_type="full_text",
+                        char_start=chunk["char_start"] + start,
+                        char_end=chunk["char_start"] + start + len(quote),
+                        offset_basis=chunk["offset_basis"],
+                        provider=paper.get("source"), source_url=paper.get("pdf_url") or paper.get("url"),
+                    ))
+                    mapping.setdefault(field, []).append(evidence_id)
+        records.append(ExtractionChunkRecord(**{
+            key: chunk[key] for key in ("chunk_id", "page", "section", "char_start", "char_end", "offset_basis")
+        }, status=status, reason=reason))
+    scalar = {"research_problem", "study_design", "sample_size", "method", "dataset", "results"}
+    data = {field: "\n".join(items) if field in scalar else items for field, items in values.items()}
+    # WHY: 元数据只来自检索层；缺失字段保持空，不能让聚合步骤推断或补写。
+    card = _dict_to_card(data, paper, "full_text", topic)
+    complete = bool(records) and any(r.status == "processed" for r in records) and all(
+        r.status in {"processed", "excluded"} for r in records)
+    return card.model_copy(update={
+        **{key: (value or None) if key in {"sample_size", "dataset", "results"} else value
+           for key, value in data.items()},
+        "extraction_coverage": ExtractionCoverage(
+            status="complete" if complete else "partial",
+            chunks=sorted(records, key=lambda record: record.chunk_id), retrieval=retrieval),
+        "evidence_spans": spans, "field_evidence": mapping,
+        "quality_issues": list(dict.fromkeys(issues + ([] if complete else ["extraction:partial_coverage"]))),
+    })
 
 
 def extract_from_abstract(
@@ -556,9 +652,12 @@ def _quality_gate(card: PaperCard) -> PaperCard:
     ]
     limitations = [str(item).strip() for item in card.limitations if str(item).strip()]
     evidence_state = card.evidence_state
+    snapshot = card.model_dump(mode="json")
     field_claims = {
         field: [
-            claim for claim in claims
+            claim.model_copy(update={
+                "explicitly_reported": authorized_field_claim(snapshot, claim.model_dump(mode="json")),
+            }) for claim in claims
             if field not in {
                 "research_problem", "method", "results", "contributions", "limitations"
             }
@@ -714,12 +813,15 @@ def batch_extract_paper_cards(
         paper_id = str(paper.get("paper_id") or "")
         parsed = parsed_texts.get(paper_id)
         try:
-            card = extract_paper_card(paper, parsed, llm, topic)
+            card = extract_paper_card(paper, parsed, llm, topic, should_cancel=should_cancel)
             return idx, card
         except InterruptedError:
             # 协作式取消必须向上传播，不能被降级为规则抽取。
             raise
         except Exception as e:
+            from app.agent.execution_budget import is_control_exception
+            if isinstance(e, (VectorIntegrityError, VectorStoreUnavailable)) or is_control_exception(e):
+                raise
             logger.warning("Failed to extract card for %s: %s", paper_id, e)
             try:
                 return idx, _extract_rule_based(paper, parsed, topic)
@@ -1212,6 +1314,28 @@ def _attach_evidence(
     """为结构化字段匹配原文证据，并生成稳定的 field_evidence 映射。"""
     candidates = _candidate_evidence(paper, parsed_text)
     evidence_state = resolve_evidence_permissions(paper, parsed_text)
+    # WHY: 新路径只接受能按原坐标回读的摘录；不能再被 200 条词项候选采样挤掉。
+    if card.extraction_coverage is not None:
+        span_by_id = {span.evidence_id: span for span in card.evidence_spans}
+        verified = []
+        for field, ids in card.field_evidence.items():
+            value = getattr(card, field, None)
+            value_text = "\n".join(value) if isinstance(value, list) else str(value or "")
+            for evidence_id in ids:
+                span = span_by_id.get(evidence_id)
+                if span is None or span.char_start is None or span.char_end is None:
+                    continue
+                if span.page is not None:
+                    source = next((str(page.get("text") or "") for page in (parsed_text or {}).get("pages", [])
+                                   if page.get("page") == span.page), "")
+                else:
+                    source = str((parsed_text or {}).get("full_text") or "")
+                if source[span.char_start:span.char_end] != span.text or span.text not in value_text:
+                    continue
+                candidate = span.model_dump(exclude={"evidence_id"})
+                candidate["_field"] = field
+                verified.append(candidate)
+        candidates = verified + candidates
     if not candidates:
         return card.model_copy(update={
             "evidence_state": evidence_state,
@@ -1229,6 +1353,10 @@ def _attach_evidence(
         "contributions": " ".join(card.contributions),
         "limitations": " ".join(card.limitations),
     }
+    if card.extraction_coverage is not None:
+        for name in ("study_design", "sample_size", "data_modalities", "behavior_categories"):
+            value = getattr(card, name)
+            field_values[name] = "\n".join(value) if isinstance(value, list) else str(value or "")
     selected_indexes: List[int] = []
     field_indexes: Dict[str, List[int]] = {}
     field_scores: Dict[str, Dict[int, float]] = {}
@@ -1240,7 +1368,11 @@ def _attach_evidence(
             key=lambda pair: pair[1],
             reverse=True,
         )
-        matches = [index for index, score in ranked[:2] if score >= 0.08]
+        if card.extraction_coverage is not None:
+            matches = [index for index, item in enumerate(candidates) if item.get("_field") == field]
+            ranked = [(index, 1.0) for index in matches]
+        else:
+            matches = [index for index, score in ranked[:2] if score >= 0.08]
         if matches:
             field_indexes[field] = matches
             field_scores[field] = {index: score for index, score in ranked if index in matches}
@@ -1269,7 +1401,9 @@ def _attach_evidence(
         selected_indexes = [0]
     # WHY: 上限从 12 提高到 20，为新增的书目 evidence 留出预算；内容字段仍
     # 排在前面，因此不会被书目 span 挤出。
-    selected_indexes = list(dict.fromkeys(selected_indexes))[:20]
+    selected_indexes = list(dict.fromkeys(selected_indexes))
+    if card.extraction_coverage is None:
+        selected_indexes = selected_indexes[:20]
     paper_id = str(card.paper_id or paper.get("paper_id") or "paper")
     index_to_id = {
         index: f"{paper_id}:e{position + 1:03d}"
@@ -1285,12 +1419,32 @@ def _attach_evidence(
         )
         for index in selected_indexes
     ]
+    from app.schemas.retrieval_schema import fingerprint
+    for span in spans:
+        if span.source_type not in {"abstract", "full_text", "table"}:
+            continue
+        if span.source_type == "abstract":
+            source = _clean_abstract(str(paper.get("abstract") or ""))
+        elif span.page is not None:
+            source = next((str(page.get("text") or "") for page in (parsed_text or {}).get("pages", [])
+                           if page.get("page") == span.page), "")
+        elif span.offset_basis == "full_text" or span.section == "full_text":
+            source = str((parsed_text or {}).get("full_text") or "")
+        else:
+            source = str(((parsed_text or {}).get("sections") or {}).get(span.section) or "")
+        anchored = (span.char_start is not None and span.char_end is not None
+                    and 0 <= span.char_start < span.char_end <= len(source)
+                    and source[span.char_start:span.char_end] == span.text)
+        span.source_status = "source_verified" if anchored else "source_unverified"
+        span.source_text_hash = hashlib.sha256(span.text.encode("utf-8")).hexdigest()
+        span.source_document_hash = fingerprint(source) if anchored else None
     field_evidence = {
         field: [index_to_id[index] for index in indexes if index in index_to_id]
         for field, indexes in field_indexes.items()
     }
     access_level = evidence_state.access_level
     field_claims: Dict[str, List[EvidenceClaim]] = {}
+    verified_span_ids = {span.evidence_id for span in spans if span.source_status == "source_verified"}
     bibliographic_fields = {
         "publication", "title", "authors", "year", "venue", "doi", "publication_status",
     }
@@ -1306,17 +1460,10 @@ def _attach_evidence(
                 continue
             candidate = candidates[index]
             score = float(field_scores.get(field, {}).get(index, 0.0))
-            normalized_value = re.sub(r"\s+", " ", value).strip().lower()
-            normalized_source = re.sub(r"\s+", " ", candidate["text"]).strip().lower()
+            claim_value = str(candidate["text"]) if candidate.get("_field") else value
             explicit = bool(
-                normalized_value
-                and (
-                    normalized_value in normalized_source
-                    or normalized_source in normalized_value
-                    # 低词面重合只能用于候选召回，不能直接证明蕴含。LLM 抽取
-                    # 产生的改写若无法与原文形成较高覆盖，应保守标记为未显式报告。
-                    or score >= 0.65
-                )
+                literal_support(claim_value,candidate["text"], fragment=field in {"dataset","metrics"})
+                and index_to_id[index] in verified_span_ids
                 and candidate.get("source_type") not in ("metadata", "title")
             )
             source_type = str(candidate.get("source_type") or "metadata")
@@ -1326,8 +1473,8 @@ def _attach_evidence(
                 "abstract": AccessLevel.ABSTRACT,
             }.get(source_type, access_level)
             claims.append(EvidenceClaim(
-                claim=value[:1000],
-                source_text=str(candidate["text"])[:1500],
+                claim=claim_value,
+                source_text=str(candidate["text"]),
                 source_section=str(candidate.get("section") or candidate.get("source_type") or "unknown"),
                 evidence_id=index_to_id[index],
                 evidence_level=claim_level,

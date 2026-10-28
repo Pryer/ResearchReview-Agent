@@ -165,6 +165,7 @@ class ResearchAgentState(TypedDict, total=False):
     parsed_papers: Dict[str, Dict[str, Any]]
 
     # ---------- PaperCard ----------
+    pending_card_rebuild_ids: List[str]  # 元数据变更后待重建的当前论文，不授予引用权限
     paper_cards: List[Dict[str, Any]]
     clusters: List[Dict[str, Any]]
     dynamic_taxonomy: Dict[str, Any]

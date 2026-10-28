@@ -72,6 +72,9 @@ def _card(i):
         'paper_id': f'p{i}', 'title': f'测试研究{i}', 'year': 2024,
         'quality_status': 'valid', 'evidence_source': 'abstract',
         'relation_type': 'direct', 'eligible_deliverables': ['research_background'],
+        'evidence_spans': [{'evidence_id': f'p{i}:e001',
+                            'text': f'研究{i}分析课堂行为与学生参与度的关系',
+                            'source_type': 'abstract', 'source_url': f'https://example.org/p{i}'}],
         'field_claims': {'research_problem': [{
             'claim': f'研究{i}分析课堂行为与学生参与度的关系',
             'explicitly_reported': True, 'evidence_id': f'p{i}:e001',

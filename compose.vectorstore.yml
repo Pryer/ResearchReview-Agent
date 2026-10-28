@@ -1,0 +1,18 @@
+services:
+  vectorstore:
+    image: pgvector/pgvector:0.8.0-pg17
+    environment:
+      POSTGRES_DB: research_vectors
+      POSTGRES_USER: research_vectors
+      POSTGRES_PASSWORD: ${CARD_VECTOR_PASSWORD:?Set a private development password}
+    ports:
+      - "127.0.0.1:${CARD_VECTOR_PORT:-55432}:5432"
+    volumes:
+      - research_vector_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U research_vectors -d research_vectors"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+volumes:
+  research_vector_data:

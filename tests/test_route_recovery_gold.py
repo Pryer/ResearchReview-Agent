@@ -214,6 +214,8 @@ def test_rr08_claim_stronger_than_evidence_is_weakened():
     }]
     cards = [{
         "paper_id": "p1",
+        "evidence_spans": [{"evidence_id": "p1:findings:0", "text": "The method improved accuracy on one benchmark.",
+                            "source_type": "abstract", "source_url": "https://example.org/p1"}],
             "field_claims": {"findings": [{
             "evidence_id": "p1:findings:0",
             "claim_id": "p1:findings:0",

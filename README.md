@@ -10,41 +10,76 @@
 
 ## ✨ 核心能力
 
+按「**1 条工程底座 + 3 个业务模块**」组织：底座是让这套 RAG 在生产上跑得住的运行时能力，
+三个模块是业务数据流（发现 → 检索抽取 → 生成质检）。
+
+### ▍工程底座（跨模块）
+
 | 能力 | 说明 |
 |------|------|
-| 研究请求理解 | LLM开放语义解析 + 规则校验，抽取主题、年份、篇数、范围与四类交付物 |
-| 多轮研究会话 | 保存澄清、论文集合、生成版本和修订历史；支持按序号/标题排除论文 |
-| 上下文管理 | Stable Prefix、ReAct Trajectory、Agent Status Bar 与有界 Compaction 支撑主从决策 |
-| 研究记忆检索 | 主控按任务查询当前会话的历史摘要和失败经验，有界注入上下文，记录采用反馈与后续结果 |
-| 独立子 Agent 循环 | Search / Analysis / Writing 各自持有跨委派上下文，多轮决策并与主控结构化通信 |
-| 专业任务边界 | Controller 按动作投影输入，校验输出白名单、类型、身份与版本后提交 |
-| 后台任务控制 | 长任务异步执行，可查询步骤与进度，并在节点边界协作式取消 |
-| 持久化恢复 | 会话租约与数据库 CAS 保护提交；检查点恢复保留证据、显式约束及累计预算 |
-| 缓存与用量 | 稳定前缀与追加式 ReAct 轨迹，Token 预算触发分层压缩和检查点恢复；统计真实缓存用量 |
-| 增量重生成 | 编辑论文集合后只重做聚类、写作和引用验证，不重复检索与详情补全 |
-| 多源检索 | 默认 arXiv + Semantic Scholar + OpenAlex + Crossref；CNKI Selenium 适配器默认关闭 |
+| Agent 编排模型 | 统一主从调度：主 Agent 每轮选一个任务；Search / Analysis / Writing 各自独立 ReAct 循环，跨委派保留上下文，通过结构化消息完成委派、汇报与协助请求 |
+| 受控执行边界 | Controller 按动作投影输入，校验角色工具权限、输出白名单、类型、身份与版本后才提交；建议动作不等于授权执行 |
+| 上下文工程 | Stable Prefix + 追加式 ReAct Trajectory + 动态 Agent Status Bar；Token 水位触发的有界 Compaction（含滞回阈值）、Artifact 归档与历史观察回查 |
+| 会话记忆检索 | Append-only Event Log + Cursor 增量摘要；主控按任务做中英文词项检索、有界注入，并记录采用反馈与后续结果 |
+| 长任务运行时 | 线程池 Job + 步骤级 Checkpoint；长任务异步执行，可查询步骤与进度，并在节点边界协作式取消 |
+| 持久化与并发 | 条件 UPDATE + 版本号实现乐观并发；会话租约保护提交、防止旧执行覆盖新状态；检查点恢复保留证据、显式约束与累计预算 |
+| 重启恢复边界 | queued 任务重新入队、cancel_requested 兑现取消、**running 任务标记 failed**（不承诺续跑，避免重复副作用） |
+| 缓存与用量 | 稳定前缀与追加式轨迹提升缓存命中；统计真实缓存用量，Token 预算触发分层压缩 |
+
+### ▍模块一：文献发现与知识入库
+
+| 能力 | 说明 |
+|------|------|
+| 研究请求理解 | LLM 开放语义解析 + 规则校验，抽取主题、年份、篇数、范围与四类交付物 |
+| 多轮研究会话 | 保存澄清、论文集合、生成版本与修订历史；支持按序号/标题排除论文 |
+| 多源检索 | 默认 arXiv + Semantic Scholar + OpenAlex + Crossref；CNKI 为 Selenium 网页适配器、**默认关闭**、需显式授权启用 |
+| 论文排序 | 相关性 + 质量综合打分，自动去重；记录 `citation_count_by_source` 避免跨源口径混淆 |
 | 失败诊断 | 区分"真空结果"与"检索失败"，避免误判关键词不合适 |
-| 论文排序 | 相关性 + 质量综合打分，自动去重 |
-| 按源引用量 | 记录 `citation_count_by_source`，避免跨源口径混淆 |
-| PDF 解析 | PyMuPDF 全文/分段提取 |
-| PaperCard | 结构化抽取研究问题、方法、数据、指标 |
+| PDF 解析 | PyMuPDF 逐页解析，保留页码、解析证据指纹与 parser profile；记录空文本页、低文本页等诊断 |
+| 切块与入库校验 | 切块后校验论文身份、块唯一编号与 `[start,end)` 原文区间回读；重复页、改写文本、错位均拒绝持久化 |
+| 向量索引 | **论文内 chunk 级**索引：NumPy 精确检索为默认后端，可选 pgvector；按来源 revision 与 active 快照隔离，复用向量缓存 |
+
+> ⚠️ **边界说明**：`POST /api/library/rebuild_index` 目前是占位实现，仅返回卡片数量，
+> 尚未实现库级向量索引。真实的向量检索能力在 **chunk 层**（`app/tools/chunk_retriever.py`）。
+> 本轮未实现 OCR、表格结构恢复或替换解析器。
+
+### ▍模块二：分层混合检索与结构化证据抽取
+
+| 能力 | 说明 |
+|------|------|
+| 两层检索 | 第一层按论文排序；第二层在单篇论文范围内按七类字段执行 BM25 + Dense 混合召回 |
+| 融合与重排 | Family-aware RRF（同一 Query Family 内先取该论文最优排名，避免查询改写数量直接放大权重）+ 可选 Reranker 重排 |
+| 来源容错 | **按 Provider 粒度**的令牌桶限流、`Retry-After` 解析、指数退避抖动、源级冷却与三态熔断；单一数据源故障不影响其余来源 |
+| 结构化抽取 | PaperCard 抽取研究问题、方法、数据、指标与局限 |
 | 文献矩阵 | 保存作者、完整题名、DOI、文献类型、证据等级、研究设计、样本规模、模态、结果与局限 |
+| 证据计数 | 显式区分「候选论文数」与「合格证据数」，数量不足时报告实际篇数而非凑数 |
+
+### ▍模块三：证据驱动生成与质量控制
+
+| 能力 | 说明 |
+|------|------|
+| 四类交付物 | 研究背景、研究现状、论文相关工作、叙述性综述初稿 |
 | 文献聚类 | 从论文证据归纳理论、实证、方法、应用等研究脉络 |
-| **📝 四类交付物** | 研究背景、研究现状、论文相关工作、叙述性综述初稿 |
-| 引用校验 | 双向匹配降低论文幻觉，支持 claim_evidence_map 逐句核验（可选） |
+| Claim–Evidence | 写作时按句输出证据引用；先做引用存在性校验，再做语义支持判定 |
+| 质量门禁 | 多级门禁，对证据不足执行补检索、修复或阻断交付；区分**硬约束**（引用不存在、违反用户显式年份/数量限制）与**启发式质量阈值** |
+| 增量重生成 | 编辑论文集合后只重做聚类、写作与引用验证，不重复检索与详情补全 |
+| 引用与标识分离 | 主张验证阶段用 DOI / S2 / OpenAlex / arXiv ID 追踪证据；正文统一渲染为顺序编码或作者—年份引用，完整元数据进入参考文献表 |
+| 真实运行反查 | 通过真实 Provider 端到端运行反查出年份漏解析、「最多 N 篇」被误作最低引用数、纯检索被误判写作、子 Agent 汇报动作不合法、相邻题名混入等契约缺陷，逐一修复并补回归 |
 
-默认检索源为 `arxiv,semantic_scholar,openalex,crossref`，仍须遵守各来源的 API Key、
-访问与限流要求。CNKI 是 Selenium 网页适配器，不是官方 API；默认
-`CNKI_ENABLED=false`。请求参数和历史会话中的来源列表均不能覆盖禁用状态，
-直接客户端和浏览器创建入口也会检查。仅在确认适用的自动化访问授权后由部署方
-显式启用，并把 `cnki` 加入所需来源；适配器不隐藏浏览器自动化身份，不绕过访问限制。
+### 关于 CNKI
 
-时间范围说明：相对时间按滚动年份边界近似。例如系统在 2026 年处理“近三年”时，
-检索年份元数据为 2023—2026 年，当前年度只纳入检索时已正式出版或在线公开的记录。
-用户明确给出的时间范围不会为凑足篇数而自动向前扩展；数量不足时系统会报告实际篇数。
+CNKI 是 **Selenium 网页适配器，不是官方 API**，默认 `CNKI_ENABLED=false`。
+请求参数和历史会话中的来源列表均不能覆盖禁用状态，直接客户端和浏览器创建入口也会检查。
+仅在确认适用的自动化访问授权后由部署方显式启用，并把 `cnki` 加入所需来源；
+适配器不隐藏浏览器自动化身份，不绕过访问限制。
 
-正文生成与内部检索标识分离：主张验证阶段使用 DOI、Semantic Scholar、OpenAlex 或
-arXiv ID 追踪证据，最终论文正文统一渲染为顺序编码或作者—年份引用，完整元数据进入参考文献表。
+### 关于时间范围
+
+相对时间按滚动年份边界近似。例如系统在 2026 年处理"近三年"时，检索年份元数据为
+2023—2026 年，当前年度只纳入检索时已正式出版或在线公开的记录。用户明确给出的时间范围
+不会为凑足篇数而自动向前扩展；数量不足时系统会报告实际篇数。
+
+---
 
 ## 当前架构
 
@@ -355,6 +390,16 @@ ResearchReview-Agent/
 | `AGENT_EXECUTION_ACTION_BUDGET` | 会话累计专业动作预留上限 | `64` |
 | `AGENT_MAIN_TOKEN_BUDGET` | 主决策、解析、专业任务、重试及备用共享累计 token 上限 | `10000000` |
 | `AGENT_RETRIEVAL_BUDGET` | 累计检索轮次上限 | `64` |
+| `CARD_EXTRACTION_CHUNK_CHARS` | 全文抽取每块字符上限，优先页及章节边界 | `6000` |
+| `CARD_EXTRACTION_MAX_CHUNKS` | 单篇最多块抽取调用次数，未读块记录为覆盖不全 | `8` |
+| `CARD_CHUNK_RETRIEVAL_MODE` | `sections` 为章节选择；`hybrid` 为论文内字段级 BM25＋dense＋RRF＋可选重排 | `sections` |
+| `CARD_CHUNK_TOP_K` | 每字段检索返回块数；实际抽取仍受每篇调用上限约束 | `5` |
+| `CARD_CHUNK_INDEX_LIMIT` | 单篇参与第二层混合检索的最大块数 | `128` |
+| `CARD_CHUNK_RERANK_WINDOW` / `CARD_CHUNK_ENABLE_RERANK` | 每字段重排窗口及开关 | `12` / `true` |
+| `CARD_VECTOR_BACKEND` / `CARD_VECTOR_DATABASE_URL` | 可选独立持久化后端及 DSN，不替换业务库 | `numpy` / 空 |
+| `CARD_VECTOR_INDEX_MAX_CHUNKS` | 持久化索引的计划块数上限，截断单独记录 | `128` |
+| `CARD_VECTOR_DB_FAILURE_POLICY` | 向量库不可用时 sections 降级或 fail 中止 | `sections` |
+| `CARD_VECTOR_TENANT` | 受信任部署配置的索引隔离作用域，不等同于用户认证 | `local` |
 | `RETRIEVAL_RANKING_MODE` | `rules`、`hybrid_shadow` 或 `hybrid`；已有会话沿用其检索 profile | `rules` |
 | `DASHSCOPE_API_KEY` | hybrid 使用的独立百炼密钥 | 空 |
 | `RETRIEVAL_EMBEDDING_MODEL` / `RETRIEVAL_RERANK_MODEL` | 专用向量及相关性重排模型 | `qwen3.7-text-embedding` / `qwen3.7-text-rerank` |
@@ -409,6 +454,7 @@ ResearchReview-Agent/
 - [docs/retrieval-failure-policy.md](docs/retrieval-failure-policy.md)：限流、重试、部分成功与检索取消边界。
 - [docs/research-workflow.md](docs/research-workflow.md)：Agent 工作流、阶段契约和分支保证。
 - [docs/evidence-model.md](docs/evidence-model.md)：PaperMetadata、Evidence、Claim、Citation 的关系。
+- [docs/knowledge-engineering.md](docs/knowledge-engineering.md)：三模块工作流、可选 pgvector、来源版本、迁移回滚与数据库验收边界。
 - [docs/quality-gates.md](docs/quality-gates.md)：能力、路线、主张、交付物和生成质量门禁。
 - [docs/lessons-learned.md](docs/lessons-learned.md)：历史缺陷、根因和防回归经验。
 - [CHANGELOG.md](CHANGELOG.md)：公开变更摘要与验证边界；详细开发流水仅本地保存。
@@ -427,6 +473,12 @@ ResearchReview-Agent/
 Agent API 的 `claim_verification` 字段提供完整报告，Streamlit 的“引用验证”页可查看
 原句、证据片段、章节/页码和修改建议。设计与 QLoRA 数据导出说明见
 [`docs/evidence_verification.md`](docs/evidence_verification.md)。
+
+历史卡片的抽取字段不能代替原文证据；字段主张在进入规划与写作前会重新检查独立来源和逐字支持。
+UI 片段保留 360 字符，语义核验使用完整的已选证据。
+`CLAIM_VERIFICATION_MAX_CONTEXT_CHARS` 默认限制每条原子主张的去重原文为 12000 字符；
+超限明确报告 `insufficient_context` 并阻断该主张通过，不静默截断。
+迁移、缓存失效与验证边界见 [证据正确性修复](docs/evidence-correctness.md)。
 
 ### 当前实现状态
 
