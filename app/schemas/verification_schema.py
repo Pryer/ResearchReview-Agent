@@ -65,3 +65,5 @@ class ClaimVerificationReport(BaseModel):
     evidence_summary: dict = Field(default_factory=dict)
     evidence_limitations: List[str] = Field(default_factory=list)
     threshold_policy: dict = Field(default_factory=dict)
+    verifier_version: str = ""
+    evidence_input_fingerprint: str = ""

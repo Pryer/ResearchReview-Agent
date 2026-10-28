@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -23,19 +24,31 @@ def parse_pdf(pdf_path: str, *, paper_id: str | None = None) -> Dict[str, Any]:
     Returns:
         包含 sections 和 full_text 的字典。
     """
-    pages = extract_pdf_pages(pdf_path)
+    diagnostics: Dict[str, Any] = {}
+    pages = extract_pdf_pages(pdf_path, diagnostics=diagnostics)
     full_text = clean_parsed_text("\n".join(page["text"] for page in pages))
     sections = split_paper_sections(full_text)
     references = extract_references(full_text)
 
-    return {
+    digest = hashlib.sha256()
+    with open(pdf_path, "rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    from app.services.document_ingestion import PARSER_PROFILE, source_fingerprint
+    result = {
         "full_text": full_text,
         "sections": sections,
         "abstract": sections.get("abstract", ""),
         "references": references,
         "paper_id": paper_id or Path(pdf_path).stem,
         "pages": pages,
+        "source_pdf_hash": digest.hexdigest(),
+        "parser_profile": PARSER_PROFILE,
+        "parse_diagnostics": {**diagnostics, "recognized_sections": list(sections),
+                              "table_count": None, "reading_order_verified": False},
     }
+    result["parsed_source_hash"] = source_fingerprint(result)
+    return result
 
 
 def extract_pdf_text(pdf_path: str) -> str:
@@ -47,7 +60,7 @@ def extract_pdf_text(pdf_path: str) -> str:
     return clean_parsed_text("\n".join(page["text"] for page in pages))
 
 
-def extract_pdf_pages(pdf_path: str) -> List[Dict[str, Any]]:
+def extract_pdf_pages(pdf_path: str, *, diagnostics: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """逐页提取文本，保留 Evidence Card 所需的页码信息。"""
     try:
         import fitz  # PyMuPDF
@@ -58,6 +71,14 @@ def extract_pdf_pages(pdf_path: str) -> List[Dict[str, Any]]:
             for index, page in enumerate(doc)
         ]
         doc.close()
+        if diagnostics is not None:
+            empty = [page["page"] for page in pages if not page["text"].strip()]
+            diagnostics.update(
+                total_pages=len(pages), empty_pages=empty,
+                text_characters=sum(len(page["text"]) for page in pages),
+                # WHY: 低文本只表示 OCR 候选；空白封面等也会命中，不等同于解析失败。
+                ocr_candidate_pages=[page["page"] for page in pages if len(page["text"].strip()) < 40],
+            )
         return [page for page in pages if page["text"]]
     except ImportError:
         raise PDFParseError("PyMuPDF is required to parse PDF files")
@@ -76,21 +97,11 @@ def split_paper_sections(text: str) -> Dict[str, str]:
 
     sections: Dict[str, str] = {}
 
-    # 分段标题正则
-    _HEADING_PATTERNS = [
-        ("references", r"(?:^|\n)\s*(?:references|bibliography|参考文献)\s*(?:\n|$)"),
-        ("conclusion", r"(?:^|\n)\s*\d*\.?\s*(?:conclusions?|discussion|summary|结论|讨论|总结与展望)\s*(?:\n|$)"),
-        ("experiment", r"(?:^|\n)\s*\d*\.?\s*(?:experiments?|evaluation|results?|实验|评估|评价|结果分析?)\s*(?:\n|$)"),
-        ("method", r"(?:^|\n)\s*\d*\.?\s*(?:methods?|approach|model|proposed|研究方法|方法|模型|研究设计)\s*(?:\n|$)"),
-        ("introduction", r"(?:^|\n)\s*\d*\.?\s*(?:introduction|引言|绪论)\s*(?:\n|$)"),
-        ("abstract", r"(?:^|\n)\s*(?:abstract|摘要)\s*(?:\n|$)"),
-    ]
+    from app.tools.chunk_pdf import section_headings
 
-    # 按标题切分
-    splits: list[tuple[str, int]] = []
-    for name, pattern in _HEADING_PATTERNS:
-        for m in re.finditer(pattern, text, re.IGNORECASE):
-            splits.append((name, m.start()))
+    # WHY: 解析保留历史 experiment 名称；与 Chunk 使用同一标题边界，避免准入错位。
+    names = {"results": "experiment", "discussion": "conclusion"}
+    splits = [(names.get(name, name), start) for start, name in section_headings(text)]
 
     # 按位置排序
     splits.sort(key=lambda x: x[1])

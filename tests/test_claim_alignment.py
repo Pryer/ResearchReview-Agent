@@ -30,7 +30,8 @@ def _claim_plans() -> list[dict]:
 def test_single_source_claim_budget_drops_excess_claims() -> None:
     cards = [{
         "paper_id": "p1",
-        "evidence_spans": [{"evidence_id": "p1:e1", "text": "研究提出一种方法。"}],
+        "evidence_spans": [{"evidence_id": "p1:e1", "text": "研究提出一种方法。",
+                            "source_type": "abstract", "source_url": "https://example.org/p1"}],
     }]
     claims = [{
         "claim_id": f"c{i}", "claim_text": f"主张{i}", "claim_type": "finding",
@@ -46,8 +47,8 @@ def test_single_source_claim_budget_drops_excess_claims() -> None:
 
 def test_multiple_spans_from_one_paper_do_not_meet_comparison_minimum() -> None:
     cards = [{"paper_id": "p1", "evidence_spans": [
-        {"evidence_id": "p1:e1", "text": "方法甲的实验结果。"},
-        {"evidence_id": "p1:e2", "text": "方法乙的实验结果。"},
+        {"evidence_id": "p1:e1", "text": "方法甲的实验结果。", "source_type": "abstract", "source_url": "https://example.org/p1"},
+        {"evidence_id": "p1:e2", "text": "方法乙的实验结果。", "source_type": "abstract", "source_url": "https://example.org/p1"},
     ]}]
     plans, report = enforce_claim_evidence_gate(
         [{"route_id": "r1", "claims": [{
@@ -65,7 +66,8 @@ def test_multiple_spans_from_one_paper_do_not_meet_comparison_minimum() -> None:
 def test_pre_generation_entailment_rejects_claim_not_entailed() -> None:
     cards = [{
         "paper_id": "p1",
-        "evidence_spans": [{"evidence_id": "p1:e1", "text": "证据仅说明模型被提出。"}],
+        "evidence_spans": [{"evidence_id": "p1:e1", "text": "证据仅说明模型被提出。",
+                            "source_type": "abstract", "char_start": 0, "char_end": len("证据仅说明模型被提出。")}],
     }]
     class LLM:
         def complete(self, prompt: str, **kwargs) -> str:
@@ -290,6 +292,12 @@ def test_reference_coverage_plan_adds_only_missing_evidence_backed_cards():
          "evidence_state": {"access_level": "metadata_only"},
          "research_problem": "只有元数据", "field_evidence": {"research_problem": ["p4:e1"]}},
     ]
+    for card in cards:
+        text = card["research_problem"]
+        card["evidence_spans"] = [{
+            "evidence_id": f"{card['paper_id']}:e1", "text": text,
+            "source_type": "abstract", "char_start": 0, "char_end": len(text),
+        }]
     plan = build_reference_coverage_plan(
         cards,
         {"canonical_topic": "课堂行为分析"},

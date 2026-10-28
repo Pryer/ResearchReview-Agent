@@ -16,6 +16,7 @@ from typing import Any
 
 from app.core.config import get_review_threshold_policy
 from app.core.logger import get_logger
+from app.services.evidence_support import authorized_field_claim, independent_spans
 
 logger = get_logger(__name__)
 
@@ -367,26 +368,21 @@ def build_reference_coverage_plan(
         )
         if access_level not in {"abstract", "partial_full_text", "full_text"}:
             continue
-        field_evidence = card.get("field_evidence") or {}
         text = ""
         evidence_ids: list[str] = []
         for field in ("research_problem", "method", "results", "contributions", "study_design"):
-            value = str(card.get(field) or "").strip()
-            if not value:
+            supported = [claim for claim in (card.get("field_claims") or {}).get(field) or []
+                         if authorized_field_claim(card,claim)]
+            if not supported:
                 continue
-            text = re.split(r"[。；;!?！？\n]", value)[0].strip()[:180]
-            evidence_ids = [
-                str(item) for item in field_evidence.get(field) or [] if str(item)
-            ]
+            text = str(supported[0].get("claim") or "").strip()
+            evidence_ids = [str(supported[0]["evidence_id"])]
             if text and evidence_ids:
                 break
         if not text or not evidence_ids:
-            spans = [
-                span for span in card.get("evidence_spans") or []
-                if isinstance(span, dict) and span.get("evidence_id") and span.get("text")
-            ]
+            spans = independent_spans(card)
             if spans:
-                text = re.split(r"[。；;!?！？\n]", str(spans[0].get("text") or ""))[0].strip()[:180]
+                text = str(spans[0].get("text") or "").strip()
                 evidence_ids = [str(spans[0]["evidence_id"])] if text else []
         if text and evidence_ids:
             candidates.append({"paper_id": paper_id, "claim_text": text, "evidence_ids": evidence_ids})
@@ -628,13 +624,7 @@ def enforce_claim_evidence_gate(
     }
     evidence_to_paper: dict[str, str] = {}
     for paper_id, card in card_map.items():
-        for field, field_claims in (card.get("field_claims") or {}).items():
-            for claim in field_claims or []:
-                if not isinstance(claim, dict):
-                    continue
-                evidence_id = str(claim.get("evidence_id") or f"{paper_id}:{field}")
-                evidence_to_paper[evidence_id] = paper_id
-        for span in card.get("evidence_spans") or []:
+        for span in independent_spans(card):
             if isinstance(span, dict) and span.get("evidence_id"):
                 evidence_to_paper[str(span["evidence_id"])] = paper_id
 
@@ -688,6 +678,9 @@ def enforce_claim_evidence_gate(
             type_config = _CLAIM_TYPES.get(claim_type, _CLAIM_TYPES["finding"])
             minimum = int(type_config.get("min_evidence", 1))
             if len(paper_ids) < minimum:
+                # WHY: 无独立原文是核验失败，不能因提前删除主张而把门禁改记为通过。
+                if not valid_evidence_ids:
+                    entailment_failed_claims += 1
                 # WHY: 同一论文的多个字段/片段不构成多篇独立支撑；
                 # 与 build_claim_plans 的类型门槛保持同一计数口径。
                 gap_type = (
@@ -763,7 +756,7 @@ def enforce_claim_evidence_gate(
             repaired_plans, card_map, llm
         )
         entailment_checked_claims = checked
-        entailment_failed_claims = failed
+        entailment_failed_claims += failed
         dropped += failed
         retained = sum(len(plan.get("claims") or []) for plan in repaired_plans)
     report = ClaimEvidenceGateReport(
@@ -788,7 +781,7 @@ def _filter_non_entailed_claims(
     llm,
 ) -> tuple[list[dict[str, Any]], int, int]:
     """写作前按证据片段执行真实蕴含校验，拒绝仅词面相似的主张。"""
-    from app.tools.verify_claims import _card_evidence, _llm_entailment_results
+    from app.tools.verify_claims import _card_evidence, _llm_entailment_results, has_semantic_verification_evidence
     from app.schemas.verification_schema import ClaimEvidenceResult
 
     candidates: list[ClaimEvidenceResult] = []
@@ -823,6 +816,9 @@ def _filter_non_entailed_claims(
                 support_status="partially_supported",
                 evidence_snippets=snippets,
             )
+            if not has_semantic_verification_evidence(result):
+                failed_ids.add(str(claim.get("claim_id") or ""))
+                continue
             candidates.append(result)
 
     results = _llm_entailment_results(candidates, llm)
@@ -1111,7 +1107,7 @@ def _extract_route_claims(
         card = card_map.get(paper_id, {})
         for field, field_claims in (card.get("field_claims") or {}).items():
             for claim in field_claims or []:
-                if not isinstance(claim, dict):
+                if not authorized_field_claim(card, claim):
                     continue
                 claim_text = str(claim.get("claim") or claim.get("text") or "").strip()
                 if not claim_text:
@@ -1500,7 +1496,7 @@ def _classify_gap_claim(
                 if not isinstance(claim, dict):
                     continue
                 if str(claim.get("evidence_id") or "") == eid:
-                    if claim.get("explicitly_reported"):
+                    if authorized_field_claim(card, claim):
                         has_explicit_limitation = True
                         break
 
@@ -1771,7 +1767,7 @@ def _is_author_stated(evidence_id: str, card_map: dict[str, dict[str, Any]]) -> 
             if not isinstance(claim, dict):
                 continue
             if str(claim.get("evidence_id") or "") == evidence_id:
-                return bool(claim.get("explicitly_reported"))
+                return authorized_field_claim(card, claim)
     return False
 
 

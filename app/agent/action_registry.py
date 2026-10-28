@@ -157,6 +157,10 @@ def admitted_ranked_papers(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 def recovery_handoff_action(state: dict[str, Any]) -> str:
     """质量恢复后优先把已确认的候选推进到当前证据与授权。"""
+    # WHY: 普通 rules 任务也会在详情刷新时失效旧卡；先交回分析角色重建，
+    # 不要求已经进入写作失败恢复，也不让检索角色越权提取。
+    if state.get("intent") != "search_papers" and state.get("paper_details") and state.get("pending_card_rebuild_ids"):
+        return "extract_paper_cards"
     if not state.get("active_quality_recovery") or state.get("intent") == "search_papers":
         return ""
     if (state.get("retrieval_profile") or {}).get("mode") != "hybrid":

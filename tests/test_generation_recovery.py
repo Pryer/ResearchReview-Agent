@@ -48,6 +48,8 @@ def _card(index: int) -> dict:
         "evidence_state": {"access_level": "abstract"},
         "research_problem": claim,
         "field_evidence": {"research_problem": [f"{paper_id}:e1"]},
+        "evidence_spans": [{"evidence_id":f"{paper_id}:e1","text":claim,"source_type":"abstract",
+                            "char_start":0,"char_end":len(claim)}],
         "field_claims": {
             "research_problem": [{
                 "claim": claim,

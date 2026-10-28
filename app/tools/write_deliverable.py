@@ -21,6 +21,7 @@ from app.deliverables.renderers import (
     _validate_rewritten_section,
 )
 from app.schemas.deliverable_schema import WritingPlan
+from app.services.evidence_support import authorized_field_claim
 
 _AGENT_PROCESS_LANGUAGE_RE = AGENT_PROCESS_LANGUAGE_RE
 _strip_evidence_meta_language = strip_evidence_meta_language
@@ -297,7 +298,7 @@ def _writer_inputs(plan: WritingPlan, state: dict[str, Any]):
         for field, field_claims in (card.get("field_claims") or {}).items():
             for claim in field_claims:
                 evidence_id = str(claim.get("evidence_id") or "")
-                if claim.get("explicitly_reported") and (
+                if authorized_field_claim(card, claim) and (
                     not allowed_claim_ids or evidence_id in allowed_claim_ids
                 ):
                     claims.append({"field": field, **claim})

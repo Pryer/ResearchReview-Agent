@@ -61,12 +61,17 @@ def _role_llm(llm, role: str):
 
 def _draft_fingerprint(state):
     from app.agent.context_builder import _stable_hash
+    from app.services.evidence_support import EVIDENCE_POLICY_VERSION
+    from app.tools.verify_claims import _ENTAILMENT_VERIFIER_VERSION
     # WHY: 调度状态在任务提交时改变，不属于正文验证输入；证据和授权改变则必须重验。
-    return _stable_hash({key: state.get(key) for key in (
+    return _stable_hash({"evidence_policy": EVIDENCE_POLICY_VERSION,
+                         "verifier_version": _ENTAILMENT_VERIFIER_VERSION,
+                         "context_limit": get_settings().claim_verification_max_context_chars,
+                         **{key: state.get(key) for key in (
         "review", "paper_cards", "paper_details", "claim_plans", "writing_plans",
         "citation_map", "citation_registry", "required_reference_count", "start_year",
         "end_year", "quality_gate", "claim_verification", "core_deliverables",
-    )})
+    )}})
 
 
 def _run_autonomous_pipeline(

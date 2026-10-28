@@ -1701,6 +1701,17 @@ def _apply_final_quality_gate(state: "ResearchAgentState") -> None:
     issues: list[dict[str, Any]] = []
     recovery: list[str] = []
     warnings: list[dict[str, Any]] = []
+    prior_report = state.get("claim_verification") or {}
+    if prior_report.get("claims"):
+        from app.tools.verify_claims import _ENTAILMENT_VERIFIER_VERSION
+        if prior_report.get("verifier_version") != _ENTAILMENT_VERIFIER_VERSION:
+            # WHY: 旧检查点的通过结论不能越过新证据规则直接释放正文。
+            issues.append({"code": "claim_verification_incomplete", "message": "证据验证规则已更新，需重新核验正文"})
+            recovery.append("按当前证据规则重新核验正文")
+        if any(set(claim.get("issues") or []) & {"source_unverified", "insufficient_context"}
+               for claim in prior_report.get("claims") or []):
+            issues.append({"code": "claim_evidence_quality_not_met", "message": "正文包含缺少可信原文或完整核验上下文的主张"})
+            recovery.append("补充独立原文或完整上下文，或删除对应主张")
     if state.get("best_effort_generation"):
         forced_issues = list(state.get("forced_generation_issues") or [])
         taxonomy_validation = state.get("taxonomy_validation") or {}
@@ -1739,7 +1750,11 @@ def _apply_final_quality_gate(state: "ResearchAgentState") -> None:
                 "requested": requested,
                 "actual": cited,
             })
-            recovery.append("扩展检索或经用户确认降低最低引用篇数")
+            from app.agent.quality_recovery_policy import forbidden_quality_actions
+
+            recovery.append("在原范围和年份内补充检索与证据")
+            if "accept_available" not in forbidden_quality_actions(state):
+                recovery.append("经用户确认降低最低引用篇数")
 
     selected_scope = state.get("selected_scope") or {}
     if selected_scope and state.get("reference_papers"):

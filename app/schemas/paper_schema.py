@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from app.schemas.chunk_schema import ChunkRetrievalReport
 
 
 class PaperSearchRequest(BaseModel):
@@ -134,9 +135,15 @@ class EvidenceSpan(BaseModel):
     )
     char_start: Optional[int] = Field(default=None, description="在对应来源文本中的起始字符位置")
     char_end: Optional[int] = Field(default=None, description="在对应来源文本中的结束字符位置")
+    offset_basis: Optional[Literal["page", "full_text"]] = Field(
+        default=None, description="新增分块证据的坐标系；历史记录保留 None",
+    )
     confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="证据抽取置信度")
     provider: Optional[str] = Field(default=None, description="证据提供方，如 crossref/openalex/cnki")
     source_url: Optional[str] = Field(default=None, description="证据原始来源链接")
+    source_status: Optional[Literal["source_verified", "source_unverified"]] = None
+    source_text_hash: Optional[str] = None
+    source_document_hash: Optional[str] = None
 
 
 class AccessLevel(str, Enum):
@@ -177,6 +184,25 @@ class EvidenceClaim(BaseModel):
     evidence_level: AccessLevel
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     explicitly_reported: bool = False
+
+
+class ExtractionChunkRecord(BaseModel):
+    chunk_id: int
+    page: Optional[int] = None
+    section: str
+    char_start: int
+    char_end: int
+    offset_basis: Literal["page", "full_text"]
+    status: Literal["processed", "failed", "skipped", "excluded"]
+    reason: Optional[str] = None
+
+
+class ExtractionCoverage(BaseModel):
+    status: Literal["complete", "partial"] = "partial"
+    chunks: List[ExtractionChunkRecord] = Field(default_factory=list)
+    retrieval: Optional[ChunkRetrievalReport] = None
+    # WHY: complete 仅指可用解析文本的非参考文献块均已处理，不授予额外证据权限。
+    strategy: str = "bounded_verbatim_chunks_v1"
 
 
 class PaperCard(BaseModel):
@@ -227,6 +253,9 @@ class PaperCard(BaseModel):
     evidence_source: str = Field(
         default="metadata",
         description="证据来源：abstract / full_text / metadata",
+    )
+    extraction_coverage: Optional["ExtractionCoverage"] = Field(
+        default=None, description="实际分块处理记录；不代表 PDF 解析完整或语义信息完整",
     )
     evidence_spans: List[EvidenceSpan] = Field(
         default_factory=list,

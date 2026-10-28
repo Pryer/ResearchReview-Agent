@@ -250,6 +250,7 @@ class Settings(BaseSettings):
     enable_llm_card_extraction: bool = False
     enable_llm_clustering: bool = True
     enable_claim_verification: bool = True
+    claim_verification_max_context_chars: int = Field(default=12000, ge=1000, le=64000)
     # 引用分配已有主题均衡的确定性算法；默认不再为这一控制面等待
     # 主备 LLM 超时，避免生成正文前额外阻塞数分钟。
     enable_llm_citation_planning: bool = False
@@ -304,6 +305,23 @@ class Settings(BaseSettings):
     detail_fetch_max_workers: int = 8
     pdf_download_max_workers: int = 4
     card_extraction_max_workers: int = 5
+    card_extraction_chunk_chars: int = Field(default=6000, ge=1000, le=12000)
+    card_extraction_max_chunks: int = Field(default=8, ge=1, le=32)
+    card_chunk_retrieval_mode: Literal["sections", "hybrid"] = "sections"
+    card_chunk_top_k: int = Field(default=5, ge=1, le=8)
+    card_chunk_index_limit: int = Field(default=128, ge=8, le=512)
+    card_chunk_rerank_window: int = Field(default=12, ge=8, le=32)
+    card_chunk_enable_rerank: bool = True
+    card_vector_backend: Literal["numpy", "pgvector"] = "numpy"
+    card_vector_database_url: str = ""
+    card_vector_tenant: str = Field(default="local", min_length=1)
+    card_vector_index_max_chunks: int = Field(default=128, ge=8, le=512)
+    card_vector_db_failure_policy: Literal["sections", "fail"] = "sections"
+    card_vector_connect_timeout: int = Field(default=5, ge=1, le=30)
+    card_vector_statement_timeout_ms: int = Field(default=10000, ge=100, le=60000)
+    card_vector_pool_size: int = Field(default=2, ge=1, le=8)
+    card_vector_prepared_statements: bool = True
+    card_vector_build_lease_seconds: int = Field(default=180, ge=1, le=1800)
     pdf_download_retries: int = 3
     pdf_download_backoff_seconds: float = 0.8
     pdf_download_connect_timeout: int = 15

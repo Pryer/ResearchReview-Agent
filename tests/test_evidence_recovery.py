@@ -203,6 +203,8 @@ def test_claim_gate_weakens_overclaim_and_drops_unbound_optional_claim():
     cards = [{
         "paper_id": "p1",
         "source": "openalex",
+        "evidence_spans": [{"evidence_id": "p1:results:1", "text": "方法在该数据集上提升了准确率",
+                            "source_type": "abstract", "source_url": "https://example.org/p1"}],
         "field_claims": {
             "results": [{
                 "claim": "方法在该数据集上提升了准确率",

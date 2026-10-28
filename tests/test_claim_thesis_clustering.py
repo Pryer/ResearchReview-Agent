@@ -294,6 +294,12 @@ def _card(pid: str, problem: str, method: str) -> dict:
         "evidence_state": {"access_level": "abstract"},
         "research_problem": problem,
         "method": method,
+        "evidence_spans": [
+            {"evidence_id": f"{pid}:problem", "text": problem,
+             "source_type": "abstract", "char_start": 0, "char_end": len(problem)},
+            {"evidence_id": f"{pid}:method", "text": method,
+             "source_type": "abstract", "char_start": 0, "char_end": len(method)},
+        ],
         "field_claims": {
             "research_problem": [
                 {"claim": problem, "evidence_id": f"{pid}:problem",

@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from app.schemas.deliverable_schema import GapType, SynthesizedGap, ThemeSynthesis
+from app.services.evidence_support import authorized_field_claim
 
 
 def synthesize_themes(
@@ -94,7 +95,7 @@ def _claims_for(field: str, paper_ids: list[str], cards: dict[str, dict[str, Any
     seen: set[str] = set()
     for paper_id in paper_ids:
         for claim in (cards[paper_id].get("field_claims") or {}).get(field) or []:
-            if not claim.get("explicitly_reported"):
+            if not authorized_field_claim(cards[paper_id], claim):
                 continue
             text = str(claim.get("claim") or "").strip()
             key = re.sub(r"\W+", "", text.lower())[:160]
