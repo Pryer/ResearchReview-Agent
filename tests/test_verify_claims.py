@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.tools.extract_paper_card import extract_paper_card
+from tests.card_fixtures import source_card
 from app.tools.training_data import (
     build_controlled_training_records,
     build_qlora_records,
@@ -41,7 +41,10 @@ def _card() -> dict:
             "The method achieves 80% accuracy on the FEVER dataset."
         ),
     }
-    return extract_paper_card(paper, llm=None, topic="RAG hallucination").model_dump()
+    return source_card(paper,
+        research_problem=paper["abstract"].split(". ")[0] + ".",
+        results=paper["abstract"].split(". ")[-1],
+    ).model_dump()
 
 
 def _second_card() -> dict:
@@ -56,7 +59,10 @@ def _second_card() -> dict:
             "The pipeline achieves 95% accuracy on the SciFact dataset."
         ),
     }
-    return extract_paper_card(paper, llm=None, topic="RAG hallucination").model_dump()
+    return source_card(paper,
+        research_problem=paper["abstract"].split(". ")[0] + ".",
+        results=paper["abstract"].split(". ")[-1],
+    ).model_dump()
 
 
 def test_rendered_citations_keep_the_same_evidence_on_repeated_checks():
@@ -885,7 +891,7 @@ def _numbered_cards(count: int) -> list[dict]:
                 f"The method achieves {80 + index}% accuracy on the FEVER dataset."
             ),
         }
-        cards.append(extract_paper_card(paper, llm=None, topic="RAG").model_dump())
+        cards.append(source_card(paper).model_dump())
     return cards
 
 

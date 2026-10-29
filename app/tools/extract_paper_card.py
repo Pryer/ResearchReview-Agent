@@ -71,39 +71,35 @@ def extract_paper_card(
             )
         parsed_text = None
 
+    has_full_text = bool(parsed_text and parsed_text.get("full_text"))
+    has_abstract = bool((paper.get("abstract") or "").strip())
+    if not has_full_text and not has_abstract:
+        return _unavailable_card(paper, "no_accessible_content", topic)
+    if llm is None:
+        raise PaperCardExtractionError("PaperCard 抽取需要 LLM；规则抽卡路径已移除")
     try:
-        has_full_text = bool(parsed_text and parsed_text.get("full_text"))
-        has_abstract = bool((paper.get("abstract") or "").strip())
-
-        # 只对有全文或有摘要的论文调 LLM 抽卡片；
-        # 无摘要（如 CrossRef 中文期刊常缺摘要）直接走规则抽取，避免无效 LLM 调用。
-        if has_full_text and llm:
-            card = extract_from_full_text(paper, parsed_text, llm, topic, should_cancel=should_cancel)
-        elif has_abstract and llm:
-            card = extract_from_abstract(paper, llm, topic)
-        else:
-            card = _extract_rule_based(paper, parsed_text, topic)
-
-        card = _deduplicate_card_fields(card)
-        card = _quality_gate(_attach_evidence(card, paper, parsed_text))
-
-        if validate_paper_card(card):
-            return card
-        if card.extraction_coverage is not None:
-            return card.model_copy(update={
-                "quality_status": "invalid", "field_claims": {}, "field_evidence": {},
-                "quality_issues": [*card.quality_issues, "extraction:invalid_card_structure"],
-            })
-        # 验证失败时降级到规则抽取
-        fallback = _deduplicate_card_fields(_extract_rule_based(paper, parsed_text, topic))
-        return _quality_gate(_attach_evidence(fallback, paper, parsed_text))
-    except Exception as e:
+        card = (extract_from_full_text(paper, parsed_text, llm, topic, should_cancel=should_cancel)
+                if has_full_text else extract_from_abstract(paper, llm, topic))
+        card = _quality_gate(_attach_evidence(_deduplicate_card_fields(card), paper, parsed_text))
+        if not validate_paper_card(card):
+            return _unavailable_card(paper, "invalid_card_structure", topic)
+        return card
+    except Exception as exc:
         from app.agent.execution_budget import is_control_exception
-        if isinstance(e, (InterruptedError, VectorIntegrityError, VectorStoreUnavailable)) or is_control_exception(e):
+        if isinstance(exc, (InterruptedError, VectorIntegrityError, VectorStoreUnavailable)) or is_control_exception(exc):
             raise
-        logger.warning("PaperCard extraction failed for %s: %s", paper.get("paper_id"), e)
-        fallback = _deduplicate_card_fields(_extract_rule_based(paper, parsed_text, topic))
-        return _quality_gate(_attach_evidence(fallback, paper, parsed_text))
+        # WHY: 模型失败不能被规则抽卡包装成成功；只返回不可用于写作的身份记录。
+        logger.warning("PaperCard extraction failed: paper=%s error=%s", paper.get("paper_id"), type(exc).__name__)
+        return _unavailable_card(paper, f"model_failure:{type(exc).__name__}", topic)
+
+
+def _unavailable_card(paper: Dict[str, Any], reason: str, topic: str = "") -> PaperCard:
+    metadata = {**paper, "paper_id": str(paper.get("paper_id") or ""), "title": str(paper.get("title") or "")}
+    card = _dict_to_card({}, metadata, "metadata", topic)
+    return card.model_copy(update={
+        "quality_status": "invalid", "quality_issues": [f"extraction:{reason}"],
+        "unsupported_fields": ["research_problem", "method", "results", "contributions", "limitations"],
+    })
 
 
 def extract_from_full_text(
@@ -238,107 +234,6 @@ def extract_from_abstract(
     return _dict_to_card(data, paper, "abstract", topic)
 
 
-def _extract_rule_based(
-    paper: Dict[str, Any],
-    parsed_text: Optional[Dict[str, Any]],
-    topic: str,
-) -> PaperCard:
-    """不依赖 LLM 的规则兜底抽取。"""
-    abstract = _clean_abstract(paper.get("abstract", "") or "")
-    evidence = "metadata"
-    text = ""
-
-    if parsed_text and parsed_text.get("full_text"):
-        text = parsed_text["full_text"]
-        evidence = "full_text"
-    elif abstract:
-        text = abstract
-        evidence = "abstract"
-
-    source_text = text or abstract
-    full_sentences = [item[0] for item in _split_sentences_with_offsets(text)]
-    abstract_sentences = [
-        item[0] for item in _split_sentences_with_offsets(abstract)
-    ]
-    sentences = full_sentences or abstract_sentences
-    # 研究问题优先取摘要，避免把 PDF 首页的期刊页眉、版权行或标题残片
-    # 当作论文研究问题；摘要缺失时才回退到全文。
-    research_problem = (
-        _find_sentence_strict(abstract_sentences, _PROBLEM_PATTERNS)
-        or _find_sentence_strict(full_sentences, _PROBLEM_PATTERNS)
-    )
-    if not research_problem:
-        research_problem = next(
-            (
-                sentence for sentence in [*abstract_sentences, *full_sentences]
-                if _is_clean_evidence_sentence(sentence)
-            ),
-            "",
-        )
-    sections = (parsed_text or {}).get("sections", {})
-    section_method = str(sections.get("method") or "").strip()
-    method_sentences = [
-        item[0] for item in _split_sentences_with_offsets(section_method)
-    ]
-    method = (
-        _find_sentence_strict(method_sentences, _METHOD_PATTERNS)
-        or _find_sentence_strict([*abstract_sentences, *full_sentences], _METHOD_PATTERNS)
-    )
-    result_section = " ".join(
-        str(sections.get(name) or "")
-        for name in ("results", "experiment", "conclusion")
-    )
-    result_sentences = [
-        item[0] for item in _split_sentences_with_offsets(result_section)
-    ]
-    result_text = _find_sentence_strict(
-        [*result_sentences, *abstract_sentences, *full_sentences],
-        _RESULT_PATTERNS,
-    )
-    contribution = _find_sentence_strict(
-        [*abstract_sentences, *full_sentences],
-        _CONTRIBUTION_PATTERNS,
-    )
-    limitation = _find_sentence_strict(
-        [*abstract_sentences, *full_sentences],
-        _LIMITATION_PATTERNS,
-    )
-    metrics = _extract_metrics(source_text)
-    datasets = _extract_datasets(source_text)
-    publication = _infer_publication_profile(paper, source_text)
-
-    return PaperCard(
-        paper_id=paper.get("paper_id", ""),
-        title=paper.get("title", ""),
-        authors=paper.get("authors") or [],
-        year=paper.get("year"),
-        venue=paper.get("venue"),
-        doi=paper.get("doi"),
-        url=paper.get("url"),
-        source=str(paper.get("source") or "unknown"),
-        arxiv_id=paper.get("arxiv_id"),
-        publication_status=_coerce_publication_status(paper.get("publication_status")),
-        publication_type=publication["publication_type"],
-        peer_review_status=publication["peer_review_status"],
-        evidence_level=publication["evidence_level"],
-        research_problem=research_problem,
-        study_design=_infer_study_design(source_text),
-        sample_size=_extract_sample_size(source_text),
-        data_modalities=_extract_data_modalities(source_text),
-        # 开放领域中的类别集合必须由 LLM 从原文动态抽取；规则兜底不维护
-        # 课堂行为等领域枚举，证据不足时宁可保持为空。
-        behavior_categories=[],
-        method=method[:500] if method else "",
-        dataset=", ".join(datasets) if datasets else None,
-        metrics=metrics,
-        results=result_text or None,
-        contributions=[contribution] if contribution else [],
-        limitations=[limitation] if limitation else [],
-        relevance_reason=f"与主题「{topic}」相关" if topic else "",
-        evidence_source=evidence,
-    )
-
-
 def validate_paper_card(card: PaperCard) -> bool:
     """验证身份、证据引用完整性、访问等级和主题关系契约。"""
     if not card.paper_id:
@@ -466,15 +361,6 @@ _LIMITATION_PATTERNS = (
 )
 
 
-def _find_sentence_strict(sentences: List[str], patterns: tuple[str, ...]) -> str:
-    for sentence in sentences:
-        if not _is_clean_evidence_sentence(sentence):
-            continue
-        if any(re.search(pattern, sentence, re.IGNORECASE) for pattern in patterns):
-            return sentence[:800]
-    return ""
-
-
 def _clean_abstract(text: str) -> str:
     """清除中文网页摘要前混入的作者、单位和“摘要”标签。"""
     text = re.sub(r"\s+", " ", str(text or "")).strip()
@@ -561,7 +447,7 @@ def _same_claim_text(left: str, right: str) -> bool:
 def _deduplicate_card_fields(card: PaperCard) -> PaperCard:
     """同一原句只允许承担一个语义字段。
 
-    摘要首句常同时被规则兜底写入 research_problem、method 和
+    摘要原句可能同时被模型写入 research_problem、method 和
     contributions。这里在证据绑定前消除重复，避免同一个 evidence span
     被 Writer 当作三条独立声明使用。
     """
@@ -823,17 +709,10 @@ def batch_extract_paper_cards(
             if isinstance(e, (VectorIntegrityError, VectorStoreUnavailable)) or is_control_exception(e):
                 raise
             logger.warning("Failed to extract card for %s: %s", paper_id, e)
-            try:
-                return idx, _extract_rule_based(paper, parsed, topic)
-            except Exception as inner_e:
-                logger.error("Rule-based extraction also failed for %s: %s", paper_id, inner_e)
-                return idx, PaperCard(
-                    paper_id=paper_id or f"p_{idx}",
-                    title=str(paper.get("title") or ""),
-                    authors=list(paper.get("authors") or []),
-                    year=paper.get("year"),
-                    research_problem=str(paper.get("abstract") or ""),
-                )
+            if isinstance(e, PaperCardExtractionError):
+                raise
+            return idx, _unavailable_card(paper, f"batch_failure:{type(e).__name__}", topic)
+
 
     if should_cancel and should_cancel():
         raise InterruptedError("卡片抽取已取消")
@@ -904,11 +783,10 @@ def _dict_to_card(
         peer_review_status=publication["peer_review_status"],
         evidence_level=publication["evidence_level"],
         research_problem=data.get("research_problem", ""),
-        study_design=data.get("study_design") or _infer_study_design(source_text),
-        sample_size=_coerce_optional_text(data.get("sample_size")) or _extract_sample_size(source_text),
-        data_modalities=_coerce_to_list(data.get("data_modalities")) or _extract_data_modalities(source_text),
-        # 开放领域类别只来自 LLM 动态抽取；缺失时保持为空，不能调用
-        # 不存在的规则兜底（NameError 会让整张卡片静默降级为规则抽取）。
+        study_design=data.get("study_design") or "",
+        sample_size=_coerce_optional_text(data.get("sample_size")),
+        data_modalities=_coerce_to_list(data.get("data_modalities")),
+        # WHY: 内容字段只来自模型绑定的原文，缺失时不得用词表推测类别。
         behavior_categories=_coerce_to_list(data.get("behavior_categories")),
         method=data.get("method", ""),
         dataset=data.get("dataset"),
@@ -940,50 +818,6 @@ def _coerce_optional_text(value) -> Optional[str]:
         return text or None
     text = str(value).strip()
     return text or None
-
-
-def _find_sentence(sentences: List[str], keywords: tuple[str, ...]) -> str:
-    for sentence in sentences:
-        lowered = sentence.lower()
-        if any(keyword in lowered for keyword in keywords):
-            return sentence[:800]
-    return ""
-
-
-def _extract_metrics(text: str) -> List[str]:
-    known = {
-        "accuracy": "Accuracy",
-        "precision": "Precision",
-        "recall": "Recall",
-        "f1": "F1",
-        "bleu": "BLEU",
-        "rouge": "ROUGE",
-        "mrr": "MRR",
-        "ndcg": "NDCG",
-        "准确率": "准确率",
-        "精确率": "精确率",
-        "召回率": "召回率",
-    }
-    lowered = (text or "").lower()
-    return [label for keyword, label in known.items() if keyword in lowered]
-
-
-def _extract_datasets(text: str) -> List[str]:
-    """从摘要/全文中保守抽取显式数据集名称。"""
-    candidates: List[str] = []
-    patterns = (
-        r"\b([A-Z][A-Za-z0-9_.-]{2,})\s+(?:dataset|benchmark|corpus)\b",
-        r"\b(?:on|using|evaluate(?:d)? on)\s+(?:the\s+)?([A-Z][A-Za-z0-9_.-]{2,})(?:\s+dataset)?\b",
-        r"(?:在|使用)([A-Za-z0-9_\-\u4e00-\u9fff]{2,30})数据集",
-    )
-    for pattern in patterns:
-        candidates.extend(re.findall(pattern, text or "", flags=re.IGNORECASE))
-    blocked = {"the", "this", "our", "public", "multiple", "different"}
-    cleaned = [candidate.strip(" .,:;()") for candidate in candidates]
-    return list(dict.fromkeys(
-        candidate for candidate in cleaned
-        if candidate and candidate.lower() not in blocked
-    ))[:5]
 
 
 def _infer_publication_profile(paper: Dict[str, Any], text: str = "") -> Dict[str, str]:
@@ -1043,55 +877,6 @@ def _publication_profile(publication_type: str, is_preprint: bool) -> Dict[str, 
         "peer_review_status": review_status,
         "evidence_level": evidence_map[publication_type],
     }
-
-
-def _infer_study_design(text: str) -> str:
-    lowered = (text or "").lower()
-    designs = (
-        (("meta-analysis", "meta analysis", "元分析"), "meta_analysis"),
-        (("systematic review", "系统综述", "系统评价"), "systematic_review"),
-        (("randomized", "randomised", "随机对照"), "randomized_experiment"),
-        (("longitudinal", "纵向"), "longitudinal_study"),
-        (("case study", "案例研究"), "case_study"),
-        (("interview", "qualitative", "访谈", "质性"), "qualitative_study"),
-        (("survey", "questionnaire", "问卷", "调查"), "survey_study"),
-        (("experiment", "实验"), "experiment"),
-        (("dataset", "benchmark", "数据集", "基准"), "dataset_or_benchmark"),
-    )
-    for markers, label in designs:
-        if any(marker in lowered for marker in markers):
-            return label
-    return ""
-
-
-def _extract_sample_size(text: str) -> Optional[str]:
-    patterns = (
-        r"\b\d{1,6}(?:,\d{3})*\s+(?:[a-z-]+\s+){0,2}(?:students?|teachers?|participants?|patients?|subjects?|cells?|genes?|proteins?|samples?|instances?|images?|videos?|segments?|sessions?|cases?|studies?|trials?|datasets?)\b",
-        r"(?:样本|纳入|包含|分析|收集|测试|评估)(?:了|过|到)?\s*\d{1,6}\s*(?:名学生|名教师|名受试者|例患者|例病例|个样本|个细胞|个基因|个实例|张图像|段视频|项研究|项试验|个数据集)",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text or "", re.IGNORECASE)
-        if match:
-            return match.group(0)[:120]
-    return None
-
-
-def _extract_data_modalities(text: str) -> List[str]:
-    lowered = (text or "").lower()
-    mapping = {
-        "video": ("video", "视频"),
-        "image": ("image", "图像"),
-        "audio": ("audio", "speech", "语音", "音频"),
-        "text": ("transcript", "text", "discourse", "文本", "话语"),
-        "pose_skeleton": ("pose", "skeleton", "keypoint", "姿态", "骨骼", "关键点"),
-        "gaze": ("gaze", "eye tracking", "视线", "眼动"),
-        "sensor": ("sensor", "imu", "accelerometer", "传感器", "加速度计"),
-        "signal": ("eeg", "ecg", "emg", "ppg", "脑电", "心电", "肌电", "生理信号"),
-        "tabular": ("tabular", "structured data", "csv", "表格", "结构化数据"),
-        "genomic": ("genomic", "dna", "rna", "protein sequence", "crispr", "基因组", "测序", "蛋白质序列"),
-        "questionnaire": ("questionnaire", "survey", "问卷"),
-    }
-    return [label for label, markers in mapping.items() if any(marker in lowered for marker in markers)]
 
 
 def _split_sentences_with_offsets(text: str) -> List[tuple[str, int, int]]:

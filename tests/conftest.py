@@ -8,12 +8,11 @@ import sys
 # 确保项目根目录在 sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# 测试默认钉在 rules 检索模式：绝大多数单元/集成测试验证的是既有规则链路
-# （rule_filter/llm_rerank 诊断等），不应因为本机 .env 启用 hybrid 而改变
-# 行为。hybrid 行为由 test_hybrid_retrieval*.py 通过 state 的
-# retrieval_profile 或 monkeypatch settings 显式开启。必须在导入 app
-# 之前设置，pydantic-settings 在实例化时读取环境变量。
-os.environ.setdefault("RETRIEVAL_RANKING_MODE", "rules")
+# 测试运行同一条 hybrid 业务路径，模型使用确定性替身；数据库集成单独显式启用。
+os.environ.setdefault("RETRIEVAL_RANKING_MODE", "hybrid")
+os.environ["CARD_CHUNK_RETRIEVAL_MODE"] = "hybrid"
+os.environ["CARD_VECTOR_DB_FAILURE_POLICY"] = "fail"
+os.environ["CARD_VECTOR_BACKEND"] = "numpy"
 
 # 把测试期间的文件日志隔离到 logs/test/：很多用例直接调用 run_research_agent
 # 等函数，会真实打印"Agent started/step"等运行痕迹；若写入生产 logs/app.log，
@@ -21,6 +20,26 @@ os.environ.setdefault("RETRIEVAL_RANKING_MODE", "rules")
 os.environ.setdefault("APP_LOG_DIR", os.path.join("logs", "test"))
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def offline_rag_models(monkeypatch, tmp_path):
+    from app.core.config import get_settings
+    from app.services import retrieval_ranking_service
+    from app.tools import chunk_retriever
+    from app.agent import graph
+    from tests.retrieval_fakes import OfflineEmbedding, OfflineReranker
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "retrieval_cache_dir", str(tmp_path / "retrieval"))
+    monkeypatch.setattr(settings, "dashscope_api_key", "offline-test")
+    monkeypatch.setattr(settings, "retrieval_embedding_url", "https://example.invalid/embedding")
+    monkeypatch.setattr(settings, "retrieval_rerank_url", "https://example.invalid/rerank")
+    for module in (retrieval_ranking_service, chunk_retriever):
+        monkeypatch.setattr(module, "EmbeddingClient", OfflineEmbedding)
+        monkeypatch.setattr(module, "RerankerClient", OfflineReranker)
+    # WHY: 本 fixture 只隔离环境检查；启动依赖检查本身由专用用例调用真实实现。
+    monkeypatch.setattr(graph, "require_rag_runtime", lambda settings: {"ready": True})
 
 
 @pytest.fixture

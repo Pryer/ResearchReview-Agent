@@ -33,21 +33,8 @@ class NoModel:
         raise AssertionError("must not invoke embedding")
 
 
-def test_sections_mode_does_not_require_pg_database(settings):
-    settings.card_chunk_retrieval_mode = "sections"
-    parsed,chunks = source()
-    report = retrieve_chunks("p",chunks,settings=settings,parsed_text=parsed,embedding_client=NoModel())
-    assert report.backend == "sections" and not report.degraded
 
 
-def test_database_unavailable_explicit_sections_fallback(settings):
-    parsed,chunks = source()
-    report = retrieve_chunks("p",chunks,settings=settings,parsed_text=parsed,embedding_client=NoModel(),
-                             vector_store=BrokenStore(VectorStoreUnavailable("private password")))
-    assert report.backend == "sections"
-    assert report.index_coverage.status == "failed"
-    assert report.degraded == ["vector_store:unavailable"]
-    assert "private password" not in report.model_dump_json()
 
 
 @pytest.mark.parametrize("error", [VectorIntegrityError("stale"),AgentBudgetExceeded("budget"),InterruptedError("cancel")])

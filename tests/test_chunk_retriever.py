@@ -148,13 +148,6 @@ def test_index_bound_and_late_section_coverage(settings):
     assert source[-1]["chunk_id"] in report.selected_chunk_ids
 
 
-def test_sections_mode_never_invokes_remote_models(settings):
-    settings.card_chunk_retrieval_mode = "sections"
-    encoder = Encoder(AssertionError("network forbidden"))
-    report = retrieve_chunks("p", chunks("Introduction\nEarlier context.", "Methods\n" + METHOD,
-                                        "Results\n" + TARGET), settings=settings, embedding_client=encoder)
-    assert not encoder.calls
-    assert report.selected_chunk_ids == [1, 2]
 
 
 @pytest.mark.parametrize("vectors,query", [([[0, 0]], [1, 0]), ([[1, 0]], [float("nan"), 0]),

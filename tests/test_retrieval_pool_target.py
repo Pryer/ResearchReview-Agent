@@ -110,9 +110,12 @@ def _paper(index: int) -> dict:
 
 def _run_fetch_detail(state: dict, ranked_count: int = 90) -> dict:
     from app.tools import fetch_metadata
+    from tests.retrieval_fakes import admitted_paper
 
     state.setdefault("steps", [])
-    state["ranked_papers"] = [_paper(index) for index in range(ranked_count)]
+    state["ranked_papers"] = [admitted_paper(state, **_paper(index)) for index in range(ranked_count)]
+    if state.get("paper_details"):
+        state["paper_details"] = [admitted_paper(state, **p) for p in state["paper_details"]]
     original = fetch_metadata.fetch_batch_details
     fetch_metadata.fetch_batch_details = lambda papers: list(papers)
     try:

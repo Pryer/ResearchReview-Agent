@@ -18,7 +18,7 @@ import copy
 from typing import Any, Callable, Dict, List, Optional
 
 from app.agent.controller import AgentController
-from app.agent.orchestration import normalize_orchestration_mode
+from app.agent.orchestration import normalize_orchestration_mode, normalize_retrieval_profile
 from app.agent.execution import AgentCancelledError
 from app.agent.execution_budget import research_budget
 from app.agent.execution import checkpoint as _checkpoint
@@ -49,6 +49,7 @@ from app.agent.state import ResearchAgentState
 from app.core.config import get_settings
 from app.core.logger import get_logger
 from app.schemas.agent_task_schema import AgentRole
+from app.services.rag_runtime import require_rag_runtime
 
 logger = get_logger(__name__)
 
@@ -63,8 +64,10 @@ def _draft_fingerprint(state):
     from app.agent.context_builder import _stable_hash
     from app.services.evidence_support import EVIDENCE_POLICY_VERSION
     from app.tools.verify_claims import _ENTAILMENT_VERIFIER_VERSION
+    from app.services.rag_runtime import RAG_PIPELINE_VERSION
     # WHY: 调度状态在任务提交时改变，不属于正文验证输入；证据和授权改变则必须重验。
     return _stable_hash({"evidence_policy": EVIDENCE_POLICY_VERSION,
+                         "pipeline_version": RAG_PIPELINE_VERSION,
                          "verifier_version": _ENTAILMENT_VERIFIER_VERSION,
                          "context_limit": get_settings().claim_verification_max_context_chars,
                          **{key: state.get(key) for key in (
@@ -84,8 +87,12 @@ def _run_autonomous_pipeline(
     """以五字段主控循环驱动既有研究节点；门禁仍由确定性代码执行。"""
     from app.agent.main_loop import MainAgentLoop
 
+    if should_cancel and should_cancel():
+        raise AgentCancelledError("任务已取消")
     normalize_orchestration_mode(state)
+    normalize_retrieval_profile(state)
     settings = get_settings()
+    require_rag_runtime(settings)
     llm = _get_llm()
     if state.get("agent_operation_mode") == "verification_only" and not state.get("agent_mandatory_actions"):
         # WHY: 用户/恢复阶梯已选定只重验，模型不能用 finish 或 blocked
@@ -153,9 +160,7 @@ def _run_autonomous_pipeline(
                 parse_pdf_node(current, should_cancel=should_cancel)
 
     def _extract(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
-        card_llm = (
-            _role_llm(llm, "analysis") if settings.enable_llm_card_extraction else None
-        )
+        card_llm = _role_llm(llm, "analysis")
         extract_card_node(current, llm=card_llm, should_cancel=should_cancel)
 
     def _validate_routes(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
@@ -458,6 +463,9 @@ def run_research_agent(
     Raises:
         AgentCancelledError: 任务被取消时抛出。
     """
+    if should_cancel and should_cancel():
+        raise AgentCancelledError("任务已在执行前取消")
+
     # ---------- 初始化状态 ----------
     state: ResearchAgentState = {
         "user_query": user_query,
@@ -480,19 +488,7 @@ def run_research_agent(
         state["state_schema_version"] = "2"
         state["steps"] = []
         state["errors"] = []
-    if "retrieval_profile" not in state:
-        # WHY: 这里不能再写局部 import——文件顶部已全局导入 get_settings，
-        # 函数内任何位置出现对它的绑定都会让 Python 把整个函数内的
-        # get_settings 视为局部变量，导致绑定前调用（如下面的 total_steps）
-        # 抛 UnboundLocalError。
-        # WHY: 带既有研究状态的旧会话不能因环境变量变化而静默切换筛选策略。
-        previous_work = bool(initial_state and any(
-            initial_state.get(key) for key in ("candidate_papers", "ranked_papers", "paper_details")
-        ))
-        state["retrieval_profile"] = {
-            "mode": "rules" if previous_work else get_settings().retrieval_ranking_mode,
-            "version": "hybrid.v1",
-        }
+    normalize_retrieval_profile(state)
 
     logger.info("Agent started: %s", user_query[:100])
 
@@ -540,6 +536,7 @@ def run_research_agent(
         return _build_output(state)
 
     # ---------- 1. 规划 ----------
+    require_rag_runtime(get_settings())
     _checkpoint(state, "plan", 0, total_steps, should_cancel, progress_callback)
     # WHY: 原始需求解析属于检索规划适配器；主决策角色仅在五字段循环调用。
     plan_node(state, llm=_role_llm(_get_llm(), "search"), current_year=current_year)
@@ -587,6 +584,7 @@ def run_research_agent(
             return _build_output(state)
 
     normalize_orchestration_mode(state)
+    normalize_retrieval_profile(state)
     state["agent_operation_mode"] = "initial"
     return _run_autonomous_pipeline(
         state,
@@ -864,7 +862,7 @@ def _prepare_autonomous_regeneration(
             ),
             expected_output=["paper_details", "source_diagnostics"], should_cancel=should_cancel,
         )
-        card_llm = _role_llm(_get_llm(), "analysis") if get_settings().enable_llm_card_extraction else None
+        card_llm = _role_llm(_get_llm(), "analysis")
         _run_analysis_subagent(
             state, operation="extract_paper_cards", objective="刷新现有论文的证据卡",
             handler=lambda current: extract_card_node(current, llm=card_llm, should_cancel=should_cancel),
@@ -1135,7 +1133,7 @@ def _repair_citation_gap(
         "repair_extract_cards",
         extract_card_node,
         state,
-        llm=_get_llm() if settings.enable_llm_card_extraction else None,
+        llm=_get_llm(),
         should_cancel=should_cancel,
     )
     if {"research_status", "related_work", "narrative_review"}.intersection(
@@ -1476,6 +1474,9 @@ def continue_research_agent(
     progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> Dict[str, Any]:
     """在既有证据池上增量检索并重生成，不重复规划和既有证据抽取。"""
+    if should_cancel and should_cancel():
+        raise AgentCancelledError("任务已在执行前取消")
+
     state: ResearchAgentState = dict(research_state)
     existing_details = list(state.get("paper_details") or [])
     existing_cards = list(state.get("paper_cards") or [])
@@ -1500,6 +1501,7 @@ def continue_research_agent(
     _reset_generation_products(state)
 
     normalize_orchestration_mode(state)
+    normalize_retrieval_profile(state)
     state["agent_operation_mode"] = "incremental"
     from app.agent.generation_recovery import active_focus_recovery_targets
 
@@ -1564,12 +1566,16 @@ def regenerate_research_agent(
         AgentCancelledError: 任务被取消时抛出。
         ValueError: 如果删除后没有剩余论文。
     """
+    if should_cancel and should_cancel():
+        raise AgentCancelledError("任务已在执行前取消")
+
     state: ResearchAgentState = dict(research_state)
     state["steps"] = []
     state["errors"] = []
     _restore_explicit_constraint_markers(state)
     verification_only_recovery = bool(state.pop("verification_only_recovery", False))
     normalize_orchestration_mode(state)
+    normalize_retrieval_profile(state)
     state["agent_operation_mode"] = (
         "verification_only" if verification_only_recovery else "regeneration"
     )

@@ -233,3 +233,16 @@ class PgVectorStore:
         with self._db() as cur:
             cur.execute("SELECT version() AS server, extversion AS vector FROM pg_extension WHERE extname='vector'")
             return cur.fetchone()
+
+    def ready(self):
+        """只读检查扩展、迁移版本、维度及运行所需表；不得在业务入口隐式迁移。"""
+        with self._db() as cur:
+            cur.execute("SELECT version, dimension FROM rra_vector_schema WHERE singleton")
+            schema = cur.fetchone()
+            if not schema or (schema["version"], schema["dimension"]) != (1, self.settings.retrieval_embedding_dimension):
+                raise VectorIntegrityError("向量库迁移版本或维度不匹配")
+            for table in ("rra_vector_sources", "rra_vector_snapshots", "rra_vector_chunks"):
+                cur.execute("SELECT to_regclass(%s) AS relation", (table,))
+                if not cur.fetchone()["relation"]:
+                    raise VectorIntegrityError("向量库缺少已迁移的运行表")
+        return True

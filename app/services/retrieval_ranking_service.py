@@ -206,12 +206,14 @@ def _embed_cached(client, cache, settings, texts, text_type, should_cancel):
     return result, len(missing)
 
 
-def _validate_profile(settings):
+def _validate_profile(settings, *, include_rerank=True):
     if settings.retrieval_provider != "dashscope":
         raise ValueError("hybrid 目前只支持 dashscope")
-    if not settings.dashscope_api_key or not settings.retrieval_embedding_url or not settings.retrieval_rerank_url:
+    if not settings.dashscope_api_key or not settings.retrieval_embedding_url:
         raise ValueError("hybrid 缺少 DashScope 密钥或模型端点")
-    if settings.retrieval_cross_encoder_initial_k > settings.retrieval_cross_encoder_max_k:
+    if include_rerank and not settings.retrieval_rerank_url:
+        raise ValueError("启用重排必须配置 Reranker 端点")
+    if include_rerank and settings.retrieval_cross_encoder_initial_k > settings.retrieval_cross_encoder_max_k:
         raise ValueError("hybrid 初始精排窗口超过最大窗口")
 
 
@@ -250,7 +252,7 @@ def _rerank_cached(client, settings, query: str, documents, should_cancel):
 def rank_candidates(state, *, settings, include_rerank=False, should_cancel=None,
                     embedding_client=None, reranker_client=None):
     """返回全部融合候选的有界检查窗口及不含原文的诊断。"""
-    _validate_profile(settings)
+    _validate_profile(settings, include_rerank=include_rerank)
     from app.tools.paper_matching import compile_scope
     from app.tools.rank_papers import evaluate_paper_hard_filters
 
@@ -371,7 +373,7 @@ def rank_candidates(state, *, settings, include_rerank=False, should_cancel=None
         if len(window_papers) >= max_window:
             break
     ranked = window_papers
-    rerank = reranker_client or RerankerClient(settings)
+    rerank = (reranker_client or RerankerClient(settings)) if include_rerank else None
     reranked_new = 0
     if include_rerank and max_window:
         window = min(max_window, settings.retrieval_cross_encoder_initial_k)

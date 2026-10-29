@@ -146,11 +146,11 @@ def test_real_writing_pipeline_rejects_outline_reservation_without_sending_reque
     from unittest.mock import Mock
     from app.agent.execution_budget import budget_scope, budgeted_create
     from app.schemas.deliverable_schema import GenerationReadinessResult, DeliverableReadinessResult
-    from app.tools.extract_paper_card import extract_paper_card
+    from tests.card_fixtures import source_card
 
     paper = {'paper_id': 'p1', 'title': '课堂行为识别', 'authors': ['测试作者'],
              'year': 2024, 'venue': '测试期刊', 'abstract': '该研究通过课堂行为自动识别分析学生参与度。'}
-    card = extract_paper_card(paper, llm=None).model_dump(mode='json')
+    card = source_card(paper).model_dump(mode='json')
     state = {'topic': '课堂行为分析', 'intent': 'generate_review',
              'core_deliverables': ['research_background'], 'paper_details': [paper],
              'paper_cards': [card], 'required_reference_count': 40, 'steps': [], 'errors': [],

@@ -219,7 +219,7 @@ def test_unchanged_detail_keeps_complete_semantic_admission(monkeypatch):
     from app.agent.nodes.retrieval import fetch_detail_node
     from app.agent.deliverable_router import check_generation_readiness
     from app.services.retrieval_ranking_service import _document
-    from app.tools.extract_paper_card import extract_paper_card
+    from tests.card_fixtures import source_card
     from app.tools.paper_matching import compile_scope
 
     scope = compile_scope(topic="classroom interaction")
@@ -253,7 +253,7 @@ def test_unchanged_detail_keeps_complete_semantic_admission(monkeypatch):
                 "_screened_scope_fingerprint"):
         assert detail[key] == ranked[0][key]
     assert detail["_pending_semantic_check"] is False
-    card = extract_paper_card(detail, topic=state["topic"]).model_dump(mode="json")
+    card = source_card(detail, research_problem=detail["abstract"].split(". ")[0] + ".").model_dump(mode="json")
     state["paper_cards"] = [card]
     assert card["relation_type"] == "direct"
     assert card["eligible_deliverables"] == ["related_work"]

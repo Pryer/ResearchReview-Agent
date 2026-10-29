@@ -53,7 +53,6 @@ class ResearchAgentState(TypedDict, total=False):
     required_reference_count: int  # 用户要求最终综述至少使用的唯一参考文献数量
     retrieval_target: int
     retrieval_profile: Dict[str, Any]
-    hybrid_shadow_report: Dict[str, Any]
     retrieval_screening_cache: Dict[str, Any]
     generation_limit: int
     # 证据池绝对目标（详情补全阶段的候选规模上限）。

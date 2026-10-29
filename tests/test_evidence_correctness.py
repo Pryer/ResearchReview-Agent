@@ -7,6 +7,7 @@ from app.schemas.paper_schema import PaperCard
 from app.tools.extract_paper_card import _attach_evidence, _quality_gate, extract_paper_card
 from app.tools.verify_claims import verify_review_claims
 from app.utils.deduplicate import deduplicate_papers
+from tests.card_fixtures import source_card
 
 
 METHOD = "We use a dual encoder method for document retrieval."
@@ -31,7 +32,7 @@ def test_a_legacy_fields_are_not_independent_evidence():
 
 
 def test_a_real_abstract_span_remains_verifiable():
-    card = extract_paper_card({"paper_id":"p1","title":"Study","abstract":METHOD},llm=None).model_dump(mode="json")
+    card = source_card({"paper_id":"p1","title":"Study","abstract":METHOD}).model_dump(mode="json")
     model = Echo()
     report = verify_review_claims(METHOD+" [p1]",[card],llm=model)
     assert report["claims"][0]["support_status"] == "supported"
@@ -110,7 +111,7 @@ def test_a_nonempty_span_without_valid_source_is_not_authorized(span):
 
 
 def test_a_tampered_source_hash_is_not_authorized():
-    card = extract_paper_card({"paper_id":"p1","title":"Study","abstract":METHOD},llm=None).model_dump(mode="json")
+    card = source_card({"paper_id":"p1","title":"Study","abstract":METHOD}).model_dump(mode="json")
     for span in card["evidence_spans"]:
         if span["source_type"] == "abstract":
             span["text"] = span["text"].replace("We use","We ban")
@@ -140,7 +141,7 @@ def test_c_serialized_legacy_true_flag_is_reauthorized_before_writing():
     from app.agent.claim_plan import _is_author_stated
     from app.tools.write_deliverable import _writer_inputs
     from app.schemas.deliverable_schema import WritingPlan, WritingSection
-    card = extract_paper_card({"paper_id":"p1","title":"Study","abstract":METHOD},llm=None).model_dump(mode="json")
+    card = source_card({"paper_id":"p1","title":"Study","abstract":METHOD}).model_dump(mode="json")
     claim = card["field_claims"]["method"][0]
     claim["claim"] = METHOD.replace("We use","We do not use")
     claim["explicitly_reported"] = True
@@ -170,7 +171,7 @@ def test_d_context_after_display_boundary_invalidates_cache():
 
 def test_old_verifier_version_cannot_reuse_local_report_or_cache(monkeypatch):
     import app.tools.verify_claims as verifier
-    card = extract_paper_card({"paper_id":"p1","title":"Study","abstract":METHOD},llm=None).model_dump(mode="json")
+    card = source_card({"paper_id":"p1","title":"Study","abstract":METHOD}).model_dump(mode="json")
     cache = {}
     with monkeypatch.context() as old:
         old.setattr(verifier,"_ENTAILMENT_VERIFIER_VERSION","atomic-entailment-v3")
@@ -225,7 +226,7 @@ def test_legacy_claim_is_rejected_by_quality_planning_and_theme_synthesis(defect
     from app.agent.writing_plan import _all_claim_ids
     from app.tools.synthesize_themes import synthesize_themes
 
-    card = extract_paper_card({"paper_id": "p1", "title": "Study", "abstract": METHOD}, llm=None).model_dump(mode="json")
+    card = source_card({"paper_id": "p1", "title": "Study", "abstract": METHOD}).model_dump(mode="json")
     assert _extract_route_claims(["p1"], {"p1": card})
     if defect == "missing_source":
         card["evidence_spans"] = []

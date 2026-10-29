@@ -1,11 +1,11 @@
 # 有界全文分块抽取
 
-启用 LLM 卡片抽取时，全文路径不再只读取前 8,000 字符：
+业务内容卡片统一由 LLM 抽取，全文路径不再只读取前 8,000 字符：
 
 ```text
 已有解析页面（无页面时使用 full_text）
 → 页内章节、段落边界切块
-→ 可选字段级 BM25/dense/RRF/重排，结合章节覆盖选择块
+→ 字段级 BM25/dense/RRF/重排，结合章节覆盖选择块
 → 每块一次多字段原文摘录
 → 连续原文及位置校验
 → 去重聚合 PaperCard
@@ -23,7 +23,7 @@
 - 普通来源失败停止该论文后续块调用，保留此前成功摘录；预算、取消及执行失效信号向上传播。
 
 长度单位是字符，不是模型 tokens。调用上限不保证费用恒定；已有预算账本仍是最终边界。
-未启用 LLM 时仍走原规则抽取路径。
+规则抽卡与模型失败后的规则回退已删除；缺少模型明确报错，普通模型失败只保留 invalid 元数据记录。
 
 ## 第二层字段检索
 
@@ -32,9 +32,9 @@
 
 `CARD_CHUNK_RETRIEVAL_MODE=hybrid` 时，为研究问题、方法、数据、指标、结果、贡献、局限
 七个字段分别执行 BM25 与 dense 召回、RRF 融合和可选专用模型重排，每字段返回 Top-K。
-原文向量只构建一次，所有字段共用单篇论文内的 NumPy 精确归一化向量索引。
+所有字段共用同一论文的向量索引；默认使用 pgvector，显式选择 NumPy 时使用内存精确索引。
 向量缓存复用现有 VectorCache，按模型、端点、维度、缓存版本、文本类型及内容指纹隔离。
-默认不新增 FAISS 或向量数据库服务；可显式启用独立 pgvector 后端。
+默认需要独立 pgvector，未就绪时停止；未引入 FAISS。
 持久化、来源 CAS、迁移和验证边界见 [知识工程与三模块工作流](knowledge-engineering.md)。
 
 默认最多 128 块参与索引；按章节轮转并保留长章节尾块，达到上限时记录 `index_truncated`。
@@ -48,13 +48,11 @@
 
 Embedding 失败保留 BM25 与章节选择；重排失败保留 RRF 顺序，并记录脱敏 `degraded`。
 卡片附加质量问题，不能标为 `valid`。取消或预算信号直接停止，不继续降级调用。
-默认 `sections` 模式不调用 Embedding 或 Reranker；它使用同一章节选择机制。
+独立 `sections` 业务模式已删除，章节覆盖仍作为 Hybrid 选块的一部分保留。
 
-启用第二层需安装 `requirements-retrieval.txt` 并配置已有 Embedding/Reranker 端点与密钥，
-另设置：
+默认第二层需要安装 `requirements.txt`，配置 Embedding/Reranker 端点与密钥及独立数据库，相关参数：
 
 ```dotenv
-ENABLE_LLM_CARD_EXTRACTION=true
 CARD_CHUNK_RETRIEVAL_MODE=hybrid
 CARD_CHUNK_TOP_K=5
 CARD_CHUNK_INDEX_LIMIT=128
@@ -62,7 +60,7 @@ CARD_CHUNK_RERANK_WINDOW=12
 CARD_CHUNK_ENABLE_RERANK=true
 ```
 
-配置示例不触发运行，本次开发保留当前本地开关，未调用真实 Provider。
+参数变化不证明真实模型已运行。启动检查、迁移与旧路径清理见 [分层 RAG 迁移](hierarchical-rag-migration.md)。
 
 ## 位置与证据
 

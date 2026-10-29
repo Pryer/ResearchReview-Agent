@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 
 class VectorStoreUnavailable(RuntimeError):
-    """连接/依赖不可用，可按显式策略降级。"""
+    """连接/依赖不可用，必须停止持久化检索，不能包装为章节模式成功。"""
 
 
 class VectorIntegrityError(RuntimeError):
