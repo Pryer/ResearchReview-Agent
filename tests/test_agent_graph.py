@@ -443,6 +443,13 @@ def test_incremental_detail_and_card_steps_reuse_existing_work(monkeypatch):
         "errors": [],
     }
 
+    from tests.retrieval_fakes import admitted_paper
+    old = admitted_paper(state, **old)
+    new = admitted_paper(state, **new)
+    state["ranked_papers"] = [old, new]
+    state["paper_details"] = [old]
+    state["paper_cards"] = [{**state["paper_cards"][0], "relation_type": "direct",
+                             "eligible_deliverables": old["_eligible_deliverables"]}]
     fetch_detail_node(state)
     extract_card_node(state, llm=None)
 
@@ -673,6 +680,13 @@ def test_review_flow_does_not_count_unverified_pdf_url_as_download_failure(monke
     monkeypatch.setattr("app.tools.download_pdf.batch_download_pdfs", fake_download)
     monkeypatch.setattr("app.tools.parse_pdf.batch_parse_pdfs", fake_parse)
     monkeypatch.setattr("app.agent.graph._get_llm", lambda: WorkflowLLM())
+
+    from tests.retrieval_fakes import admitted_paper
+    def searched(current, **kwargs):
+        paper = admitted_paper(current, **_paper(pdf_url="https://example.com/p1.pdf"))
+        current.update(candidate_papers=[paper], ranked_papers=[paper],
+                       searched_keywords=current.get("keywords") or [], focus_coverage={"missing_focuses": []})
+    monkeypatch.setattr("app.agent.graph._search_rank_with_refinement", searched)
 
     result = run_research_agent(
         "帮我调研近五年目标检测相关论文，并生成中文文献综述，引用不少于5篇",
@@ -1549,54 +1563,6 @@ def test_non_strict_explicit_relative_range_is_not_expanded(monkeypatch):
     assert state["steps"][-1]["output_data"]["reason"] == "explicit_user_defined_year_range"
 
 
-def test_incremental_rerank_only_covers_new_papers_and_boundary(monkeypatch):
-    """增量轮末尾 LLM 重排只覆盖新论文 + 旧榜尾部边界段，头部段保持原序。"""
-    from app.agent.retrieval_loop import search_rank_with_refinement
-    from app.agent.nodes.base import _paper_identity_key
-
-    old_papers = [_paper(paper_id=f"o{i}", title=f"Old Paper {i}") for i in range(1, 11)]
-    new_papers = [_paper(paper_id=f"n{i}", title=f"New Paper {i}") for i in range(1, 3)]
-    ranked_all = old_papers + new_papers
-
-    def fake_search_node(state, should_cancel=None):
-        state["candidate_papers"] = list(ranked_all)
-        state["incremental_new_paper_keys"] = [
-            _paper_identity_key(paper) for paper in new_papers
-        ]
-
-    def fake_rank_node(state, llm=None):
-        state["ranked_papers"] = list(state["candidate_papers"])
-        state["screening_report"] = {}
-
-    rerank_input: list = []
-
-    def fake_rerank(papers, **kwargs):
-        rerank_input.extend(papers)
-        return list(papers)
-
-    monkeypatch.setattr("app.agent.retrieval_loop.search_node", fake_search_node)
-    monkeypatch.setattr("app.agent.retrieval_loop.rank_node", fake_rank_node)
-    monkeypatch.setattr("app.tools.rank_papers.llm_rerank_papers", fake_rerank)
-
-    state = {
-        "topic": "增量主题",
-        "incremental_retrieval": True,
-        "max_papers": 12,
-        "steps": [],
-        "errors": [],
-    }
-
-    search_rank_with_refinement(state, llm=object())
-
-    # 重排输入 = 旧榜尾部 6 篇（target//2）+ 新增 2 篇，头部 4 篇不参与
-    assert {p["paper_id"] for p in rerank_input} == {
-        "o5", "o6", "o7", "o8", "o9", "o10", "n1", "n2",
-    }
-    assert state["screening_report"]["llm_rerank_mode"] == "incremental_merge"
-    # 头部段保持原序拼接在重排结果之前
-    final_ids = [p["paper_id"] for p in state["ranked_papers"]]
-    assert final_ids[:4] == ["o1", "o2", "o3", "o4"]
-    assert set(final_ids) == {f"o{i}" for i in range(1, 11)} | {"n1", "n2"}
 
 
 def test_citation_gap_repair_snapshot_restores_polluted_state():
@@ -1733,7 +1699,7 @@ def test_regeneration_refreshes_existing_evidence_without_expanding_candidate_po
     ))
     monkeypatch.setattr("app.agent.graph._run_claim_evidence_gate", lambda state: None)
 
-    def fake_fetch(state, should_cancel=None):
+    def fake_fetch(state, should_cancel=None, **kwargs):
         observed["fetch_ids"] = [item["paper_id"] for item in state["candidate_papers"]]
 
     def fake_extract(state, llm=None, should_cancel=None):

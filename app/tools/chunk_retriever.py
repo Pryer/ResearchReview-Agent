@@ -102,14 +102,11 @@ def select_extraction_chunks(chunks, report, limit):
 
 def retrieve_chunks(paper_id, chunks, *, settings, topic="", should_cancel=None,
                     embedding_client=None, reranker_client=None, parsed_text=None, vector_store=None):
-    """只接受同篇论文的原始 Chunk；失败可诊断降级，停止信号不捕获。"""
+    """只接受同篇论文的原始 Chunk；数据库失败及停止信号直接透传。"""
     _check(should_cancel)
     if any(chunk.get("paper_id") != paper_id for chunk in chunks):
         raise ValueError("Chunk 索引禁止混入其他论文")
     report = ChunkRetrievalReport(mode=settings.card_chunk_retrieval_mode)
-    if report.mode == "sections":
-        report.backend = "sections"
-        return select_extraction_chunks(chunks, report, settings.card_extraction_max_chunks)
     order = coverage_order(chunks)
     persistent = settings.card_vector_backend == "pgvector"
     limit = settings.card_vector_index_max_chunks if persistent else settings.card_chunk_index_limit
@@ -146,18 +143,11 @@ def retrieve_chunks(paper_id, chunks, *, settings, topic="", should_cancel=None,
     except InterruptedError:
         # WHY: InterruptedError 继承 OSError，必须先透传，不能误降级后继续调用重排。
         raise
-    except VectorStoreUnavailable:
-        if settings.card_vector_db_failure_policy == "fail":
-            raise
-        report.backend = "sections"
-        report.degraded.append("vector_store:unavailable")
-        report.index_coverage = IndexCoverage(status="failed", total_chunks=len(order))
-        return select_extraction_chunks(chunks, report, settings.card_extraction_max_chunks)
     except (RetrievalProviderError, OSError) as exc:
         report.degraded.append(f"dense:{type(exc).__name__}")
         if persistent and report.index_coverage is None:
             report.index_coverage = IndexCoverage(status="failed", total_chunks=len(order))
-    reranker = reranker_client or RerankerClient(settings)
+    reranker = (reranker_client or RerankerClient(settings)) if settings.card_chunk_enable_rerank else None
     for position, (field, text) in enumerate(zip(FIELD_RETRIEVAL_QUERIES, query_texts)):
         _check(should_cancel)
         query = RetrievalQuery(text=text, role="field", family=field, source="paper_chunk")

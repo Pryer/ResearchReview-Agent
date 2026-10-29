@@ -400,13 +400,13 @@ def test_direct_reverification_filters_both_claim_ids_and_sentence_indices(monke
 
 def test_mixed_reverification_runs_real_validator_without_releasing_structural_failure(monkeypatch):
     import re
-    from app.tools.extract_paper_card import extract_paper_card
+    from tests.card_fixtures import source_card
     from app.tools.verify_claims import verify_review_claims
 
-    card = extract_paper_card({
+    card = source_card({
         "paper_id": "p1", "title": "Evidence Verification", "authors": ["Alice"],
         "year": 2024, "venue": "ACL", "abstract": "The method achieves 80% accuracy on FEVER.",
-    }, llm=None).model_dump()
+    }).model_dump()
     text = "另一方法在 SciFact 数据集上达到 95% accuracy。该方法在 FEVER 数据集上达到 80% accuracy [p1]。"
     class PendingLLM:
         def complete(self, *args, **kwargs):

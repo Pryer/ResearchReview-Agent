@@ -14,6 +14,8 @@ pydantic-settings==2.5.2
 
 # ---------- 数据库 ----------
 sqlalchemy==2.0.35
+psycopg[binary]==3.3.6
+pgvector==0.5.1
 
 # ---------- 网络与 API 客户端 ----------
 requests==2.32.3
@@ -33,6 +35,8 @@ python-dotenv==1.0.1
 
 # ---------- 工具 ----------
 python-multipart==0.0.12
+jieba==0.42.1
+rank-bm25==0.2.2
 
 # ---------- 可选：中文文献网页手动测试 ----------
 selenium==4.46.0

@@ -90,6 +90,7 @@ def test_readiness_structured_options_obey_strict_constraints_but_keep_ordinary_
 def test_pending_rebuild_only_extracts_missing_current_papers(monkeypatch):
     from app.agent.nodes.extraction import extract_card_node
     state = evidence_state()
+    state["paper_cards"][0]["eligible_deliverables"] = ["research_background"]
     state["paper_details"].append({"paper_id": "p2", "title": "new evidence"})
     state["pending_card_rebuild_ids"] = ["p2"]
     kept = copy.deepcopy(state["paper_cards"][0])

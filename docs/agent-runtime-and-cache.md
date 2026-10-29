@@ -223,7 +223,7 @@ Controller 在 `fetch_metadata` 提交内比较详情变化并撤销旧证据授
 未知字段变化也不自动忽略。此规则不删除来源溯源字段。
 
 已有卡片失效后，`pending_card_rebuild_ids` 记录当前详情中缺失的卡片。该字段与详情
-在同一 Controller 提交和检查点中保存；普通 rules 任务也优先交回 Analysis Agent
+在同一 Controller 提交和检查点中保存；旧任务恢复执行后同样优先交回 Analysis Agent
 执行 `extract_paper_cards`。Search Agent 可以汇报并归还控制权，不能越权提取。
 这是局部证据依赖交接，用户改约、必做恢复队列、取消与总预算仍由原执行边界约束。
 

@@ -37,7 +37,7 @@
 | 失败诊断 | 区分"真空结果"与"检索失败"，避免误判关键词不合适 |
 | PDF 解析 | PyMuPDF 逐页解析，保留页码、解析证据指纹与 parser profile；记录空文本页、低文本页等诊断 |
 | 切块与入库校验 | 切块后校验论文身份、块唯一编号与 `[start,end)` 原文区间回读；重复页、改写文本、错位均拒绝持久化 |
-| 向量索引 | **论文内 chunk 级**索引：NumPy 精确检索为默认后端，可选 pgvector；按来源 revision 与 active 快照隔离，复用向量缓存 |
+| 向量索引 | **论文内 chunk 级**索引：默认 pgvector，可显式选择 NumPy；按来源 revision 与 active 快照隔离，复用向量缓存 |
 
 > ⚠️ **边界说明**：`POST /api/library/rebuild_index` 目前是占位实现，仅返回卡片数量，
 > 尚未实现库级向量索引。真实的向量检索能力在 **chunk 层**（`app/tools/chunk_retriever.py`）。
@@ -392,15 +392,15 @@ ResearchReview-Agent/
 | `AGENT_RETRIEVAL_BUDGET` | 累计检索轮次上限 | `64` |
 | `CARD_EXTRACTION_CHUNK_CHARS` | 全文抽取每块字符上限，优先页及章节边界 | `6000` |
 | `CARD_EXTRACTION_MAX_CHUNKS` | 单篇最多块抽取调用次数，未读块记录为覆盖不全 | `8` |
-| `CARD_CHUNK_RETRIEVAL_MODE` | `sections` 为章节选择；`hybrid` 为论文内字段级 BM25＋dense＋RRF＋可选重排 | `sections` |
+| `CARD_CHUNK_RETRIEVAL_MODE` | 业务仅支持 `hybrid`：字段级混合检索并结合章节覆盖 | `hybrid` |
 | `CARD_CHUNK_TOP_K` | 每字段检索返回块数；实际抽取仍受每篇调用上限约束 | `5` |
 | `CARD_CHUNK_INDEX_LIMIT` | 单篇参与第二层混合检索的最大块数 | `128` |
 | `CARD_CHUNK_RERANK_WINDOW` / `CARD_CHUNK_ENABLE_RERANK` | 每字段重排窗口及开关 | `12` / `true` |
-| `CARD_VECTOR_BACKEND` / `CARD_VECTOR_DATABASE_URL` | 可选独立持久化后端及 DSN，不替换业务库 | `numpy` / 空 |
+| `CARD_VECTOR_BACKEND` / `CARD_VECTOR_DATABASE_URL` | 默认独立持久化后端及 DSN；NumPy 可显式用于本地检索，不替换业务库 | `pgvector` / 空 |
 | `CARD_VECTOR_INDEX_MAX_CHUNKS` | 持久化索引的计划块数上限，截断单独记录 | `128` |
-| `CARD_VECTOR_DB_FAILURE_POLICY` | 向量库不可用时 sections 降级或 fail 中止 | `sections` |
+| `CARD_VECTOR_DB_FAILURE_POLICY` | 仅支持 `fail`，向量库不可用时停止 | `fail` |
 | `CARD_VECTOR_TENANT` | 受信任部署配置的索引隔离作用域，不等同于用户认证 | `local` |
-| `RETRIEVAL_RANKING_MODE` | `rules`、`hybrid_shadow` 或 `hybrid`；已有会话沿用其检索 profile | `rules` |
+| `RETRIEVAL_RANKING_MODE` | 业务入口仅支持 `hybrid`，旧规则/影子 profile 恢复时迁移 | `hybrid` |
 | `DASHSCOPE_API_KEY` | hybrid 使用的独立百炼密钥 | 空 |
 | `RETRIEVAL_EMBEDDING_MODEL` / `RETRIEVAL_RERANK_MODEL` | 专用向量及相关性重排模型 | `qwen3.7-text-embedding` / `qwen3.7-text-rerank` |
 | `RETRIEVAL_EMBEDDING_URL` / `RETRIEVAL_RERANK_URL` | 百炼工作空间原生 HTTPS 端点 | 空 |
@@ -415,7 +415,7 @@ ResearchReview-Agent/
 | `ENABLE_RECOVERY_EXHAUSTED_BEST_EFFORT_GENERATION` | 有界恢复耗尽后，是否基于当前可用证据执行一次最终草稿生成并以 `partial` 发布 | `true` |
 | `ROUTE_SECTION_MIN_PLAIN_CHARS` | 正式研究路线小节的最低正文字符数；章节引用下限仍由 WritingPlan 单独给出 | `80` |
 
-使用 hybrid 前执行 `python -m pip install -r requirements-retrieval.txt`，并在本地 `.env` 中配置密钥与两个端点。注意真实环境变量的优先级高于 `.env`：若终端里残留旧的 `DASHSCOPE_API_KEY`（如曾 `$env:DASHSCOPE_API_KEY=...` 赋值），请求会带旧密钥并返回 `403 Endpoint.AccessDenied`；启动前用 `Remove-Item Env:DASHSCOPE_API_KEY -ErrorAction SilentlyContinue` 清除，或重开终端/重启服务进程。候选论文使用标题、摘要和关键词构建 BM25 与 dense 检索视图，再用 RRF 融合和专用 reranker 排序。分数只决定筛选顺序；现有 LLM 逐篇确认研究范围和交付物资格，详情变化时重新核验。向量与专用重排分数缓存在 `data/retrieval_cache/`，可重建。`hybrid_shadow` 会调用远程模型并产生费用，但研究输出仍走规则模式。
+安装执行 `python -m pip install -r requirements.txt`（已包含检索和向量库驱动），并在本地 `.env` 中配置密钥与两个端点。注意真实环境变量的优先级高于 `.env`：若终端里残留旧的 `DASHSCOPE_API_KEY`（如曾 `$env:DASHSCOPE_API_KEY=...` 赋值），请求会带旧密钥并返回 `403 Endpoint.AccessDenied`；启动前用 `Remove-Item Env:DASHSCOPE_API_KEY -ErrorAction SilentlyContinue` 清除，或重开终端/重启服务进程。候选论文使用标题、摘要和关键词构建 BM25 与 dense 检索视图，再用 RRF 融合和专用 reranker 排序。分数只决定筛选顺序；现有 LLM 逐篇确认研究范围和交付物资格，详情变化时重新核验。向量与专用重排分数缓存在 `data/retrieval_cache/`，可重建。业务中的 `rules` 和 `hybrid_shadow` 分支已移除；规则评分工具仅用于离线对照与硬过滤。
 
 写作门禁失败后，系统会依据实际缺口在预算内自动重算状态、重建主张授权、
 调整引用或只重写失败章节。只有缺少访问条件、用户材料，或必须改变显式范围/
@@ -431,6 +431,22 @@ ResearchReview-Agent/
 时间或主题要求。blocked 会话可直接输入“生成可用草稿”复用已保存证据。
 
 ---
+
+## 分层 RAG 启动与旧路径迁移
+
+论文排序默认 Hybrid，全文内容经字段级 Chunk Hybrid 选择后由 LLM 抽取；规则抽卡及其异常回退已删除。
+默认使用独立 pgvector。配置模型端点/密钥和 CARD_VECTOR_DATABASE_URL，完成显式迁移后，先执行
+`python scripts/check_rag_runtime.py`；检查不消耗模型 Token。数据库连接、迁移或维度不满足时停止，
+不会把 sections 或规则抽卡记为完整链路成功。此检查只证明配置/数据库就绪，不验证 Provider 可用性或模型准确率。
+
+旧配置需要将 RETRIEVAL_RANKING_MODE、CARD_CHUNK_RETRIEVAL_MODE 改为 hybrid，
+CARD_VECTOR_DB_FAILURE_POLICY 改为 fail；ENABLE_LLM_CARD_EXTRACTION 已删除。旧会话原始证据、
+约束和预算保留，旧规则排序的派生授权失效。完整步骤、删除范围与验收边界见
+[分层 RAG 迁移说明](docs/hierarchical-rag-migration.md)。修改本地配置后需重启服务加载。
+
+Windows 也可直接使用 Conda 安装原生 PostgreSQL＋pgvector，无需 Docker。
+rragent 环境的安装组合、启动/停止及已完成的原生数据库验证见
+[Windows Conda 部署](docs/windows-conda-pgvector.md)。
 
 ## 📋 实现路线图
 

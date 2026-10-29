@@ -598,144 +598,6 @@ def search_node(
 # ============================================================
 # Rank 节点
 # ============================================================
-def _recovery_branch_minimums(
-    state: "ResearchAgentState",
-    search_branches: list[dict[str, Any]],
-) -> dict[str, int]:
-    """为本轮定向恢复分支推导软配额。
-
-    配额 = 该轮受影响路线的核心证据缺口之和，只影响 top_k 名额分配，
-    不放宽任何硬过滤或语义筛选：候选仍须先通过完整评分链。
-    """
-    if not state.get("incremental_retrieval"):
-        return {}
-    decision = state.get("recovery_decision") or {}
-    targets = dict(decision.get("route_targets") or {})
-    if not targets:
-        return {}
-    core_counts = {
-        str(route.get("route_id") or ""): len(route.get("core_paper_ids") or [])
-        for route in state.get("validated_routes") or []
-        if route.get("route_id")
-    }
-    affected = [
-        str(route_id)
-        for route_id in decision.get("affected_route_ids") or []
-        if str(route_id)
-    ]
-    deficit = sum(
-        max(0, int(targets.get(route_id) or 0) - int(core_counts.get(route_id) or 0))
-        for route_id in affected
-    )
-    if deficit <= 0:
-        return {}
-    recovery_branches = [
-        str(branch.get("branch_type") or "")
-        for branch in search_branches
-        if str(branch.get("constraint_level") or "") == "targeted_recovery"
-        and str(branch.get("branch_type") or "")
-    ]
-    if not recovery_branches:
-        return {}
-    # 只给最新一轮恢复分支配额；历史轮次的召回已在池中。
-    return {recovery_branches[-1]: deficit}
-
-
-# 双分支规则筛选诊断中可按分支求和的计数字段。
-_BRANCH_FILTER_COUNTERS = (
-    "pre_dedup_count", "deduplicated_count", "duplicate_removed_count",
-    "filtered_count", "passed_hard_filters", "selected_count",
-    "reserve_selected_count", "truncated_by_top_k",
-)
-# 被过滤样例的展示上限，与 rank_papers._record_filter_diagnostic 保持一致。
-_BRANCH_FILTER_EXAMPLE_LIMIT = 12
-
-
-def _merge_branch_filter_diagnostics(
-    branch_diagnostics: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    """把中英分支各自的规则筛选诊断合并成 rank 步骤的一级字段。
-
-    WHY: 双分支模式此前只把 ``passed_hard_filters`` 拷进 ``branch_stats``，
-    逐阶段过滤计数、被过滤样例、top_k 截断量、去重损耗与分支软配额全部随
-    局部变量丢弃，排查筛选退化时只能靠 grep 日志行还原。计数按分支求和，
-    阶段/原因两个映射按键累加，样例截断到与单分支相同的上限。
-    """
-    merged: dict[str, Any] = {}
-    # 两个"键 → 计数"映射：阶段粒度与原因粒度，均按分支逐键累加。
-    counters_by_key: dict[str, dict[str, int]] = {"filtered_by_stage": {}, "filter_reasons": {}}
-    examples: list[dict[str, Any]] = []
-    for diagnostics in branch_diagnostics.values():
-        for key in _BRANCH_FILTER_COUNTERS:
-            if key in diagnostics:
-                merged[key] = int(merged.get(key) or 0) + int(diagnostics.get(key) or 0)
-        for map_name, accumulator in counters_by_key.items():
-            for name, count in (diagnostics.get(map_name) or {}).items():
-                accumulator[str(name)] = (
-                    int(accumulator.get(str(name)) or 0) + int(count or 0)
-                )
-        for example in diagnostics.get("filtered_examples") or []:
-            if len(examples) >= _BRANCH_FILTER_EXAMPLE_LIMIT:
-                break
-            examples.append(example)
-        # 两个分支收到同一份软配额，取任一非空值即可，不应求和。
-        for key in ("source_minimums", "branch_minimums"):
-            if not merged.get(key) and diagnostics.get(key):
-                merged[key] = dict(diagnostics[key])
-    for map_name, accumulator in counters_by_key.items():
-        if accumulator:
-            merged[map_name] = accumulator
-    if examples:
-        merged["filtered_examples"] = examples
-    return merged
-
-
-# rank 步骤一级字段 ← llm_rerank_papers 诊断键。只收录可跨分支求和的计数，
-# reserve_target 这类阈值留在嵌套诊断里，求和会得到误导性的数字。
-_RERANK_STEP_FIELDS = {
-    "rerank_candidate_count": "candidate_count",
-    "rerank_retained_count": "retained_count",
-    "rerank_selected_count": "selected_count",
-    "rerank_excluded_count": "excluded_count",
-    "rerank_screening_degraded_count": "screening_degraded_count",
-    "rerank_reserve_backfilled_count": "reserve_backfilled_count",
-    "rerank_deepened_batch_count": "deepened_batch_count",
-}
-
-
-def _promote_rerank_diagnostics(rerank_diagnostics: dict[str, Any]) -> dict[str, Any]:
-    """把 LLM 语义重排的计数提升为 rank 步骤的一级字段。
-
-    WHY: 这些计数此前只存在于嵌套的 ``llm_rerank`` 子字典，双分支模式下更是
-    随局部变量整个丢弃，排查"排除率过高导致引用缺口"时只能靠 grep INFO 日志
-    行还原。单分支与双分支的诊断形状互斥（前者计数在顶层，后者只在
-    ``branches`` 下），因此两处一起求和不会重复计数。
-    """
-    sources = [rerank_diagnostics]
-    sources.extend((rerank_diagnostics.get("branches") or {}).values())
-    return {
-        step_key: sum(int(source.get(source_key) or 0) for source in sources)
-        for step_key, source_key in _RERANK_STEP_FIELDS.items()
-    }
-
-
-def _screening_reserve_k(
-    required_reference_count: int,
-    max_papers: int,
-    candidate_max: int,
-) -> int:
-    """规则粗排在 ``max_papers`` 之外额外保留的筛选后备窗口大小。
-
-    WHY: LLM 语义重排只对规则粗排的输出打分，尾部此前被 ``top_k`` 直接丢弃。
-    实测 1101 篇候选被截到 64 篇后排除 34 篇，重排的回填池结构性为空，
-    "不少于 40 篇引用"的缺口再也补不回来。保留一段规则合格的尾部，重排
-    阶段才能继续向深处筛选，而不是拿未经语义确认的论文凑数。
-    """
-    required = max(0, int(required_reference_count or 0))
-    window = max(0, int(max_papers or 0))
-    if not required or not window:
-        return 0
-    return max(0, int(candidate_max or 0) - window)
 
 
 @node(name="rank", category="retrieval", description="候选论文去重、排序、筛选")
@@ -747,30 +609,18 @@ def _screening_reserve_k(
     "screening_protocol", "topic_anchors"
 )
 def rank_node(state: "ResearchAgentState", llm=None, should_cancel=None) -> "ResearchAgentState":
-    """候选论文去重、排序、筛选。
-
-    中英文分支独立处理：先按语言拆分 → 各自去重/硬过滤/评分/LLM重排 →
-    百分位归一化 → 配额合并 → 跨语言去重 → 最终论文池。
-    旧会话无协议或 language_branch 被禁用时保留原统一过滤链。
-    """
+    """候选去重/硬过滤、BM25+dense/RRF、精排及独立语义准入。"""
     t0 = time.time()
     try:
-        from app.tools.rank_papers import (
-            deduplicate_and_rank,
-            llm_rerank_papers,
-        )
         from app.tools.paper_matching import compile_scope
-        from app.tools.language_router import split_papers_by_language
-        from app.tools.branch_merge import (
-            build_language_coverage_contract,
-            merge_language_branches,
-        )
 
         candidates = state.get("candidate_papers") or []
         topic = state.get("topic", "")
         from app.core.config import get_settings
 
         settings = get_settings()
+        from app.agent.orchestration import normalize_retrieval_profile
+        normalize_retrieval_profile(state)
         max_papers = (
             state.get("retrieval_target")
             or state.get("max_papers")
@@ -796,413 +646,52 @@ def rank_node(state: "ResearchAgentState", llm=None, should_cancel=None) -> "Res
             excluded_title_terms=excluded_title_terms,
         )
         state["compiled_scope"] = compiled_scope
-        ranking_mode = str((state.get("retrieval_profile") or {}).get("mode")
-                           or settings.retrieval_ranking_mode)
-        if ranking_mode in {"hybrid", "hybrid_shadow"}:
-            from app.services.retrieval_ranking_service import rank_candidates, screen_candidates
-            from app.schemas.retrieval_schema import fingerprint
+        from app.services.retrieval_ranking_service import rank_candidates, screen_candidates
+        from app.schemas.retrieval_schema import fingerprint
 
-            config_fingerprint = fingerprint((
-                settings.retrieval_provider, settings.retrieval_embedding_model,
-                settings.retrieval_embedding_url, settings.retrieval_embedding_dimension,
-                settings.retrieval_rerank_model, settings.retrieval_rerank_url,
-                settings.retrieval_cache_version,
-            ))
-            profile = state.setdefault("retrieval_profile", {"mode": ranking_mode,
-                                                               "version": "hybrid.v1"})
-            if profile.get("config_fingerprint") and profile["config_fingerprint"] != config_fingerprint:
-                raise ValueError("当前会话检索模型配置已变化，需显式重建检索快照")
-            profile["config_fingerprint"] = config_fingerprint
-            profile["embedding_model"] = settings.retrieval_embedding_model
-            profile["rerank_model"] = settings.retrieval_rerank_model
-            hybrid_ranked, hybrid_report = rank_candidates(
-                state, settings=settings,
-                include_rerank=llm is not None and ranking_mode == "hybrid",
+        config_fingerprint = fingerprint((
+            settings.retrieval_provider, settings.retrieval_embedding_model,
+            settings.retrieval_embedding_url, settings.retrieval_embedding_dimension,
+            settings.retrieval_rerank_model, settings.retrieval_rerank_url,
+            settings.retrieval_cache_version,
+        ))
+        profile = state.setdefault("retrieval_profile", {"mode": "hybrid",
+                                                           "version": "hybrid.v1"})
+        if profile.get("config_fingerprint") and profile["config_fingerprint"] != config_fingerprint:
+            raise ValueError("当前会话检索模型配置已变化，需显式重建检索快照")
+        profile["config_fingerprint"] = config_fingerprint
+        profile["embedding_model"] = settings.retrieval_embedding_model
+        profile["rerank_model"] = settings.retrieval_rerank_model
+        hybrid_ranked, hybrid_report = rank_candidates(
+            state, settings=settings,
+            include_rerank=llm is not None,
+            should_cancel=should_cancel,
+        )
+        if llm is None:
+            ranked = hybrid_ranked
+            hybrid_report["screening"] = {"mode": "pending_until_final_screen"}
+        else:
+            ranked, screening = screen_candidates(
+                state, hybrid_ranked, llm, target=int(max_papers),
                 should_cancel=should_cancel,
             )
-            if ranking_mode == "hybrid":
-                if llm is None:
-                    ranked = hybrid_ranked
-                    hybrid_report["screening"] = {"mode": "pending_until_final_screen"}
-                else:
-                    ranked, screening = screen_candidates(
-                        state, hybrid_ranked, llm, target=int(max_papers),
-                        should_cancel=should_cancel,
-                    )
-                    hybrid_report["screening"] = screening
-                state["ranked_papers"] = ranked
-                state["retrieval_requirement_met"] = bool(llm is not None and len(ranked) >= int(
-                    state.get("required_reference_count") or max_papers
-                ))
-                if not ranked:
-                    state["retrieval_stop_reason"] = {
-                        "no_query_or_text": "混合检索缺少可执行查询或可索引文本",
-                    }.get(str(hybrid_report.get("stop_reason")), "混合检索窗口无候选")
-                state["screening_report"] = {"mode": "hybrid", "hybrid": hybrid_report,
-                                             "compiled_scope": {"version": compiled_scope.get("version"),
-                                                                "fingerprint": compiled_scope.get("fingerprint")}}
-                append_step(state, "rank", "success", tool_name="hybrid_retrieval",
-                            input_data={"candidates": len(candidates), "max_papers": max_papers},
-                            output_data={"ranked": len(ranked), "hybrid": hybrid_report},
-                            duration_ms=int((time.time() - t0) * 1000))
-                return state
-            state["hybrid_shadow_report"] = hybrid_report
-        rule_diagnostics: dict[str, Any] = {"compiled_scope_fingerprint": compiled_scope["fingerprint"]}
-        rerank_diagnostics: dict[str, Any] = {}
-        branch_stats: dict[str, Any] = {}
-        # 分支诊断必须在分支块之外声明：块内局部变量在合并阶段就取不到了，
-        # 双分支模式因此只剩 branch_stats 里手抄的一个 passed_hard_filters。
-        zh_diag: dict[str, Any] = {}
-        en_diag: dict[str, Any] = {}
-        zh_rerank_diag: dict[str, Any] = {}
-        en_rerank_diag: dict[str, Any] = {}
-        # 定向恢复轮的软配额：为本轮 targeted_recovery 分支保留名额，避免为
-        # 某条路线补来的论文因全局分数偏低而在 top_k 截断处消失。
-        branch_minimums = _recovery_branch_minimums(state, search_branches)
-        # 规则粗排在主窗口之外保留的筛选后备段：LLM 重排据此在高排除率下
-        # 继续向尾部加深筛选，而不是拿未筛论文回填。
-        screening_reserve_k = _screening_reserve_k(
-            state.get("required_reference_count") or 0,
-            max_papers,
-            settings.rerank_candidate_max,
-        )
-
-        # 判断是否启用双分支模式
-        use_branched = (
-            settings.language_branch_enabled
-            and bool(screening_protocol)
-            and len(candidates) > 0
-        )
-
-        if use_branched:
-            # ============================================================
-            # 双分支模式：中英文独立处理 + 配额合并
-            # ============================================================
-            zh_papers, en_papers = split_papers_by_language(candidates)
-            branch_stats["zh_initial"] = len(zh_papers)
-            branch_stats["en_initial"] = len(en_papers)
-
-            # --- 中文分支 ---
-            zh_ranked: list[dict] = []
-            if zh_papers:
-                zh_deduped = deduplicate_and_rank(
-                    zh_papers, topic,
-                    top_k=min(max_papers, len(zh_papers)),
-                    keywords=state.get("keywords") or [],
-                    required_concepts=required_concepts,
-                    excluded_title_terms=excluded_title_terms,
-                    scope=selected_scope,
-                    search_branches=search_branches,
-                    research_mode=research_mode,
-                    screening_protocol=screening_protocol,
-                    filter_diagnostics=zh_diag,
-                    branch_minimums=branch_minimums,
-                    language_branch="zh",
-                    start_year=state.get("start_year"),
-                    end_year=state.get("end_year"),
-                    # 与单分支同理用 reserve_k 而非抬高 top_k：抬高会把
-                    # branch_minimums 的配额基准从主窗口挪走，定向恢复论文
-                    # 可能落到 72 名之外，再被下游全局重排截掉。
-                    reserve_k=screening_reserve_k,
-                    compiled_scope=compiled_scope,
-                )
-                branch_stats["zh_after_hard_filter"] = zh_diag.get("passed_hard_filters", 0)
-                zh_ranked = zh_deduped
-
-            # --- 英文分支 ---
-            en_ranked: list[dict] = []
-            if en_papers:
-                en_deduped = deduplicate_and_rank(
-                    en_papers, topic,
-                    top_k=min(max_papers, len(en_papers)),
-                    keywords=state.get("keywords") or [],
-                    required_concepts=required_concepts,
-                    excluded_title_terms=excluded_title_terms,
-                    scope=selected_scope,
-                    search_branches=search_branches,
-                    research_mode=research_mode,
-                    screening_protocol=screening_protocol,
-                    filter_diagnostics=en_diag,
-                    branch_minimums=branch_minimums,
-                    language_branch="en",
-                    start_year=state.get("start_year"),
-                    end_year=state.get("end_year"),
-                    # 同中文分支：配额基准保持在主窗口。
-                    reserve_k=screening_reserve_k,
-                    compiled_scope=compiled_scope,
-                )
-                branch_stats["en_after_hard_filter"] = en_diag.get("passed_hard_filters", 0)
-                en_ranked = en_deduped
-
-            # --- 硬过滤后轻量跨语言去重（仅 DOI/ID 精确匹配，不做标题语义）---
-            from app.tools.branch_merge import identifier_level_cross_dedup
-
-            if zh_ranked and en_ranked:
-                zh_ranked, en_ranked = identifier_level_cross_dedup(zh_ranked, en_ranked)
-                branch_stats["zh_after_identifier_dedup"] = len(zh_ranked)
-                branch_stats["en_after_identifier_dedup"] = len(en_ranked)
-
-            # --- 分支 LLM 重排 ---
-            # WHY: 分支重排只负责语义筛选与分支内排序，minimum_required 必须
-            # 保持 0——引用缺口的安全网属于合并后那次全局重排。若在每个语言
-            # 分支各自套用全局引用要求，两支会分别去凑同一个目标，筛选成本
-            # 翻倍且各自虚高保留量。
-            if llm is not None:
-                if zh_ranked:
-                    try:
-                        zh_ranked = llm_rerank_papers(
-                            zh_ranked, topic=topic, scope=selected_scope,
-                            llm=llm, top_k=max_papers + screening_reserve_k,
-                            research_mode=research_mode,
-                            screening_protocol=screening_protocol,
-                            rerank_diagnostics=zh_rerank_diag,
-                            minimum_required=0,
-                        )
-                    except Exception as exc:
-                        logger.warning("ZH branch LLM rerank failed: %s", exc)
-                        zh_rerank_diag.update({
-                            "mode": "rule_order_fallback",
-                            "error": str(exc),
-                        })
-                if en_ranked:
-                    try:
-                        en_ranked = llm_rerank_papers(
-                            en_ranked, topic=topic, scope=selected_scope,
-                            llm=llm, top_k=max_papers + screening_reserve_k,
-                            research_mode=research_mode,
-                            screening_protocol=screening_protocol,
-                            rerank_diagnostics=en_rerank_diag,
-                            minimum_required=0,
-                        )
-                    except Exception as exc:
-                        logger.warning("EN branch LLM rerank failed: %s", exc)
-                        en_rerank_diag.update({
-                            "mode": "rule_order_fallback",
-                            "error": str(exc),
-                        })
-
-            # 统一使用 _branch_final_score 供后续合并
-            for p in zh_ranked:
-                p["_branch_final_score"] = float(p.get("_rank_score", 0))
-            for p in en_ranked:
-                p["_branch_final_score"] = float(p.get("_rank_score", 0))
-            branch_stats["zh_after_rank"] = len(zh_ranked)
-            branch_stats["en_after_rank"] = len(en_ranked)
-
-            state["language_coverage_target"] = build_language_coverage_contract(
-                int(state.get("required_reference_count") or state.get("max_papers") or 0),
-                float(
-                    state.get("language_branch_zh_ratio")
-                    or settings.language_branch_zh_ratio
-                ),
-                min_zh=settings.language_branch_min_zh,
-                min_en=settings.language_branch_min_en,
-                eligible_zh=len(zh_ranked),
-                eligible_en=len(en_ranked),
-                affinity=str(
-                    (state.get("research_semantic_frame") or {}).get("language_affinity")
-                    or "balanced"
-                ),
-            )
-
-            # --- 异常告警与配额保护 ---
-            en_pass_rate = None
-            if branch_stats.get("en_initial", 0) >= 30:
-                en_pass_rate = (
-                    branch_stats.get("en_after_hard_filter", 0)
-                    / max(1, branch_stats["en_initial"])
-                )
-                if en_pass_rate < 0.10:
-                    logger.warning(
-                        "英文分支硬过滤通过率低于 10%% (%.1f%%)，"
-                        "暂停英文配额转移并保留语言缺口供定向恢复",
-                        en_pass_rate * 100,
-                    )
-            state["screening_report_low_pass_protection"] = {
-                "english_initial": int(branch_stats.get("en_initial") or 0),
-                "english_after_hard_filter": int(branch_stats.get("en_after_hard_filter") or 0),
-                "english_pass_rate": en_pass_rate,
-                "quota_transfer_blocked": bool(en_pass_rate is not None and en_pass_rate < 0.10),
-            }
-            if branch_stats.get("zh_initial", 0) >= 20:
-                zh_pass_rate = (
-                    branch_stats.get("zh_after_hard_filter", 0)
-                    / max(1, branch_stats["zh_initial"])
-                )
-                if zh_pass_rate < 0.10:
-                    logger.warning(
-                        "中文分支硬过滤通过率低于 10%% (%.1f%%)，"
-                        "可能存在中文别名缺失或协议过严",
-                        zh_pass_rate * 100,
-                    )
-
-            # --- 分支合并 ---
-            # 中文配额优先取规划阶段按主题语言倾向解析的值；缺省回落到全局配置。
-            effective_zh_ratio = float(
-                state.get("language_branch_zh_ratio")
-                or settings.language_branch_zh_ratio
-            )
-            ranked = merge_language_branches(
-                zh_ranked=zh_ranked,
-                en_ranked=en_ranked,
-                # 合并窗口同样要带上筛选后备段：否则这里截回主窗口，下游全局
-                # 重排就没有可加深的材料（实测 2026-09-01 走的正是双分支模式）。
-                # calculate_branch_targets 按 top_k 等比推导两侧配额，比例不变。
-                top_k=max_papers + screening_reserve_k,
-                zh_ratio=effective_zh_ratio,
-                min_zh=settings.language_branch_min_zh,
-                min_en=settings.language_branch_min_en,
-                allow_quota_transfer=not bool(
-                    state.get("screening_report_low_pass_protection", {}).get(
-                        "quota_transfer_blocked"
-                    )
-                ),
-            )
-            rule_diagnostics = {
-                "mode": "branched",
-                "input_count": len(candidates),
-                "branch_stats": branch_stats,
-                "zh_ratio": effective_zh_ratio,
-                "zh_ratio_reason": state.get("language_branch_zh_ratio_reason") or "",
-                "zh_filter": zh_diag,
-                "en_filter": en_diag,
-                **_merge_branch_filter_diagnostics({"zh": zh_diag, "en": en_diag}),
-            }
-            if zh_rerank_diag or en_rerank_diag:
-                rerank_diagnostics["branches"] = {
-                    "zh": zh_rerank_diag,
-                    "en": en_rerank_diag,
-                }
-            rerank_triggered = True
-        else:
-            # ============================================================
-            # 单分支模式（向后兼容）
-            # ============================================================
-            source_minimums: dict[str, int] = {}
-            cnki_count = sum(
-                1 for paper in candidates
-                if str(paper.get("source") or "").strip().lower() == "cnki"
-            )
-            if cnki_count:
-                configured_source_count = max(1, len(set(settings.search_sources_list)))
-                requested_evidence = int(
-                    state.get("required_reference_count")
-                    or state.get("max_papers")
-                    or 1
-                )
-                source_quota = max(
-                    1,
-                    math.ceil(requested_evidence / configured_source_count),
-                )
-                source_minimums["cnki"] = min(source_quota, cnki_count)
-
-            ranked = deduplicate_and_rank(
-                candidates,
-                topic,
-                max_papers,
-                keywords=state.get("keywords") or [],
-                required_concepts=required_concepts,
-                excluded_title_terms=excluded_title_terms,
-                scope=selected_scope,
-                search_branches=search_branches,
-                research_mode=research_mode,
-                screening_protocol=screening_protocol,
-                filter_diagnostics=rule_diagnostics,
-                source_minimums=source_minimums,
-                branch_minimums=branch_minimums,
-                start_year=state.get("start_year"),
-                end_year=state.get("end_year"),
-                # 用 reserve_k 而非抬高 top_k：CNKI 来源配额与恢复分支配额都
-                # 必须继续按主窗口计算，后备尾部在配额逻辑之后才追加。
-                reserve_k=screening_reserve_k,
-                compiled_scope=compiled_scope,
-            )
-
-            rerank_triggered = False
-            state.pop("language_coverage_target", None)
-            if llm is not None and ranked:
-                try:
-                    ranked = llm_rerank_papers(
-                        ranked,
-                        topic=topic,
-                        scope=selected_scope,
-                        llm=llm,
-                        top_k=max_papers,
-                        research_mode=research_mode,
-                        screening_protocol=screening_protocol,
-                        rerank_diagnostics=rerank_diagnostics,
-                        minimum_required=int(
-                            state.get("required_reference_count") or 0
-                        ),
-                    )
-                    rerank_triggered = True
-                except Exception as rerank_exc:
-                    logger.warning(
-                        "LLM rerank failed, falling back to rule scores: %s",
-                        rerank_exc,
-                    )
-
+            hybrid_report["screening"] = screening
         state["ranked_papers"] = ranked
-        # 入选集合的来源贡献观测：后续裁撤低效源/调整双语配额以此为准。
-        selected_by_source = _count_by_source(ranked)
-        state["screening_report"] = {
-            "protocol": screening_protocol,
-            "compiled_scope": {
-                "version": compiled_scope.get("version"),
-                "fingerprint": compiled_scope.get("fingerprint"),
-            },
-            "rule_filter": rule_diagnostics,
-            "llm_rerank": rerank_diagnostics,
-        }
-        append_step(
-            state, "rank", "success",
-            tool_name="rank_papers",
-            input_data={
-                "topic": topic,
-                "candidates": len(candidates),
-                "max_papers": max_papers,
-                "required_reference_count": state.get("required_reference_count"),
-                "retrieval_target": state.get("retrieval_target"),
-                "keywords": state.get("keywords") or [],
-                "required_concepts": required_concepts,
-                "excluded_title_terms": excluded_title_terms,
-                "selected_scope": selected_scope,
-                "compiled_scope": {
-                    "version": compiled_scope.get("version"),
-                    "fingerprint": compiled_scope.get("fingerprint"),
-                },
-                "search_branches": search_branches,
-                "research_mode": research_mode,
-                "screening_protocol": screening_protocol,
-                "candidate_sample": _summarize_papers(candidates, limit=10),
-            },
-            output_data={
-                "ranked": len(ranked),
-                "screening_reserve_k": screening_reserve_k,
-                "screening_reserve_count": sum(
-                    1 for paper in ranked if paper.get("_rule_screened_reserve")
-                ),
-                "rerank_triggered": rerank_triggered,
-                "filter_mode": rule_diagnostics.get("mode"),
-                "filtered_count": rule_diagnostics.get("filtered_count", 0),
-                "filter_reasons": rule_diagnostics.get("filter_reasons", {}),
-                "filtered_by_stage": rule_diagnostics.get("filtered_by_stage", {}),
-                "filtered_examples": rule_diagnostics.get("filtered_examples", []),
-                "passed_hard_filters": rule_diagnostics.get("passed_hard_filters", 0),
-                "rule_selected_count": rule_diagnostics.get("selected_count", 0),
-                "rule_reserve_selected_count": rule_diagnostics.get(
-                    "reserve_selected_count", 0
-                ),
-                "truncated_by_top_k": rule_diagnostics.get("truncated_by_top_k", 0),
-                "source_minimums": rule_diagnostics.get("source_minimums", {}),
-                "branch_minimums": rule_diagnostics.get("branch_minimums", {}),
-                "selected_by_source": selected_by_source,
-                "llm_rerank": rerank_diagnostics,
-                **_promote_rerank_diagnostics(rerank_diagnostics),
-                "ranked_sample": _summarize_papers(ranked, limit=10),
-            },
-            duration_ms=int((time.time() - t0) * 1000),
-        )
+        state["retrieval_requirement_met"] = bool(llm is not None and len(ranked) >= int(
+            state.get("required_reference_count") or max_papers
+        ))
+        if not ranked:
+            state["retrieval_stop_reason"] = {
+                "no_query_or_text": "混合检索缺少可执行查询或可索引文本",
+            }.get(str(hybrid_report.get("stop_reason")), "混合检索窗口无候选")
+        state["screening_report"] = {"mode": "hybrid", "hybrid": hybrid_report,
+                                     "compiled_scope": {"version": compiled_scope.get("version"),
+                                                        "fingerprint": compiled_scope.get("fingerprint")}}
+        append_step(state, "rank", "success", tool_name="hybrid_retrieval",
+                    input_data={"candidates": len(candidates), "max_papers": max_papers},
+                    output_data={"ranked": len(ranked), "hybrid": hybrid_report},
+                    duration_ms=int((time.time() - t0) * 1000))
+        return state
     except InterruptedError as exc:
         from app.agent.graph import AgentCancelledError
 
@@ -1710,6 +1199,8 @@ def fetch_detail_node(
     """补全论文详情。"""
     t0 = time.time()
     from app.agent.graph import AgentCancelledError
+    if should_cancel and should_cancel():
+        raise AgentCancelledError("详情获取已取消")
 
     try:
         from app.tools.fetch_metadata import fetch_batch_details
@@ -1721,7 +1212,8 @@ def fetch_detail_node(
         from app.tools.language_router import detect_paper_language
         from app.core.config import get_settings
 
-        hybrid_mode = (state.get("retrieval_profile") or {}).get("mode") == "hybrid"
+        from app.agent.orchestration import normalize_retrieval_profile
+        normalize_retrieval_profile(state)
         compiled_scope = compile_scope(
             selected_scope=state.get("selected_scope") or {},
             semantic_frame=state.get("research_semantic_frame") or {},
@@ -1734,35 +1226,33 @@ def fetch_detail_node(
             research_mode=str((state.get("research_semantic_frame") or {}).get("research_mode") or ""),
         )
         state["compiled_scope"] = compiled_scope
-        if hybrid_mode:
-            from app.services.retrieval_ranking_service import (
-                admission_scope_fingerprint, is_semantically_admitted,
-            )
-            admission_fingerprint = admission_scope_fingerprint(state)
-            legacy_fingerprint = compiled_scope.get("fingerprint")
+        from app.services.retrieval_ranking_service import (
+            admission_scope_fingerprint, is_semantically_admitted,
+        )
+        admission_fingerprint = admission_scope_fingerprint(state)
+        legacy_fingerprint = compiled_scope.get("fingerprint")
 
-            def admitted(paper):
-                return is_semantically_admitted(
-                    paper, scope_fingerprint=admission_fingerprint,
-                    legacy_scope_fingerprint=legacy_fingerprint,
-                )
+        def admitted(paper):
+            return is_semantically_admitted(
+                paper, scope_fingerprint=admission_fingerprint,
+                legacy_scope_fingerprint=legacy_fingerprint,
+            )
         ranked_all = state.get("ranked_papers") or []
-        if hybrid_mode:
-            # WHY: ranked_papers 可暂存融合窗口；pending 不进入详情。旧的
-            # include 若合同/指纹缺失可在详情重筛，但重筛通过前不能成为证据。
-            ranked_all = [paper for paper in ranked_all
-                          if paper.get("_screening_decision") == "include"]
-            if not ranked_all:
-                # WHY: 待准入窗口并非“详情数为零”；只保留当前范围已确认的
-                # 历史详情，避免空 fetch 把有效证据池覆盖掉。
-                state["paper_details"] = [paper for paper in state.get("paper_details") or []
-                                          if admitted(paper)]
-                state["retrieval_requirement_met"] = len(state["paper_details"]) >= int(
-                    state.get("required_reference_count") or state.get("max_papers") or 0)
-                append_step(state, "fetch_detail", "skipped",
-                            output_data={"reason": "pending_semantic_admission",
-                                         "retained": len(state["paper_details"])})
-                return state
+        # WHY: ranked_papers 可暂存融合窗口；pending 不进入详情。旧的
+        # include 若合同/指纹缺失可在详情重筛，但重筛通过前不能成为证据。
+        ranked_all = [paper for paper in ranked_all
+                      if paper.get("_screening_decision") == "include"]
+        if not ranked_all:
+            # WHY: 待准入窗口并非“详情数为零”；只保留当前范围已确认的
+            # 历史详情，避免空 fetch 把有效证据池覆盖掉。
+            state["paper_details"] = [paper for paper in state.get("paper_details") or []
+                                      if admitted(paper)]
+            state["retrieval_requirement_met"] = len(state["paper_details"]) >= int(
+                state.get("required_reference_count") or state.get("max_papers") or 0)
+            append_step(state, "fetch_detail", "skipped",
+                        output_data={"reason": "pending_semantic_admission",
+                                     "retained": len(state["paper_details"])})
+            return state
         incremental = bool(state.get("incremental_retrieval"))
         existing_details = list(state.get("paper_details") or []) if incremental else []
         existing_keys = {
@@ -1778,7 +1268,7 @@ def fetch_detail_node(
         )
         generation_limit = int(state.get("generation_limit") or 0)
         settings = get_settings()
-        if hybrid_mode and incremental:
+        if incremental:
             # WHY: 检索路线/关键词变化不改变用户确认的准入边界；真实范围或
             # 逐篇协议变化时旧授权失效，且不能把旧卡片继续算作当前证据。
             existing_details = [paper for paper in existing_details if admitted(paper)]
@@ -1852,16 +1342,15 @@ def fetch_detail_node(
             )
             screening_protocol = state.get("screening_protocol") or {}
             for paper in batch:
-                if hybrid_mode:
-                    try:
-                        detail_year = int(paper.get("year")) if paper.get("year") is not None else None
-                    except (TypeError, ValueError):
-                        detail_year = None
-                    if detail_year and (
-                        (state.get("start_year") and detail_year < int(state["start_year"]))
-                        or (state.get("end_year") and detail_year > int(state["end_year"]))
-                    ):
-                        continue
+                try:
+                    detail_year = int(paper.get("year")) if paper.get("year") is not None else None
+                except (TypeError, ValueError):
+                    detail_year = None
+                if detail_year and (
+                    (state.get("start_year") and detail_year < int(state["start_year"]))
+                    or (state.get("end_year") and detail_year > int(state["end_year"]))
+                ):
+                    continue
                 # WHY: 详情补全会新增摘要、venue 和 DOI；这里必须重放排序阶段
                 # 的完整硬规则。旧分支一旦存在 protocol 就只验 protocol，导致
                 # scope/topic/branch 被绕过，越界论文可重新进入证据池。
@@ -1880,24 +1369,23 @@ def fetch_detail_node(
                     screening_protocol=screening_protocol,
                     language_branch=language_branch,
                     compiled_scope=compiled_scope,
-                    ranking_mode="hybrid" if hybrid_mode else "rules",
+                    ranking_mode="hybrid",
                 )
                 if passed:
-                    if hybrid_mode:
-                        from app.services.retrieval_ranking_service import screen_candidates
+                    from app.services.retrieval_ranking_service import screen_candidates
 
-                        # WHY: 详情新增内容或用户约束变化时旧语义结论失效；
-                        # 内容未变且合同完整时，硬过滤复核不得清空授权字段。
-                        if not admitted(paper):
-                            refreshed, _ = screen_candidates(
-                                state, [paper], llm, target=1, should_cancel=should_cancel,
-                            )
-                            if not refreshed:
-                                continue
-                            paper = refreshed[0]
-                        else:
-                            paper["_pending_semantic_check"] = False
-                            paper["_screened_scope_fingerprint"] = admission_fingerprint
+                    # WHY: 详情新增内容或用户约束变化时旧语义结论失效；
+                    # 内容未变且合同完整时，硬过滤复核不得清空授权字段。
+                    if not admitted(paper):
+                        refreshed, _ = screen_candidates(
+                            state, [paper], llm, target=1, should_cancel=should_cancel,
+                        )
+                        if not refreshed:
+                            continue
+                        paper = refreshed[0]
+                    else:
+                        paper["_pending_semantic_check"] = False
+                        paper["_screened_scope_fingerprint"] = admission_fingerprint
                     validated.append(paper)
                 elif stage == "document_type_filter":
                     thesis_excluded += 1
@@ -1968,8 +1456,6 @@ def fetch_detail_node(
         state.setdefault("errors", []).append(f"fetch_detail: {e}")
         append_step(state, "fetch_detail", "failed", error=str(e))
     return state
-
-
 
 
 @node(name="retrieval_shortfall", category="generation", description="未获得任何可用论文时，无法生成相关工作")

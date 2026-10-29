@@ -18,7 +18,7 @@ parser profile 和最小诊断：原始总页数、空文本页身份、文字�
 
 第一层按论文排序；第二层在单篇论文范围内按七类字段执行 BM25、dense、RRF 和可选重排。
 `ChunkVectorIndex.search()` 统一 NumPy 与 pgvector 的 dense 返回契约，其他排名及抽取流程
-不重写。NumPy 仍为默认后端，`sections` 模式在任何配置下均不连接向量库或模型端点。
+不重写。默认使用 pgvector，NumPy 保留为显式本地后端；业务不再提供独立 sections 模式。
 
 可选 PostgreSQL 使用独立连接、连接池、连接和语句超时；只在请求内连接，无 import-time
 建表或迁移。固定维度由显式迁移生成 `vector(D)`；当前默认维度为 1024，不兼容维度拒绝。
@@ -50,7 +50,7 @@ staging；旧 builder 无权续租、写入或发布。计划数量、连续次�
 
 沿用主控循环、动作契约、预算、检查点、有界检索恢复、主张授权、引用验证和草稿隔离。
 持久化命中只是候选；回读仍对照本次解析原文，逐字摘录检查和字段门禁继续执行。
-数据库不可用可显式选择 sections 降级并记录质量问题；fail 策略中止。来源/模型/权限/
+数据库不可用必须停止，不再以 sections 降级替代持久化检索。来源/模型/权限/
 所有权错误直接拒绝，不允许变成规则抽取成功。两类覆盖状态随运行卡片及检查点 JSON 保留。
 
 本轮 tenant 是受信任部署配置的隔离作用域，不是面向外部请求的 RBAC/用户认证。尚未实现
@@ -72,8 +72,8 @@ python scripts/manage_vectorstore.py migrate
 python scripts/manage_vectorstore.py health
 ```
 
-启用需同时设置 `ENABLE_LLM_CARD_EXTRACTION=true`、`CARD_CHUNK_RETRIEVAL_MODE=hybrid`、
-`CARD_VECTOR_BACKEND=pgvector` 以及已有模型配置。只配置 DSN 不会触发模型或数据迁移。
+业务默认使用 LLM 抽取、Chunk Hybrid 与 pgvector；仍需配置模型与独立 DSN、显式迁移。
+只填写 DSN 不会触发模型或自动迁移。启动前运行 `python scripts/check_rag_runtime.py`。
 
 PDF 确认更新后，显式使用已观察到的 revision 登记，再执行研究任务：
 
@@ -81,7 +81,7 @@ PDF 确认更新后，显式使用已观察到的 revision 登记，再执行研
 python scripts/manage_vectorstore.py register-source --paper-id PAPER --pdf INPUT.pdf --expected-revision 1
 ```
 
-回退业务只需恢复 numpy 或 sections；不会删除向量表。若确实需要删除可选向量表及数据，
+可显式切换到 numpy 进行本地检索，该操作不会删除向量表。若确实需要删除向量表及数据，
 使用下列显式命令；保留 vector 扩展，不触及业务 SQLite：
 
 ```powershell

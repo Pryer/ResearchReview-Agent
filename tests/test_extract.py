@@ -11,6 +11,7 @@ from app.tools.extract_paper_card import (
     validate_paper_card,
 )
 from app.schemas.paper_schema import PaperCard
+from tests.card_fixtures import source_card
 
 
 def _make_paper(**kwargs) -> dict:
@@ -143,195 +144,70 @@ class TestDictToCardAuthoritativeFields:
 
 
 class TestExtractPaperCard:
-    def test_rule_based_extraction_without_llm(self):
-        """无 LLM 时应使用规则抽取。"""
-        paper = _make_paper()
-        card = extract_paper_card(paper, parsed_text=None, llm=None)
-        assert isinstance(card, PaperCard)
-        assert card.paper_id == "test:1"
-        assert card.title == "Test Paper on Vision Transformers"
+    def test_missing_model_is_explicit_failure(self):
+        from app.core.exceptions import PaperCardExtractionError
+        with pytest.raises(PaperCardExtractionError):
+            extract_paper_card(_make_paper(), llm=None)
 
-    def test_full_text_extraction(self):
-        """有全文时应标记 evidence_source=full_text。"""
-        paper = _make_paper()
-        parsed = {"full_text": "This is the full text of a paper about transformers..."}
-        card = extract_paper_card(paper, parsed_text=parsed, llm=None)
-        assert card.evidence_source == "full_text"
+    def test_abstract_extraction_is_model_driven_and_traceable(self):
+        import json
+        text = "We propose a traceable retrieval method for document search."
+        class Model:
+            def complete(self, prompt, **kwargs):
+                assert text in prompt
+                return json.dumps({"method": text})
+        card = extract_paper_card(_make_paper(abstract=text), llm=Model())
+        assert card.method == text
+        assert card.evidence_source == "abstract"
+        assert card.field_claims["method"][0].explicitly_reported
+        assert all(s.source_status == "source_verified" for s in card.evidence_spans if s.source_type == "abstract")
+        assert any(s.source_type == "metadata" for s in card.evidence_spans)
+        assert card.authors == ["Alice", "Bob"]
+        assert card.doi == "10.1000/test"
 
-    def test_abstract_only_extraction(self):
-        """仅有摘要时应标记 evidence_source=abstract。"""
-        paper = _make_paper(abstract="Short abstract")
-        card = extract_paper_card(paper, parsed_text={}, llm=None)
-        # 没有全文时根据摘要抽取
-        assert card.evidence_source in ("abstract", "metadata")
+    def test_model_failure_does_not_create_rule_based_claims(self):
+        class Model:
+            def complete(self, *args, **kwargs):
+                raise RuntimeError("model unavailable")
+        card = extract_paper_card(_make_paper(), llm=Model())
+        assert card.quality_status == "invalid"
+        assert card.evidence_source == "metadata"
+        assert not card.method and not card.research_problem and not card.field_claims
+        assert "extraction:model_failure:RuntimeError" in card.quality_issues
 
-    def test_cnki_ignores_cached_full_text_and_uses_abstract_evidence(self):
-        """CNKI 即使存在历史全文缓存，也必须保持摘要证据级别。"""
-        paper = _make_paper(
-            paper_id="cnki:abstract-only",
-            source="cnki",
-            abstract="This abstract reports a classroom behavior coding study.",
-        )
-        parsed = {
-            "full_text": "A cached full text that must not be used.",
-            "pages": [{"page": 1, "text": "A cached full text that must not be used."}],
-        }
+    def test_unreported_fields_are_not_filled_by_rules(self):
+        class Model:
+            def complete(self, *args, **kwargs):
+                return '{"method": ""}'
+        card = extract_paper_card(_make_paper(abstract="We analyze 2018 video segments using audio and pose."), llm=Model())
+        assert card.sample_size is None
+        assert card.data_modalities == []
+        assert card.method == ""
 
-        card = extract_paper_card(paper, parsed_text=parsed, llm=None)
-
+    def test_cnki_ignores_cached_full_text(self):
+        import json
+        text = "We propose a traceable retrieval method for document search."
+        class Model:
+            def complete(self, prompt, **kwargs):
+                assert "Forbidden cached full text" not in prompt
+                return json.dumps({"method": text})
+        card = extract_paper_card(_make_paper(source="cnki", abstract=text),
+                                  {"full_text": "Forbidden cached full text"}, llm=Model())
         assert card.evidence_source == "abstract"
         assert card.evidence_state.access_level.value == "abstract"
-        assert card.evidence_spans
-        assert any(span.source_type == "abstract" for span in card.evidence_spans)
         assert all(span.source_type != "full_text" for span in card.evidence_spans)
-        assert all("cached full text" not in span.text.lower() for span in card.evidence_spans)
 
-    def test_relevance_reason_filled(self):
-        """相关性说明应有内容。"""
-        paper = _make_paper()
-        card = extract_paper_card(paper, parsed_text=None, llm=None, topic="vision transformer")
-        assert len(card.relevance_reason) > 0
-
-    def test_bibliographic_fields_carry_their_own_metadata_evidence(self):
-        """作者、年份、来源、DOI、出版状态必须各自可溯源，而非只有内容证据。"""
-        paper = _make_paper(publication_status="published")
-        card = extract_paper_card(paper, parsed_text=None, llm=None, topic="课堂行为识别")
-
-        evidence_ids = {span.evidence_id for span in card.evidence_spans}
-        for field in ("authors", "year", "venue", "doi", "publication_status"):
-            mapped = card.field_evidence.get(field)
-            assert mapped, f"{field} 缺少元数据证据"
-            assert set(mapped).issubset(evidence_ids)
-        # 书目证据只用于溯源，不得作为可写入正文的内容主张。
-        assert "authors" not in card.field_claims
-        assert "doi" not in card.field_claims
-        assert card.publication_status.value == "published"
-
-    def test_unknown_publication_status_is_not_promoted(self):
-        card = extract_paper_card(
-            _make_paper(), parsed_text=None, llm=None, topic="课堂行为识别"
-        )
-        assert card.publication_status.value == "unknown"
-
-    def test_abstract_card_contains_traceable_evidence(self):
-        paper = _make_paper(
-            abstract=(
-                "We propose a transformer method for classroom behavior recognition. "
-                "The method achieves 82% accuracy on the Classroom-10 dataset."
-            )
-        )
-        card = extract_paper_card(paper, parsed_text=None, llm=None, topic="课堂行为识别")
-
-        assert card.evidence_spans
-        assert any(span.source_type == "abstract" for span in card.evidence_spans)
-        assert card.field_evidence.get("method")
-        evidence_ids = {span.evidence_id for span in card.evidence_spans}
-        assert set(card.field_evidence["method"]).issubset(evidence_ids)
-
-    def test_same_abstract_sentence_is_not_reused_across_semantic_fields(self):
-        sentence = (
-            "This paper proposes an enhanced YOLOv8 model for classroom "
-            "student behavior detection."
-        )
-        card = extract_paper_card(
-            _make_paper(abstract=sentence),
-            parsed_text=None,
-            llm=None,
-            topic="课堂行为识别",
-        )
-
-        populated = [
-            value for value in [
-                card.research_problem,
-                card.method,
-                *card.contributions,
-            ]
-            if value
-        ]
-        assert populated == [sentence]
-        assert card.method == sentence
-        assert "research_problem" not in card.field_claims
-        assert "contributions" not in card.field_claims
-
-    def test_full_text_evidence_preserves_page_number(self):
-        paper = _make_paper(abstract="")
-        parsed = {
-            "full_text": "We introduce an evidence-aware retrieval method.",
-            "pages": [
-                {"page": 3, "text": "We introduce an evidence-aware retrieval method for factual generation."}
-            ],
-        }
-        card = extract_paper_card(paper, parsed_text=parsed, llm=None, topic="RAG")
-
-        assert any(span.source_type == "full_text" for span in card.evidence_spans)
-        assert any(span.page == 3 for span in card.evidence_spans)
-
-    def test_literature_matrix_fields_are_extracted_conservatively(self):
-        paper = _make_paper(
-            source="arxiv",
-            arxiv_id="2401.12345",
-            # venue 必须与 arxiv_client 的真实输出一致（该客户端恒置 "arXiv"，
-            # 见 arxiv_client.py 的 PaperMetadata 构造）。真预印本无出版方 DOI：
-            # 默认夹具的 doi="10.1000/test" 是出版方 DOI，配 source=arxiv 表示
-            # 正式发表后回填，那已不是预印本。此处清空以还原纯预印本形态。
-            venue="arXiv",
-            doi=None,
-            abstract=(
-                "We analyze 2018 classroom video segments using video, audio, and pose data. "
-                "The study examines hand raising, student engagement, and teacher feedback."
-            ),
-        )
-        card = extract_paper_card(paper, llm=None, topic="课堂行为分析")
-        assert card.authors == ["Alice", "Bob"]
-        assert card.doi is None
-        assert card.publication_type == "preprint"
-        assert card.peer_review_status == "not_peer_reviewed"
-        assert card.evidence_level == "preprint"
-        assert card.sample_size == "2018 classroom video segments"
-        assert {"video", "audio", "pose_skeleton"}.issubset(card.data_modalities)
-        # 开放领域类别只能由 LLM 从原文动态抽取；规则兜底不维护课堂行为词表。
-        assert card.behavior_categories == []
-
-    def test_abstract_access_rejects_author_unreported_limitations(self):
-        paper = _make_paper(
-            abstract=(
-                "We propose a multimodal classroom behavior method. "
-                "Results show that the method achieves 82% accuracy."
-            )
-        )
-        card = extract_paper_card(paper, llm=None, topic="课堂行为分析")
-        assert card.evidence_state.access_level.value == "abstract"
-        assert card.method
-        assert card.results
-        assert card.limitations == []
-        assert "limitations" in card.unsupported_fields
-        assert card.field_claims["method"][0].explicitly_reported is True
-
-    def test_metadata_only_cannot_create_content_claims(self):
-        paper = _make_paper(abstract="", keywords=None, doi=None, url=None)
-        card = extract_paper_card(paper, llm=None, topic="课堂行为分析")
+    def test_no_accessible_content_is_invalid_metadata_only(self):
+        card = extract_paper_card(_make_paper(abstract=""), llm=None)
+        assert card.quality_status == "invalid"
+        assert not card.method and not card.field_claims
         assert card.evidence_state.access_level.value == "metadata_only"
-        assert card.research_problem == ""
-        assert card.method == ""
-        assert card.results is None
-        assert "method" in card.unsupported_fields
+        assert "extraction:no_accessible_content" in card.quality_issues
 
-    def test_full_text_requires_core_sections_otherwise_is_partial(self):
+    def test_full_text_access_still_requires_core_sections(self):
         paper = _make_paper(abstract="")
-        partial = resolve_evidence_permissions(
-            paper, {"full_text": "Method text", "sections": {"method": "Method text"}}
-        )
-        complete = resolve_evidence_permissions(
-            paper,
-            {
-                "full_text": "Complete paper",
-                "sections": {"method": "m", "experiment": "e", "references": "r"},
-            },
-        )
-        assert partial.access_level.value == "partial_full_text"
-        assert partial.can_compare_metrics is False
-        assert complete.access_level.value == "full_text"
-        assert complete.can_compare_metrics is True
+        assert resolve_evidence_permissions(paper, {"full_text": "Method text", "sections": {"method": "Method text"}}).access_level.value == "partial_full_text"
+        assert resolve_evidence_permissions(paper, {"full_text": "Complete paper", "sections": {"method": "m", "experiment": "e", "references": "r"}}).access_level.value == "full_text"
 
 
 class TestValidatePaperCard:
@@ -369,7 +245,7 @@ class TestValidatePaperCard:
         assert validate_paper_card(card) is False
 
 
-def test_rule_card_rejects_motivation_as_method_and_affiliation_as_result():
+def test_card_quality_rejects_affiliation_and_unreported_limitations():
     paper = _make_paper(
         abstract=(
             "曾建电1，北京师范大学自然科学高等研究院，广东珠海。摘要："
@@ -379,7 +255,9 @@ def test_rule_card_rejects_motivation_as_method_and_affiliation_as_result():
             "实验结果表明，该方法在分类准确率和F1值上优于单模态方法。"
         )
     )
-    card = extract_paper_card(paper, llm=None, topic="课堂行为分析")
+    card = source_card(paper,
+        method="为此，本研究提出一种结合图像和文本的多模态数据增强方法。",
+        results="实验结果表明，该方法在分类准确率和F1值上优于单模态方法。")
     assert "传统单模态" not in card.method
     assert "本研究提出" in card.method
     assert card.results and "实验结果表明" in card.results
@@ -433,7 +311,7 @@ def test_full_text_front_matter_cannot_replace_clean_abstract_problem():
         }],
     }
 
-    card = extract_paper_card(paper, parsed_text=parsed, llm=None, topic="课堂行为分析")
+    card = source_card(paper, parsed, research_problem=paper["abstract"])
 
     assert card.research_problem.startswith("This study examines how classroom")
     assert all("©" not in span.text for span in card.evidence_spans)
@@ -469,11 +347,7 @@ def test_evidence_card_database_round_trip():
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
-    card = extract_paper_card(
-        _make_paper(abstract="We propose a traceable evidence method for RAG."),
-        llm=None,
-        topic="RAG",
-    )
+    card = source_card(_make_paper(abstract="We propose a traceable evidence method for RAG."))
 
     with Session(engine) as session:
         repository = PaperCardRepository(session)

@@ -365,7 +365,7 @@ def run_route_evidence_recovery(
                     download_pdf_node(state)
                     if should_parse_pdf(state):
                         parse_pdf_node(state)
-                card_llm = llm if settings.enable_llm_card_extraction else None
+                card_llm = llm
                 extract_card_node(state, llm=card_llm)
 
             state["recovery_round"] = round_number

@@ -210,6 +210,8 @@ def test_fetch_detail_node_only_enriches_generation_pool_when_sufficient(monkeyp
         "errors": [],
     }
 
+    from tests.retrieval_fakes import admitted_paper
+    state["ranked_papers"] = [admitted_paper(state, **p) for p in state["ranked_papers"]]
     fetch_detail_node(state)
 
     assert batch_sizes == [60]

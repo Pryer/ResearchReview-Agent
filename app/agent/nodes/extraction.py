@@ -183,17 +183,16 @@ def extract_card_node(
         refreshed_ids = set(state.get("incremental_new_paper_ids") or [])
         # WHY: 增量详情可能重新确认同一篇论文；旧卡的关系与交付物资格
         # 属于上一版详情，不能仅凭 paper_id 继续复用。
-        hybrid_mode = (state.get("retrieval_profile") or {}).get("mode") == "hybrid"
         # WHY: Controller 已按当前详情移除失效卡；失效重建也复用仍有效的卡，
         # 避免为重建少量论文再次消耗整池提取预算，不复用已被移除的旧卡。
         existing_cards = [card for card in (state.get("paper_cards") or [])
                           if (state.get("incremental_retrieval") or state.get("pending_card_rebuild_ids"))
                           and _paper_identity_key(card) in detail_by_key
                           and str(card.get("paper_id") or "") not in refreshed_ids
-                          and (not hybrid_mode or (
+                          and (
                               card.get("relation_type") == detail_by_key[_paper_identity_key(card)].get("_topic_relation")
                               and set(card.get("eligible_deliverables") or []) == set(
-                                  detail_by_key[_paper_identity_key(card)].get("_eligible_deliverables") or [])))]
+                                  detail_by_key[_paper_identity_key(card)].get("_eligible_deliverables") or []))]
         existing_keys = {
             _paper_identity_key(card) for card in existing_cards
             if _paper_identity_key(card)

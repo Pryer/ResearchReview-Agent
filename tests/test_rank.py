@@ -308,7 +308,7 @@ def test_high_confidence_exclusions_are_never_restored_as_reserve():
     assert diagnostics["hard_excluded_paper_ids"] == [f"p{i}" for i in range(5)]
 
 
-def test_scope_filter_happens_before_top_k_and_backfills():
+def test_scope_candidates_are_pending_until_semantic_screening():
     candidates = [
         _make_paper(paper_id="outside-1", title="Unrelated High Impact", citation_count=1000),
         _make_paper(paper_id="outside-2", title="Another Unrelated", citation_count=900),
@@ -328,9 +328,9 @@ def test_scope_filter_happens_before_top_k_and_backfills():
 
     rank_node(state)
 
-    assert [paper["paper_id"] for paper in state["ranked_papers"]] == [
-        "inside-1", "inside-2"
-    ]
+    assert {p["paper_id"] for p in state["ranked_papers"]} >= {"inside-1", "inside-2"}
+    assert all(p["_pending_semantic_check"] for p in state["ranked_papers"])
+    assert state["retrieval_requirement_met"] is False
 
 
 def test_recovery_branch_minimum_lifts_targeted_recall_into_top_k():
@@ -463,7 +463,7 @@ def test_rank_node_with_cnki_candidates_computes_source_quota():
     out = rank_node(state)
 
     assert out.get("errors") is None
-    assert out["screening_report"]["rule_filter"]["source_minimums"].get("cnki") >= 1
+    assert out["screening_report"]["mode"] == "hybrid"
     ranked = out["ranked_papers"]
     assert ranked, "CNKI 候选存在时 rank_node 应产出排序结果"
     assert any(paper["source"] == "cnki" for paper in ranked)
@@ -1463,67 +1463,6 @@ class TestBranchMerge:
         assert all(str(p["paper_id"]).startswith("en:") for p in result)
 
 
-class TestRankNodeBranchedMode:
-    """rank_node 双分支模式端到端测试。"""
-
-    def test_rank_node_branched_with_bilingual_protocol(self):
-        """模拟中英文混合候选池，验证 rank_node 双分支模式输出。"""
-        protocol = _bilingual_protocol()
-
-        # 混合中英文候选
-        candidates = []
-        for i in range(15):
-            candidates.append({
-                "paper_id": f"zh:test:{i}",
-                "title": f"基于深度学习的课堂行为识别研究第{i}篇",
-                "abstract": "本文研究课堂行为识别方法",
-                "authors": ["作者"],
-                "year": 2024,
-                "venue": "计算机学报",
-                "source": "cnki",
-                "citation_count": 5,
-            })
-        for i in range(25):
-            candidates.append({
-                "paper_id": f"en:test:{i}",
-                "title": f"Deep Learning for Classroom Behavior Recognition Study {i}",
-                "abstract": "We propose methods for recognizing student behaviors in classroom settings.",
-                "authors": ["Author"],
-                "year": 2024,
-                "venue": "CVPR",
-                "source": "arxiv",
-                "citation_count": 20,
-            })
-
-        state = {
-            "candidate_papers": candidates,
-            "topic": "课堂行为分析",
-            "keywords": ["课堂行为分析", "classroom behavior"],
-            "max_papers": 20,
-            "retrieval_target": 20,
-            "required_concepts": [],
-            "excluded_title_terms": [],
-            "selected_scope": {},
-            "search_branches": [],
-            "screening_protocol": protocol,
-            "steps": [],
-            "errors": [],
-        }
-
-        result_state = rank_node(state, llm=None)
-
-        assert result_state.get("ranked_papers") is not None
-        assert len(result_state["ranked_papers"]) > 0
-        # 不应有错误
-        assert not result_state.get("errors")
-
-        report = result_state.get("screening_report", {})
-        rule_filter = report.get("rule_filter", {})
-        # 双分支模式
-        assert rule_filter.get("mode") == "branched"
-        branch_stats = rule_filter.get("branch_stats", {})
-        assert branch_stats.get("zh_initial") == 15
-        assert branch_stats.get("en_initial") == 25
 
 
 def test_llm_rerank_survives_null_and_non_numeric_scores():
@@ -1628,10 +1567,10 @@ def test_reserve_backfill_fires_from_papers_outside_candidate_pool():
     assert [p["paper_id"] for p in result] == ["p69", "p68", "p67", "p66", "p65"]
 
 
-def test_retrieval_loop_keeps_rule_order_when_rerank_fails(monkeypatch):
+def test_retrieval_loop_does_not_authorize_candidates_when_screening_fails(monkeypatch):
     """回归：末尾 LLM rerank 异常不得炸掉整条检索链（#4 逃逸口）。
 
-    rerank 只是排序增强，失败时应保留规则粗排顺序并在诊断中记录降级。
+    语义准入未完成时不得保留未授权候选作为最终检索结果。
     """
     from app.agent import retrieval_loop
 
@@ -1656,11 +1595,8 @@ def test_retrieval_loop_keeps_rule_order_when_rerank_fails(monkeypatch):
         state, llm=object(), should_cancel=None, progress_callback=None,
     )
 
-    # 规则粗排顺序原样保留
-    assert [p["paper_id"] for p in state["ranked_papers"]] == ["p1", "p2"]
-    report = state["screening_report"]
-    assert report["llm_rerank"]["mode"] == "rule_order_fallback"
-    assert "rerank exploded" in report["llm_rerank"]["error"]
+    assert state["ranked_papers"] == []
+    assert state["retrieval_requirement_met"] is False
 
 
 def test_safe_float_degrades_instead_of_crashing_rerank():
@@ -2129,93 +2065,8 @@ def test_reserve_k_defaults_to_zero_and_keeps_top_k_contract():
     assert diagnostics["truncated_by_top_k"] == 128
 
 
-def test_screening_reserve_k_only_applies_with_explicit_reference_requirement():
-    from app.agent.nodes.retrieval import _screening_reserve_k
-
-    # 无显式引用要求 → 没有"缺口"可言，不加宽窗口
-    assert _screening_reserve_k(0, 72, 120) == 0
-    assert _screening_reserve_k(40, 72, 120) == 48
-    assert _screening_reserve_k(40, 0, 120) == 0
-    # 主窗口已不低于重排上限时不留负数后备
-    assert _screening_reserve_k(40, 200, 120) == 0
 
 
-class TestRankNodeScreeningReserve:
-    """rank_node 必须把后备窗口交到下游全局重排手里（两种模式都要）。"""
-
-    @staticmethod
-    def _single_branch_state(**overrides) -> dict:
-        state = {
-            "candidate_papers": [
-                _make_paper(paper_id=str(index), title=f"Paper {index}")
-                for index in range(200)
-            ],
-            "topic": "paper",
-            "keywords": ["paper"],
-            "max_papers": 72,
-            "retrieval_target": 72,
-            "required_concepts": [],
-            "excluded_title_terms": [],
-            "selected_scope": {},
-            "search_branches": [],
-            "screening_protocol": {},
-            "steps": [],
-            "errors": [],
-        }
-        state.update(overrides)
-        return state
-
-    def test_single_branch_pool_exceeds_primary_window(self):
-        out = rank_node(
-            self._single_branch_state(required_reference_count=40), llm=None,
-        )
-
-        ranked = out["ranked_papers"]
-        assert len(ranked) == 120
-        assert sum(1 for paper in ranked if paper.get("_rule_screened_reserve")) == 48
-        rank_step = next(
-            step for step in out["steps"] if step.get("step_name") == "rank"
-        )
-        assert rank_step["output_data"]["screening_reserve_k"] == 48
-        assert rank_step["output_data"]["screening_reserve_count"] == 48
-
-    def test_single_branch_pool_stays_at_primary_window_without_requirement(self):
-        out = rank_node(self._single_branch_state(), llm=None)
-
-        assert len(out["ranked_papers"]) == 72
-
-    def test_branched_merged_pool_exceeds_primary_window(self):
-        """回归：2026-09-01 走的正是双分支模式，合并把证据池压回 64。"""
-        out = rank_node(
-            _branched_state(
-                _branched_candidate_pool(150), required_reference_count=40,
-            ),
-            llm=None,
-        )
-
-        assert not out.get("errors")
-        rule_filter = out["screening_report"]["rule_filter"]
-        assert rule_filter["mode"] == "branched"
-        # 前置条件：候选确实够宽，否则下面的断言会被过滤器变化悄悄放行
-        assert rule_filter["branch_stats"]["zh_after_hard_filter"] >= 120
-        assert rule_filter["branch_stats"]["en_after_hard_filter"] >= 120
-        assert len(out["ranked_papers"]) > 72, "合并窗口必须带上筛选后备段"
-        assert len(out["ranked_papers"]) <= 120
-        # 后备段走 reserve_k 而不是抬高 top_k：两支各自仍按主窗口配额选 72 篇，
-        # 再各追加 48 篇带标记的尾部，合并后一起交到下游全局重排手里。
-        rank_step = next(
-            step for step in out["steps"] if step.get("step_name") == "rank"
-        )
-        assert rank_step["output_data"]["screening_reserve_k"] == 48
-        assert rank_step["output_data"]["screening_reserve_count"] == 96
-        assert rank_step["output_data"]["rule_selected_count"] == 144
-        assert rule_filter["zh_filter"]["selected_count"] == 72
-        assert rule_filter["en_filter"]["selected_count"] == 72
-
-    def test_branched_merged_pool_stays_at_primary_window_without_requirement(self):
-        out = rank_node(_branched_state(_branched_candidate_pool(150)), llm=None)
-
-        assert len(out["ranked_papers"]) <= 72
 
 
 class _ExplodingLLM:
@@ -2254,97 +2105,3 @@ def test_filter_reasons_aggregates_by_specific_reason():
     assert diagnostics["filter_reasons"] == {
         "命中用户明确排除词: zero-shot action recognition": 5,
     }
-
-
-class TestRankNodeBranchedDiagnostics:
-    """双分支模式必须把逐分支诊断带出来，而不是只留 branch_stats 里手抄的一个计数。"""
-
-    def test_branched_rule_filter_keeps_per_branch_diagnostics(self):
-        out = rank_node(
-            _branched_state(
-                _branched_candidate_pool(150), required_reference_count=40,
-            ),
-            llm=None,
-        )
-
-        assert not out.get("errors")
-        rule_filter = out["screening_report"]["rule_filter"]
-        assert rule_filter["mode"] == "branched"
-        zh_filter = rule_filter["zh_filter"]
-        en_filter = rule_filter["en_filter"]
-        assert zh_filter and en_filter
-        # 一级字段是两支之和；此前双分支模式这些键全部缺失，步骤输出只有 0。
-        assert rule_filter["passed_hard_filters"] == (
-            zh_filter["passed_hard_filters"] + en_filter["passed_hard_filters"]
-        )
-        assert rule_filter["passed_hard_filters"] == (
-            rule_filter["branch_stats"]["zh_after_hard_filter"]
-            + rule_filter["branch_stats"]["en_after_hard_filter"]
-        )
-        assert rule_filter["truncated_by_top_k"] == (
-            zh_filter["truncated_by_top_k"] + en_filter["truncated_by_top_k"]
-        )
-
-        output = next(
-            step for step in out["steps"] if step.get("step_name") == "rank"
-        )["output_data"]
-        assert output["passed_hard_filters"] == rule_filter["passed_hard_filters"]
-        assert output["truncated_by_top_k"] == rule_filter["truncated_by_top_k"]
-        assert output["rule_selected_count"] == (
-            zh_filter["selected_count"] + en_filter["selected_count"]
-        )
-
-    def test_branched_rerank_diagnostics_are_merged_and_promoted(self):
-        out = rank_node(
-            _branched_state(_branched_candidate_pool(30), required_reference_count=40),
-            llm=_HalfExcludingLLM(),
-        )
-
-        assert not out.get("errors")
-        branches = out["screening_report"]["llm_rerank"]["branches"]
-        assert branches["zh"]["candidate_count"] > 0
-        assert branches["en"]["candidate_count"] > 0
-
-        output = next(
-            step for step in out["steps"] if step.get("step_name") == "rank"
-        )["output_data"]
-        assert output["rerank_candidate_count"] == (
-            branches["zh"]["candidate_count"] + branches["en"]["candidate_count"]
-        )
-        assert output["rerank_excluded_count"] == (
-            branches["zh"]["excluded_count"] + branches["en"]["excluded_count"]
-        )
-        # _HalfExcludingLLM 高置信排除一半，这个数必须是正的才证明诊断真的接上了
-        assert output["rerank_excluded_count"] > 0
-
-    def test_branch_rerank_batch_degradation_is_visible_in_diagnostics(self):
-        """LLM 每批失败时 paper_rerank 内部降级，降级篇数必须能看见。"""
-        out = rank_node(
-            _branched_state(_branched_candidate_pool(20)), llm=_ExplodingLLM(),
-        )
-
-        branches = out["screening_report"]["llm_rerank"]["branches"]
-        assert branches["zh"]["screening_degraded_count"] == 20
-        assert branches["en"]["screening_degraded_count"] == 20
-        output = next(
-            step for step in out["steps"] if step.get("step_name") == "rank"
-        )["output_data"]
-        assert output["rerank_screening_degraded_count"] == 40
-        assert out["ranked_papers"], "重排降级必须保留论文，不能清空论文池"
-
-    def test_branch_rerank_total_failure_is_recorded_not_swallowed(
-        self, monkeypatch,
-    ):
-        def _boom(*args, **kwargs):
-            raise RuntimeError("branch rerank exploded")
-
-        monkeypatch.setattr("app.tools.rank_papers.llm_rerank_papers", _boom)
-        out = rank_node(
-            _branched_state(_branched_candidate_pool(20)), llm=object(),
-        )
-
-        branches = out["screening_report"]["llm_rerank"]["branches"]
-        assert branches["zh"]["mode"] == "rule_order_fallback"
-        assert branches["en"]["mode"] == "rule_order_fallback"
-        assert "branch rerank exploded" in branches["zh"]["error"]
-        assert out["ranked_papers"], "重排失败必须退回规则顺序，不能清空论文池"

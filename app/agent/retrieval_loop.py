@@ -1,6 +1,6 @@
 """ReAct 检索精化循环。
 
-从 graph.py 编排层下沉的检索策略本体：首轮检索 → 规则排序 →
+从 graph.py 编排层下沉的检索策略本体：首轮检索 → 混合召回与精排 →
 循环（覆盖度判定 → LLM 关键词精化 → 增量检索 → 再排序）→
 末尾统一 LLM 重排。graph 只负责决定"何时调用本循环"，
 循环的退出条件与轮次预算在这里维护。
@@ -209,7 +209,8 @@ def search_rank_with_refinement(
         or state.get("max_papers")
         or get_settings().default_max_papers
     )
-    hybrid_mode = (state.get("retrieval_profile") or {}).get("mode") == "hybrid"
+    from app.agent.orchestration import normalize_retrieval_profile
+    normalize_retrieval_profile(state)
     max_rounds = get_settings().search_refinement_max_rounds
     # 增量/修复场景本身是定向补召回，完整 refine 循环的后几轮边际收益
     # 很低却各花数分钟；压缩为最多一轮精化，控制修复总时长。
@@ -251,7 +252,7 @@ def search_rank_with_refinement(
                 if branch != focus_branch
             )]
 
-    if hybrid_mode and state.get("ranked_papers"):
+    if state.get("ranked_papers"):
         from app.agent.action_registry import admitted_ranked_papers, has_unsearched_queries
 
         pending = [paper for paper in state["ranked_papers"]
@@ -329,7 +330,7 @@ def search_rank_with_refinement(
         core_keywords=state.get("core_keywords") or [state.get("topic") or ""],
         expanded_keywords=state.get("expanded_keywords") or [],
         topic_anchors=state.get("topic_anchors") or state.get("required_concepts") or [],
-        ranking_mode="hybrid" if hybrid_mode else "rules",
+        ranking_mode="hybrid",
     )
 
     # 英文硬筛低通过率时先做一次英文定向补召回，再进入常规 refine；新结果
@@ -342,7 +343,7 @@ def search_rank_with_refinement(
             core_keywords=state.get("core_keywords") or [state.get("topic") or ""],
             expanded_keywords=state.get("expanded_keywords") or [],
             topic_anchors=state.get("topic_anchors") or state.get("required_concepts") or [],
-            ranking_mode="hybrid" if hybrid_mode else "rules",
+            ranking_mode="hybrid",
         )
 
     for _ in range(max_rounds):
@@ -366,32 +367,27 @@ def search_rank_with_refinement(
         required_references = int(
             state.get("required_reference_count") or target
         )
-        if hybrid_mode:
-            hybrid_report = ((state.get("screening_report") or {}).get("hybrid") or {})
-            window_count = int(hybrid_report.get("window_count") or 0)
-            # 与 paper_rerank.reserve_target 相同的 1.5× 过取系数：pending
-            # 窗口不能按"已合格"计数，但窗口达到储备线后继续加深的边际收益
-            # 极低（实测 556→1464 候选，窗口仅 164→177），每轮却要重复全源
-            # 检索和数百篇 embedding。直接进入末尾统一语义准入；准入不足时
-            # 下游门禁仍按既有路径保留缺口/触发恢复，不静默降低引用要求。
-            reserve_target = (
-                int(required_references * 1.5 + 0.5)
-                if required_references > 0 else 0
+        hybrid_report = ((state.get("screening_report") or {}).get("hybrid") or {})
+        window_count = int(hybrid_report.get("window_count") or 0)
+        # 与 paper_rerank.reserve_target 相同的 1.5× 过取系数：pending
+        # 窗口不能按"已合格"计数，但窗口达到储备线后继续加深的边际收益
+        # 极低（实测 556→1464 候选，窗口仅 164→177），每轮却要重复全源
+        # 检索和数百篇 embedding。直接进入末尾统一语义准入；准入不足时
+        # 下游门禁仍按既有路径保留缺口/触发恢复，不静默降低引用要求。
+        reserve_target = (
+            int(required_references * 1.5 + 0.5)
+            if required_references > 0 else 0
+        )
+        if (
+            reserve_target
+            and window_count >= reserve_target
+            and coverage.get("ready", True)
+        ):
+            state["retrieval_stop_reason"] = (
+                f"混合融合窗口 {window_count} 篇已覆盖 {required_references} 篇"
+                "引用的 1.5 倍储备且重点覆盖就绪，跳过剩余精化轮直接进入语义准入"
             )
-            if (
-                reserve_target
-                and window_count >= reserve_target
-                and coverage.get("ready", True)
-            ):
-                state["retrieval_stop_reason"] = (
-                    f"混合融合窗口 {window_count} 篇已覆盖 {required_references} 篇"
-                    "引用的 1.5 倍储备且重点覆盖就绪，跳过剩余精化轮直接进入语义准入"
-                )
-                break
-        elif eligible_count >= required_references and coverage.get("ready", True):
-            state["retrieval_requirement_met"] = True
-            state["retrieval_stop_reason"] = "引用需求与证据覆盖均已满足"
-            break  # 满足后跳出循环，在末尾统一做一次 LLM rerank
+            break
         before_keywords = list(state.get("keywords") or [])
         _checkpoint(state, "refine_search", 3, total_steps, should_cancel, progress_callback)
         refine_search_node(state, llm=llm)
@@ -417,11 +413,11 @@ def search_rank_with_refinement(
             core_keywords=state.get("core_keywords") or [state.get("topic") or ""],
             expanded_keywords=state.get("expanded_keywords") or [],
             topic_anchors=state.get("topic_anchors") or state.get("required_concepts") or [],
-            ranking_mode="hybrid" if hybrid_mode else "rules",
+            ranking_mode="hybrid",
         )
 
     # 精化轮只估计候选覆盖；正式返回前统一做专用精排和 LLM 逐篇准入。
-    if hybrid_mode and state.get("ranked_papers"):
+    if state.get("ranked_papers"):
         from app.services.retrieval_ranking_service import rank_candidates, screen_candidates
 
         # WHY: 提前跳出精化循环后，统一精排仍要对融合窗口（事故中上千篇）
@@ -472,67 +468,3 @@ def search_rank_with_refinement(
                     "语义筛选合格候选达到检索目标" if state["retrieval_requirement_met"]
                     else "语义筛选后候选不足，保留原始引用缺口"
                 )
-    # 只在最后做一次 LLM rerank
-    if not hybrid_mode and llm is not None and state.get("ranked_papers"):
-        from app.tools.rank_papers import llm_rerank_papers
-
-        from app.agent.nodes.base import _paper_identity_key
-
-        rerank_diagnostics: dict[str, Any] = {}
-        rerank_input = state["ranked_papers"]
-        rerank_mode = "full"
-        retained_head: list = []
-        # 增量轮：旧榜单的相对顺序已由上一轮全量重排确定，全池重排
-        # 纯属浪费（实测一次全池 rerank 数分钟）。只重排新增论文 +
-        # 旧榜尾部边界段（可能被新论文挤出 cutoff 的候选），重排后
-        # 与旧榜头部段拼接；头部段保持原顺序不变。
-        new_keys = set(state.get("incremental_new_paper_keys") or [])
-        if state.get("incremental_retrieval") and new_keys:
-            new_papers = [
-                paper for paper in state["ranked_papers"]
-                if _paper_identity_key(paper) in new_keys
-            ]
-            old_papers = [
-                paper for paper in state["ranked_papers"]
-                if _paper_identity_key(paper) not in new_keys
-            ]
-            if new_papers and old_papers:
-                boundary = max(1, min(len(old_papers), target // 2))
-                retained_head = old_papers[:-boundary]
-                rerank_input = old_papers[-boundary:] + new_papers
-                rerank_mode = "incremental_merge"
-        try:
-            ranked = llm_rerank_papers(
-                rerank_input,
-                topic=state.get("topic", ""),
-                scope=state.get("selected_scope") or {},
-                llm=llm,
-                top_k=target,
-                research_mode=str(
-                    (state.get("research_semantic_frame") or {}).get("research_mode") or ""
-                ),
-                screening_protocol=state.get("screening_protocol") or {},
-                rerank_diagnostics=rerank_diagnostics,
-                minimum_required=int(state.get("required_reference_count") or 0),
-            )
-        except AgentCancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            # rerank 只是排序增强：单次 LLM/解析异常不能炸掉整条检索链，
-            # 否则也是 citation_gap_repair 增量路径的逃逸口。保留规则粗排
-            # 顺序继续走，并在诊断中记录降级。
-            logger.warning("llm_rerank_papers failed; keeping rule-based order: %s", exc)
-            ranked = rerank_input
-            rerank_diagnostics.clear()
-            rerank_diagnostics.update({
-                "mode": "rule_order_fallback",
-                "error": str(exc),
-            })
-        if retained_head:
-            # 头部段与重排结果集合互斥（按身份键拆分），直接拼接后截断。
-            ranked = (retained_head + list(ranked))[:target]
-        state["ranked_papers"] = ranked
-        report = dict(state.get("screening_report") or {})
-        report["llm_rerank"] = rerank_diagnostics
-        report["llm_rerank_mode"] = rerank_mode
-        state["screening_report"] = report

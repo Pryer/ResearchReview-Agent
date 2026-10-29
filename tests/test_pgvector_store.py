@@ -41,6 +41,13 @@ def spec(settings, count=2, total=None):
     return IndexSpec(settings.card_vector_tenant,"p","source-v1","processing-v1","embedding-v1",1024,count,total or count)
 
 
+def test_runtime_ready_checks_migration_and_dimension(store, settings):
+    assert store.ready() is True
+    incompatible = settings.model_copy(update={"retrieval_embedding_dimension": 2})
+    with pytest.raises(VectorIntegrityError):
+        PgVectorStore(incompatible).ready()
+
+
 def items(count):
     return [dict(paper_id="p", chunk_id=i, section="full_text", page=i + 1,
                  char_start=0,char_end=len(f"Original source sentence {i}."),offset_basis="page",

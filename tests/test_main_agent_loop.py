@@ -192,6 +192,7 @@ def test_unavailable_preselected_recovery_action_blocks_explicitly():
 def test_autonomous_graph_pipeline_reuses_existing_nodes_and_quality_gate(monkeypatch):
     from app.agent import graph
 
+    from tests.retrieval_fakes import admitted_paper
     state = _state()
     state.update({
         "intent": "generate_review",
@@ -207,12 +208,12 @@ def test_autonomous_graph_pipeline_reuses_existing_nodes_and_quality_gate(monkey
         graph, "_search_rank_with_refinement",
         lambda current, **kwargs: current.update({
             "candidate_papers": [{"paper_id": "p1"}],
-            "ranked_papers": [{"paper_id": "p1"}],
+            "ranked_papers": [admitted_paper(current, paper_id="p1")],
         }),
     )
     monkeypatch.setattr(
         graph, "fetch_detail_node",
-        lambda current, **kwargs: current.update({"paper_details": [{"paper_id": "p1"}]}),
+        lambda current, **kwargs: current.update({"paper_details": [admitted_paper(current, paper_id="p1")]}),
     )
     monkeypatch.setattr(graph, "download_pdf_node", lambda current, **kwargs: None)
     monkeypatch.setattr(graph, "should_parse_pdf", lambda current: False)

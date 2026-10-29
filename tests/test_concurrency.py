@@ -3,6 +3,11 @@
 from app.tools.extract_paper_card import batch_extract_paper_cards
 from app.schemas.paper_schema import PaperCard
 
+
+class Model:
+    def complete(self, *args, **kwargs):
+        return '{"method": ""}'
+
 def test_batch_extract_paper_cards_concurrency_and_ordering():
     papers = [
         {
@@ -17,7 +22,7 @@ def test_batch_extract_paper_cards_concurrency_and_ordering():
     ]
     parsed_texts = {}
 
-    cards = batch_extract_paper_cards(papers, parsed_texts, llm=None, topic="测试主题", max_workers=4)
+    cards = batch_extract_paper_cards(papers, parsed_texts, llm=Model(), topic="测试主题", max_workers=4)
 
     assert len(cards) == 10
     # 验证顺序完全保持
@@ -34,10 +39,11 @@ def test_batch_extract_paper_cards_handles_worker_exception():
     ]
     parsed_texts = {}
 
-    cards = batch_extract_paper_cards(papers, parsed_texts, llm=None, topic="测试主题", max_workers=2)
+    cards = batch_extract_paper_cards(papers, parsed_texts, llm=Model(), topic="测试主题", max_workers=2)
 
     assert len(cards) == 3
     assert cards[0].paper_id == "good_1"
     assert cards[2].paper_id == "good_2"
-    # Bad card still extracted safely via fallback rule-based
+    # 无内容或异常仅保存 invalid 元数据，不生成规则内容卡。
     assert cards[1].paper_id == "bad_1"
+    assert cards[1].quality_status == "invalid"

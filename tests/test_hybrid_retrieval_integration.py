@@ -114,22 +114,6 @@ class _IncludeAllLLM:
         ]})
 
 
-def test_shadow_mode_keeps_rules_selection_and_records_diagnostics(hybrid_settings, monkeypatch):
-    _patch_clients(monkeypatch)
-    state = _base_state(candidate_papers=[
-        {"paper_id": "zh1", "title": "课堂互动行为分析", "abstract": "师生互动编码观察", "year": 2025},
-        {"paper_id": "zh2", "title": "课堂互动编码体系", "abstract": "行为序列研究", "year": 2025},
-    ], retrieval_profile={"mode": "hybrid_shadow"})
-
-    rank_node(state)
-
-    shadow = state["hybrid_shadow_report"]
-    assert shadow["candidate_count"] == 2
-    assert shadow["fused_count"] >= 1
-    ranked = state["ranked_papers"]
-    assert {paper["paper_id"] for paper in ranked} == {"zh1", "zh2"}
-    # shadow 只做旁路诊断，规则链路的论文不得携带混合检索特征。
-    assert all("_retrieval_features" not in paper for paper in ranked)
 
 
 def test_hybrid_rank_node_returns_only_llm_confirmed_candidates(hybrid_settings, monkeypatch):
@@ -573,8 +557,8 @@ def test_new_session_uses_configured_hybrid_profile(hybrid_settings, monkeypatch
     assert captured == ["hybrid"]
 
 
-def test_previous_work_session_is_pinned_to_rules(hybrid_settings, monkeypatch):
+def test_previous_work_session_uses_hybrid(hybrid_settings, monkeypatch):
     initial = {"candidate_papers": [{"paper_id": "old1", "title": "既有候选"}]}
     output, captured = _run_graph_and_capture_profile(monkeypatch, initial)
     assert output["status"] == "success"
-    assert captured == ["rules"]
+    assert captured == ["hybrid"]

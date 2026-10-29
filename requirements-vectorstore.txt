@@ -1,3 +1,3 @@
-# Optional PostgreSQL backend; business SQLite dependencies remain unchanged.
+# Standalone vector-store test dependencies; also included by requirements.txt.
 psycopg[binary]==3.3.6
 pgvector==0.5.1

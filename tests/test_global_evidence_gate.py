@@ -611,14 +611,16 @@ def _install_graph_fakes(monkeypatch, *, n_papers: int) -> None:
         return current
 
     def fake_search_rank(current, **kwargs):
-        current["candidate_papers"] = [_paper(f"p{i}") for i in range(n_papers)]
+        from tests.retrieval_fakes import admitted_paper
+        current["candidate_papers"] = [admitted_paper(current, **_paper(f"p{i}")) for i in range(n_papers)]
         current["ranked_papers"] = list(current["candidate_papers"])
         current["searched_keywords"] = ["object detection"]
         current["focus_coverage"] = {"missing_focuses": []}
         return current
 
-    def fake_fetch(current, should_cancel=None):
-        current["paper_details"] = [_paper(f"p{i}") for i in range(n_papers)]
+    def fake_fetch(current, should_cancel=None, **kwargs):
+        from tests.retrieval_fakes import admitted_paper
+        current["paper_details"] = [admitted_paper(current, **_paper(f"p{i}")) for i in range(n_papers)]
         return current
 
     def fake_download(current, should_cancel=None):

@@ -258,7 +258,7 @@ class ResearchConversationService:
 
             initial_state["retrieval_profile"] = (
                 existing_state.get("retrieval_profile")
-                or {"mode": "rules" if existing_session else get_settings().retrieval_ranking_mode,
+                or {"mode": "hybrid",
                     "version": "hybrid.v1"}
             )
         from app.agent.orchestration import normalize_orchestration_mode
