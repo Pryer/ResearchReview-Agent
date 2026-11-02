@@ -10,14 +10,17 @@ _HEADING = re.compile(
     r"(?im)^\s*(?:\d+(?:\.\d+)*\.?\s*)?"
     r"(abstract|introduction|(?:materials?\s+and\s+)?methods?|methodology|approach|model|proposed|"
     r"experimental\s+(?:results?|setup)|experiments?|evaluation|results?|discussion|"
-    r"conclusions?(?:\s+and\s+future\s+work)?|summary|limitations?|references|bibliography|appendix|"
+    r"conclusions?(?:\s+and\s+future\s+work)?|summary|limitations?|references|bibliography|"
+    r"appendi(?:x|ces)(?:[ \t]+[A-Z])?|supplementary[ \t]+(?:materials?|information|methods?)|"
     r"摘要|引言|绪论|方法|研究方法|研究设计|模型|实验结果|实验设置|实验|评估|评价|结果分析|结果|讨论|"
-    r"结论与展望|总结与展望|结论|局限性|参考文献|附录)\s*[:：]?\s*$"
+    r"结论与展望|总结与展望|结论|局限性|参考文献|附录|补充材料)\s*[:：]?\s*$"
 )
 
 
 def section_family(name):
     name = name.lower()
+    if name.startswith(("appendix", "appendices", "supplementary", "附录", "补充材料")):
+        return "appendix"
     for family, terms in (
         ("method", ("method", "approach", "setup", "model", "proposed", "方法", "设置", "研究设计", "模型")),
         ("results", ("result", "experiment", "evaluation", "实验", "结果", "评估", "评价")),
@@ -33,9 +36,18 @@ def section_family(name):
     return name
 
 
-def section_headings(text):
+def section_headings(text, *, initial_section="full_text"):
     """解析与切块共享标题位置，防止两条路径对同一章节产生不同身份。"""
-    return [(m.start(), section_family(m.group(1))) for m in _HEADING.finditer(text)]
+    headings = []
+    section = initial_section
+    for match in _HEADING.finditer(text):
+        family = section_family(match.group(1))
+        # WHY: 文献题名换行后可能恰好是“model”；参考文献只能由明确附录标题结束。
+        if section == "references" and family not in {"references", "appendix"}:
+            continue
+        headings.append((match.start(), family))
+        section = family
+    return headings
 
 
 def chunk_pdf(parsed: dict[str, Any], *, max_chars: int = 6000,
@@ -51,7 +63,7 @@ def chunk_pdf(parsed: dict[str, Any], *, max_chars: int = 6000,
     section = "full_text"
     for page, text in sources:
         boundaries = [(0, section)]
-        boundaries.extend(section_headings(text))
+        boundaries.extend(section_headings(text, initial_section=section))
         for i, (start, name) in enumerate(boundaries):
             end = boundaries[i + 1][0] if i + 1 < len(boundaries) else len(text)
             section = name
@@ -64,13 +76,14 @@ def chunk_pdf(parsed: dict[str, Any], *, max_chars: int = 6000,
                     if split >= 0:
                         stop = split + 1
                 if text[cursor:stop].strip():
+                    trivial = len(text[cursor:stop].strip()) < 2
                     chunks.append(dict(
                         paper_id=paper_id or parsed.get("paper_id"),
                         chunk_id=len(chunks), text=text[cursor:stop], page=page,
                         section=name, char_start=cursor, char_end=stop,
                         offset_basis="page" if page is not None else "full_text",
-                        element_type="text",
-                        excluded=name in {"references", "bibliography", "参考文献"},
+                        element_type="noise" if trivial else "text",
+                        excluded=trivial or name == "references",
                     ))
                 if stop == end:
                     break

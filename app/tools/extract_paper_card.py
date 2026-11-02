@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 from app.core.exceptions import PaperCardExtractionError
 from app.schemas.vector_schema import VectorIntegrityError, VectorStoreUnavailable
 from app.services.evidence_support import authorized_field_claim, literal_support
+from app.services.source_alignment import locate_quote
 from app.core.logger import get_logger
 from app.schemas.paper_schema import (
     AccessLevel,
@@ -141,7 +142,7 @@ def extract_from_full_text(
             raise InterruptedError("卡片抽取已取消")
         status, reason = "processed", None
         if chunk["excluded"]:
-            status, reason = "excluded", "reference_section"
+            status, reason = "excluded", "trivial_fragment" if chunk.get("element_type") == "noise" else "reference_section"
         elif stopped or chunk["chunk_id"] not in selected or calls >= settings.card_extraction_max_chunks:
             status, reason = "skipped", "provider_failure" if stopped else "chunk_call_limit"
         else:
@@ -174,10 +175,14 @@ def extract_from_full_text(
                         issues.append("extraction:rejected_quote")
                         continue
                     quote = quote.strip()
-                    start = chunk["text"].find(quote)
-                    if start < 0:
+                    location = locate_quote(chunk["text"], quote)
+                    if location is None:
                         issues.append("extraction:quote_not_in_source")
                         continue
+                    if len(location.text) > 1000:
+                        issues.append("extraction:rejected_quote")
+                        continue
+                    start, quote = location.start, location.text
                     if quote in values[field]:
                         continue
                     values[field].append(quote)

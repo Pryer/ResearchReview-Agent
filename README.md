@@ -401,6 +401,8 @@ ResearchReview-Agent/
 | `CARD_VECTOR_DB_FAILURE_POLICY` | 仅支持 `fail`，向量库不可用时停止 | `fail` |
 | `CARD_VECTOR_TENANT` | 受信任部署配置的索引隔离作用域，不等同于用户认证 | `local` |
 | `RETRIEVAL_RANKING_MODE` | 业务入口仅支持 `hybrid`，旧规则/影子 profile 恢复时迁移 | `hybrid` |
+| `PAPER_SCREENING_ABSTRACT_CHARS` | 逐篇语义筛选的摘要字符上限；超长保留首尾并标记省略 | `4000` |
+| `PAPER_SCREENING_BATCH_ABSTRACT_CHARS` | 单批摘要总字符预算；按本批篇数均分，另受逐篇上限约束 | `16000` |
 | `DASHSCOPE_API_KEY` | hybrid 使用的独立百炼密钥 | 空 |
 | `RETRIEVAL_EMBEDDING_MODEL` / `RETRIEVAL_RERANK_MODEL` | 专用向量及相关性重排模型 | `qwen3.7-text-embedding` / `qwen3.7-text-rerank` |
 | `RETRIEVAL_EMBEDDING_URL` / `RETRIEVAL_RERANK_URL` | 百炼工作空间原生 HTTPS 端点 | 空 |
@@ -447,6 +449,18 @@ CARD_VECTOR_DB_FAILURE_POLICY 改为 fail；ENABLE_LLM_CARD_EXTRACTION 已删除
 Windows 也可直接使用 Conda 安装原生 PostgreSQL＋pgvector，无需 Docker。
 rragent 环境的安装组合、启动/停止及已完成的原生数据库验证见
 [Windows Conda 部署](docs/windows-conda-pgvector.md)。
+
+单篇卡片 API 复用下载、解析、LLM 抽取和保存流程；卡片入库保留逐块覆盖记录。
+PDF 解析新增有序 `section_spans`，保留同名章节及页内字符区间，旧 `sections` 字典继续兼容。
+摘要预算、省略策略与迁移说明见 [RAG 输入与单篇卡片修复](docs/rag-input-correctness.md)。
+
+真实验收入口 `scripts/run_real_e2e.py` 默认仅预检；真实执行须显式传入 `--execute`、
+Token 预算和时限。每次运行隔离 SQLite、向量租户与缓存，导出检索、来源回读及人工审查表。
+启动失败同样留档，预检通过不代表模型已执行。使用与指标口径见 [真实 E2E 审查契约](docs/real-e2e-audit.md)。
+
+2026-10-30 在 rragent 中完成真实 Embedding/Reranker、语义准入及原生pgvector块检索评测。
+历史标签口径、实际结果、预算和待人工标注事项见 [Provider检索评测](docs/validation/2026-10-30-provider-retrieval.md)。
+复现入口为 `scripts/run_provider_retrieval_evaluation.py`，必须显式指定总Token、请求和时限上限。
 
 ## 📋 实现路线图
 

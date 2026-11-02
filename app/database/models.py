@@ -79,6 +79,7 @@ class PaperCardModel(Base):
     limitations: Mapped[str] = mapped_column(Text, default="")  # JSON 序列化
     relevance_reason: Mapped[str] = mapped_column(Text, default="")
     evidence_source: Mapped[str] = mapped_column(String(32), default="metadata")
+    extraction_coverage: Mapped[str] = mapped_column(Text, default="")  # JSON 序列化
     evidence_spans: Mapped[str] = mapped_column(Text, default="")  # JSON 序列化
     field_evidence: Mapped[str] = mapped_column(Text, default="")  # JSON 序列化
     evidence_state: Mapped[str] = mapped_column(Text, default="")  # JSON 序列化

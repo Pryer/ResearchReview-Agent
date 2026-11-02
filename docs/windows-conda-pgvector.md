@@ -52,8 +52,11 @@ pg_ctl -D "data/postgresql_rragent" status
 未运行时启动：
 
 ```bat
-pg_ctl -D "data/postgresql_rragent" -l "data/postgresql_rragent/server.log" -w start
+pg_ctl -D "data/postgresql_rragent" -l "data/rragent_postgresql.log" -w start
 ```
+
+服务日志放在集群数据目录之外。Windows 异常停机恢复可能遍历数据目录内文件，
+此时正在被服务打开的日志文件可能造成共享冲突，使启动无法完成。
 
 需要停止时：
 

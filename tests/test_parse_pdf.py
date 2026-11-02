@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app.tools.parse_pdf import extract_references, split_paper_sections
+from app.tools.parse_pdf import build_section_spans
 
 
 def test_extract_references_from_english_section():
@@ -63,3 +64,32 @@ def test_split_sections_recognizes_chinese_headings():
     assert "introduction" in sections
     assert "conclusion" in sections
     assert "references" in sections
+
+
+def test_ordered_sections_preserve_repeats_continuations_and_source_offsets():
+    from app.tools.chunk_pdf import chunk_pdf
+    from app.schemas.paper_schema import PaperDetail
+
+    pages = [{"page": 1, "text": "Title\nMethods\nFirst method.\nMethods\nSecond method."},
+             {"page": 3, "text": "Continuing second method.\nResults\nFirst result.\nDiscussion\nA caveat."}]
+    spans = build_section_spans(pages)
+    assert [s.section for s in spans] == ["full_text", "method", "method", "method", "results", "discussion"]
+    assert [s.page for s in spans] == [1, 1, 1, 3, 3, 3]
+    detail = PaperDetail(paper_id="p", section_spans=[s.model_dump() for s in spans])
+    assert PaperDetail.model_validate_json(detail.model_dump_json()).section_spans == spans
+    by_page = {page["page"]: page["text"] for page in pages}
+    chunks = chunk_pdf({"pages": pages})
+    assert len(chunks) == len(spans)
+    for span, chunk in zip(spans, chunks):
+        assert by_page[span.page][span.char_start:span.char_end] == span.text
+        assert span.model_dump() == {key: chunk[key] for key in span.model_fields}
+    assert split_paper_sections("Methods\nLong first method.\nMethods\nShort.")["method"] == "Methods\nLong first method."
+
+
+def test_section_spans_handle_no_heading_and_full_text_basis():
+    text = "前言没有标准章节标题。\n仍然保留全文。"
+    spans = build_section_spans([{"page": None, "text": text}, {"page": 2, "text": ""}])
+    assert len(spans) == 1
+    assert spans[0].text == text
+    assert spans[0].offset_basis == "full_text"
+    assert split_paper_sections(text) == {}

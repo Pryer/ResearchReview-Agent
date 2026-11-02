@@ -10,6 +10,7 @@ from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.schemas.chunk_schema import ChunkRetrievalReport
+from app.schemas.document_schema import SectionSpan
 
 
 class PaperSearchRequest(BaseModel):
@@ -300,6 +301,7 @@ class PaperDetail(PaperMetadata):
     """论文详情（包含解析后的文本）。"""
 
     full_text: Optional[str] = Field(default=None, description="全文文本")
+    section_spans: List[SectionSpan] = Field(default_factory=list, description="按页排序的全部章节区间")
     sections: Optional[dict] = Field(
         default=None, description="分段文本 (abstract / method / experiment 等)"
     )

@@ -70,6 +70,7 @@ def _migrate_sqlite_evidence_card_columns() -> None:
         return
     existing = {column["name"] for column in inspector.get_columns("paper_cards")}
     additions = {
+        "extraction_coverage": "TEXT DEFAULT ''",
         "evidence_spans": "TEXT DEFAULT ''",
         "field_evidence": "TEXT DEFAULT ''",
         "evidence_state": "TEXT DEFAULT ''",

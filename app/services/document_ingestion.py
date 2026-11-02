@@ -4,8 +4,8 @@ from __future__ import annotations
 from app.schemas.retrieval_schema import fingerprint
 from app.schemas.vector_schema import VectorIntegrityError
 
-PARSER_PROFILE = "pymupdf.cleaned-pages.v1"
-CHUNKER_PROFILE = "page-section-chars.v2"
+PARSER_PROFILE = "pymupdf.cleaned-pages.reference-state.v2"
+CHUNKER_PROFILE = "page-section-chars.reference-state.v3"
 
 
 def source_fingerprint(parsed):
@@ -42,4 +42,4 @@ def processing_profile(parsed, chunks, settings):
     return fingerprint((parsed.get("parser_profile", PARSER_PROFILE), CHUNKER_PROFILE,
                         settings.card_extraction_chunk_chars, 400,
                         [(c["chunk_id"], c["section"], c["page"], c["char_start"], c["char_end"],
-                          c["offset_basis"], c["text"]) for c in chunks]))
+                          c["offset_basis"], c["text"], c.get("excluded", False), c.get("element_type")) for c in chunks]))

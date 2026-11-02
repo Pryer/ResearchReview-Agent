@@ -250,7 +250,7 @@ def _rerank_cached(client, settings, query: str, documents, should_cancel):
 
 
 def rank_candidates(state, *, settings, include_rerank=False, should_cancel=None,
-                    embedding_client=None, reranker_client=None):
+                    embedding_client=None, reranker_client=None, include_channel_rankings=False):
     """返回全部融合候选的有界检查窗口及不含原文的诊断。"""
     _validate_profile(settings, include_rerank=include_rerank)
     from app.tools.paper_matching import compile_scope
@@ -410,6 +410,15 @@ def rank_candidates(state, *, settings, include_rerank=False, should_cancel=None
         "query_fingerprints": [query.query_fingerprint for query in queries],
         "scope_fingerprint": compiled_scope.get("fingerprint"),
     }
+    if include_channel_rankings:
+        # WHY: 消融必须保留融合窗口外的单通道命中；仅评测显式请求时导出，避免业务上下文膨胀。
+        empty = [[] for _ in queries]
+        report["channel_rankings"] = {
+            mode: [str(retained[searchable[item["index"]][0]].get("paper_id"))
+                   for item in fuse_rankings(len(texts), queries, lexical, semantic,
+                                             rrf_k=settings.retrieval_rrf_k)]
+            for mode, lexical, semantic in (("bm25", lex, empty), ("dense", empty, dense))
+        }
     return ranked[:window_size], report
 
 
@@ -436,7 +445,7 @@ def required_semantic_conditions(state: dict[str, Any]) -> list[dict[str, str]]:
     return conditions
 
 
-def screen_candidates(state, candidates, llm, *, target: int, should_cancel=None):
+def screen_candidates(state, candidates, llm, *, target: int, should_cancel=None, strict_provider_errors=False):
     """LLM 准入结论是 hybrid 论文进入详情/证据池的唯一出口。"""
     from app.tools.paper_rerank import llm_rerank_papers
 
@@ -466,6 +475,7 @@ def screen_candidates(state, candidates, llm, *, target: int, should_cancel=None
         screening_cache=screening_cache,
         cache_namespace=namespace,
         should_cancel=should_cancel,
+        **({"strict_provider_errors": True} if strict_provider_errors else {}),
     )
     accepted = []
     for paper in screened:

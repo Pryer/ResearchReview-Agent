@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from app.core.exceptions import PDFParseError
 from app.core.logger import get_logger
+from app.schemas.document_schema import SectionSpan
 from app.utils.text_cleaner import clean_parsed_text
 
 logger = get_logger(__name__)
@@ -38,6 +39,7 @@ def parse_pdf(pdf_path: str, *, paper_id: str | None = None) -> Dict[str, Any]:
     result = {
         "full_text": full_text,
         "sections": sections,
+        "section_spans": [span.model_dump() for span in build_section_spans(pages)],
         "abstract": sections.get("abstract", ""),
         "references": references,
         "paper_id": paper_id or Path(pdf_path).stem,
@@ -86,6 +88,26 @@ def extract_pdf_pages(pdf_path: str, *, diagnostics: Optional[Dict[str, Any]] = 
         raise PDFParseError(f"Failed to parse PDF {pdf_path}: {e}")
 
 
+def build_section_spans(pages: List[Dict[str, Any]]) -> List[SectionSpan]:
+    """按页保留所有同名章节，标题未重复时延续上一页的章节身份。"""
+    from app.tools.chunk_pdf import section_headings
+
+    spans: List[SectionSpan] = []
+    section = "full_text"
+    for page in pages:
+        text = str(page.get("text") or "")
+        boundaries = [(0, section), *section_headings(text, initial_section=section)]
+        for index, (start, name) in enumerate(boundaries):
+            end = boundaries[index + 1][0] if index + 1 < len(boundaries) else len(text)
+            section = name
+            if text[start:end].strip():
+                # WHY: 不 strip 或重新拼接区间，位置须可从已清洗页面原样回读。
+                spans.append(SectionSpan(section=name, page=page.get("page"), text=text[start:end],
+                                         char_start=start, char_end=end,
+                                         offset_basis="page" if page.get("page") is not None else "full_text"))
+    return spans
+
+
 def split_paper_sections(text: str) -> Dict[str, str]:
     """粗略划分论文段落。
 
@@ -97,19 +119,13 @@ def split_paper_sections(text: str) -> Dict[str, str]:
 
     sections: Dict[str, str] = {}
 
-    from app.tools.chunk_pdf import section_headings
-
     # WHY: 解析保留历史 experiment 名称；与 Chunk 使用同一标题边界，避免准入错位。
     names = {"results": "experiment", "discussion": "conclusion"}
-    splits = [(names.get(name, name), start) for start, name in section_headings(text)]
-
-    # 按位置排序
-    splits.sort(key=lambda x: x[1])
-
-    # 提取各段
-    for i, (name, start) in enumerate(splits):
-        end = splits[i + 1][1] if i + 1 < len(splits) else len(text)
-        content = text[start:end].strip()
+    for span in build_section_spans([{"page": None, "text": text}]):
+        if span.section == "full_text":
+            continue
+        name = names.get(span.section, span.section)
+        content = span.text.strip()
         # 取最长的同名段落
         if name not in sections or len(content) > len(sections[name]):
             sections[name] = content

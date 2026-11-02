@@ -179,7 +179,9 @@ def test_detail_huge_retry_after_is_honored(monkeypatch):
     )
 
     assert openalex_client.get_openalex_detail("W123") is None
-    assert 41550.0 < openalex_client._cooldown_remaining() <= 41559.0
+    remaining = openalex_client._cooldown_remaining()
+    # WHY: 与搜索路径相同，monotonic 加减只允许纳秒级舍入，不改变服务端冷却期限。
+    assert 41550.0 < remaining <= 41559.0 + 1e-8
 
 
 def test_cooldown_expires_and_allows_retry(monkeypatch):

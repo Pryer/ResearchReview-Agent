@@ -222,7 +222,9 @@ def build_claim_plans(
 
         # 计算支持级别 + 类型特定规则
         claim_plan_claims = []
-        for claim_text, evidence_data in merged_claims.items():
+        for evidence_data in merged_claims.values():
+            # WHY: 字典键仅用于去重，可能去掉空格并截断；正文必须保留证据对应的完整主张。
+            claim_text = evidence_data["claim_text"]
             evidence_ids = evidence_data["evidence_ids"]
             paper_ids_for_claim = list(evidence_data.get("paper_ids", []))
             # 支持级别按独立论文数判定，而非 evidence_id 数：同一篇论文的多个
@@ -551,7 +553,9 @@ def build_background_claim_plan(
         merged_claims = _merge_similar_claims(raw_claims, relevant_paper_ids)
 
         bg_claims = []
-        for claim_text, evidence_data in merged_claims.items():
+        for evidence_data in merged_claims.values():
+            # WHY: 去重键不是正文，不能把失去否定、标点或句尾条件的文本交给核验和 Writer。
+            claim_text = evidence_data["claim_text"]
             evidence_ids = evidence_data["evidence_ids"]
             paper_ids_for_claim = list(evidence_data.get("paper_ids", []))
             count = len(evidence_ids)

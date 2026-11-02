@@ -290,6 +290,8 @@ class PaperCardRepository:
             limitations=json.dumps(card.limitations, ensure_ascii=False),
             relevance_reason=card.relevance_reason,
             evidence_source=card.evidence_source,
+            extraction_coverage=json.dumps(card.extraction_coverage.model_dump(mode="json"), ensure_ascii=False)
+                if card.extraction_coverage is not None else "",
             evidence_spans=json.dumps(
                 [span.model_dump() for span in card.evidence_spans],
                 ensure_ascii=False,
@@ -371,6 +373,7 @@ class PaperCardRepository:
             limitations=_load_json(row.limitations, []),
             relevance_reason=row.relevance_reason,
             evidence_source=row.evidence_source,
+            extraction_coverage=_load_json(getattr(row, "extraction_coverage", ""), None),
             evidence_spans=_load_json(getattr(row, "evidence_spans", ""), []),
             field_evidence=_load_json(getattr(row, "field_evidence", ""), {}),
             evidence_state=_load_json(getattr(row, "evidence_state", ""), {}),

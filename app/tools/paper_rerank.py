@@ -15,6 +15,7 @@ from app.prompt.paper_screening import build_paper_screening_prompt
 from app.schemas.retrieval_schema import fingerprint
 from app.core.logger import get_logger
 from app.tools.paper_matching import term_matches_haystack
+from app.tools.screening_context import SCREENING_CONTEXT_VERSION, select_abstract_context
 
 logger = get_logger(__name__)
 
@@ -144,6 +145,7 @@ def llm_rerank_papers(
     screening_cache: Dict[str, Dict[str, Any]] | None = None,
     cache_namespace: str = "",
     should_cancel=None,
+    strict_provider_errors: bool = False,
 ):
     """两段式 LLM 语义重排：对规则粗排后的候选集进行全局 LLM 打分后排序。
 
@@ -162,9 +164,9 @@ def llm_rerank_papers(
     candidate_max = max(candidate_min, int(
         settings.rerank_candidate_max if candidate_max is None else candidate_max
     ))
-    batch_size = max(1, int(
+    batch_size = min(settings.paper_screening_batch_abstract_chars, max(1, int(
         settings.rerank_batch_size if batch_size is None else batch_size
-    ))
+    )))
 
     # 有明确最低引用数时，LLM 只筛选其两倍安全池；规则合格的尾部论文
     # 保留为证据不足时的备用，避免无条件筛选整个候选集。
@@ -217,13 +219,17 @@ def llm_rerank_papers(
         batch_start = i + len(batch)
         batch_retained_before = len(all_scored)
         items_payload = []
+        abstract_budget = min(settings.paper_screening_abstract_chars,
+                              settings.paper_screening_batch_abstract_chars // len(batch))
         for idx, p in enumerate(batch):
             paper_id = str(p.get("paper_id") or f"p_{i + idx}")
             p["_rerank_id"] = paper_id
+            abstract, context = select_abstract_context(str(p.get("abstract") or ""), abstract_budget)
             item = {
                 "paper_id": paper_id,
                 "title": str(p.get("title") or ""),
-                "abstract": str(p.get("abstract") or "")[:500],
+                "abstract": abstract,
+                "abstract_context": context,
             }
             if p.get("_anchor_low_confidence"):
                 item["relevance_hint"] = (
@@ -237,7 +243,9 @@ def llm_rerank_papers(
             "legacy_selected_scope": scope or {},
         }
         cache_keys = {
-            item["paper_id"]: fingerprint((cache_namespace, item["paper_id"],
+            item["paper_id"]: fingerprint((SCREENING_CONTEXT_VERSION,
+                settings.paper_screening_abstract_chars, settings.paper_screening_batch_abstract_chars,
+                cache_namespace, item["paper_id"], item["abstract"], item["abstract_context"],
                 item["title"], str(batch[index].get("abstract") or ""),
                 item.get("relevance_hint")))
             for index, item in enumerate(items_payload)
@@ -304,6 +312,9 @@ def llm_rerank_papers(
                 from app.agent.execution_budget import AgentBudgetExceeded
 
                 if isinstance(exc, (AgentCancelledError, AgentBudgetExceeded, InterruptedError)):
+                    raise
+                if strict_provider_errors:
+                    # WHY: 付费评测必须在首次调用/解析失败时停止，不能反复请求后把降级结果计为准确率。
                     raise
                 logger.warning("LLM rerank batch failed, falling back to rule scores: %s", exc)
 

@@ -23,6 +23,10 @@ def test_pdf_diagnostics_keep_empty_page_identity_and_cleaned_offsets(tmp_path):
     assert len(parsed["source_pdf_hash"]) == 64
     assert parsed["parsed_source_hash"] == source_fingerprint(parsed)
     assert parsed["parse_diagnostics"]["table_count"] is None
+    by_page = {p["page"]: p["text"] for p in parsed["pages"]}
+    assert [s["section"] for s in parsed["section_spans"]] == ["method", "results"]
+    for span in parsed["section_spans"]:
+        assert by_page[span["page"]][span["char_start"]:span["char_end"]] == span["text"]
     validate_chunk_sources("p", chunk_pdf(parsed, paper_id="p"), parsed)
 
 
@@ -31,6 +35,17 @@ def test_page_order_and_document_identity_affect_fingerprint():
     first = source_fingerprint({"pages": pages})
     assert source_fingerprint({"pages": list(reversed(pages))}) != first
     assert source_fingerprint({"pages": pages, "source_pdf_hash": "different"}) != first
+
+
+def test_exclusion_changes_invalidate_processing_profile():
+    from app.core.config import Settings
+    from app.services.document_ingestion import processing_profile
+    parsed={'full_text':'A sufficiently long original sentence.'}
+    chunks=chunk_pdf(parsed,paper_id='p')
+    settings=Settings(_env_file=None)
+    before=processing_profile(parsed,chunks,settings)
+    changed=[{**chunks[0],'excluded':True}]
+    assert processing_profile(parsed,changed,settings)!=before
 
 
 @pytest.mark.parametrize("change", ["text", "offset", "paper", "duplicate"])

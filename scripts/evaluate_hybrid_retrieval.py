@@ -107,22 +107,20 @@ def evaluate(snapshot_path, qrels_path, profile_path, allow_subset_qrels=False,
             search_branches=task.get("search_branches") or [],
             screening_protocol=task.get("screening_protocol") or {},
         )
-        fusion, fusion_report = rank_candidates(state, settings=settings, include_rerank=False)
+        fusion, fusion_report = rank_candidates(state, settings=settings, include_rerank=False,
+                                                include_channel_rankings=True)
         ce, ce_report = rank_candidates(state, settings=settings, include_rerank=True)
         durations.append(time.monotonic() - t0)
         by_id = lambda collection: [str(paper.get("paper_id")) for paper in collection]
         rankings = {
             "rules": by_id(rules),
-            "bm25": by_id(sorted((p for p in fusion if p["_retrieval_features"]["bm25"] is not None),
-                                   key=lambda p: (p["_retrieval_features"]["bm25_rank"],
-                                                  -p["_retrieval_features"]["bm25"]))),
-            "dense": by_id(sorted((p for p in fusion if p["_retrieval_features"]["cosine"] is not None),
-                                   key=lambda p: (p["_retrieval_features"]["dense_rank"],
-                                                  -p["_retrieval_features"]["cosine"]))),
+            "bm25": (fusion_report.get("channel_rankings") or {}).get("bm25", []),
+            "dense": (fusion_report.get("channel_rankings") or {}).get("dense", []),
             "rrf": by_id(fusion), "rrf_ce": by_id(ce),
         }
         task_result = {"task_id": task_id, "candidate_count": len(papers),
-                       "rankings": {}, "degraded": sorted(set(fusion_report["degraded"] + ce_report["degraded"]))}
+                       "raw_rankings": rankings, "ranking_reports": {"fusion": fusion_report, "reranked": ce_report},
+                       "rankings": {}, "degraded": sorted(set(fusion_report.get("degraded", []) + ce_report.get("degraded", [])))}
         for mode, ranking in rankings.items():
             metrics_by_k = {str(cut): _metrics(ranking, qrels[task_id], cut,
                                                relevance_threshold)
@@ -145,6 +143,7 @@ def evaluate(snapshot_path, qrels_path, profile_path, allow_subset_qrels=False,
     return {
         "input_sha256": {"snapshot": _hash(snapshot_path), "qrels": _hash(qrels_path),
                          "profile": _hash(profile_path)},
+        "evaluation_version": "hybrid-eval-v2_full-channel-family-rrf",
         "profile": profile, "embedding_model": settings.retrieval_embedding_model,
         "rerank_model": settings.retrieval_rerank_model,
         "model_revision": None, "cache_version": settings.retrieval_cache_version,

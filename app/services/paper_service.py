@@ -96,7 +96,8 @@ class PaperService:
         paper = self.paper_repo.get_by_id(paper_id)
         if not paper:
             return None
-        return extract_paper_card(paper.model_dump(), None, None)
+        # WHY: 单篇入口与批量入口共用下载、模型抽取和持久化，避免旧调用遗漏 LLM。
+        return self.build_paper_cards([paper.model_dump()])[0]
 
     def _save_search_results(self, papers: List[PaperMetadata]) -> None:
         """保存检索结果；失败时不影响主检索流程。"""

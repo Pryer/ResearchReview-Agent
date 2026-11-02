@@ -21,6 +21,9 @@ def build_paper_screening_prompt(topic: str, screening_spec: dict[str, Any],
 
 注意：部分候选带有 relevance_hint 字段，表示其仅由宽松匹配放行、可能偏题；
 对这类论文必须逐篇核验主题契合度，不得因凑数而放宽判断。
+abstract_context.truncated=true 表示摘要只保留了部分原文；ranges 是原摘要字符区间。
+省略标记不是原文，首尾片段之间不保证语义连续；不能推断省略内容。
+未见某项条件不代表原论文没有报告；材料不足时必须返回 uncertain。
 
 请对**每篇**论文在以下三个维度打分（0-10 分），必须为列表中的每篇都返回一条评分：
 1. topic_relevance: 核心研究问题与主题的契合度（10分最高）。

@@ -260,6 +260,8 @@ class Settings(BaseSettings):
     rerank_candidate_min: int = 60
     rerank_candidate_max: int = 120
     rerank_batch_size: int = 12
+    paper_screening_abstract_chars: int = Field(default=4000, ge=500, le=12000)
+    paper_screening_batch_abstract_chars: int = Field(default=16000, ge=500, le=64000)
     # WHY: 业务任务统一使用混合检索；规则排序仅保留为离线评测基线。
     retrieval_ranking_mode: Literal["hybrid"] = "hybrid"
     retrieval_provider: str = "dashscope"
