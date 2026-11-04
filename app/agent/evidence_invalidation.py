@@ -52,5 +52,5 @@ def invalidate_changed_evidence(state, operation, before):
                 if p.get("paper_id") and str(p["paper_id"]) not in retained]
     # WHY: 子循环可能马上选择下一个动作；不能等返回主控后才失效旧证据授权。
     for key in (*_GENERATION_PRODUCT_KEYS, "validated_routes", "route_decisions",
-                "autonomous_verified_fingerprint"):
+                "autonomous_verified_fingerprint", "pending_generation_previous", "pending_result_validation"):
         state.pop(key, None)

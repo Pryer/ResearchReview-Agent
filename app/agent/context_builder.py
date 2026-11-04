@@ -57,6 +57,12 @@ def context_source_payload(state: dict[str, Any]) -> dict[str, Any]:
         "routes": state.get("route_decisions") or [],
         "recovery": state.get("recovery_decision") or state.get("quality_recovery_decision") or {},
         "quality_gate": state.get("quality_gate") or {},
+        "pending_validation": bool(state.get("pending_result_validation")),
+        "delegation_recovery": {
+            "pending": state.get("pending_evidence_recovery") or {},
+            "round": state.get("recovery_round") or 0,
+            "attempts": state.get("route_recovery_attempts") or {},
+        },
         "global_evidence_gate": state.get("global_evidence_gate") or {},
         "clarification": state.get("clarification") or {},
         "user_clarifications": state.get("user_clarifications") or [],
@@ -259,6 +265,7 @@ def _agent_state(state: dict[str, Any]) -> AgentStateContext:
             "evidence": global_gate.get("status"),
             "explicit_constraint_unmet": bool(global_gate.get("explicit_constraint_unmet")),
             "generation_blocked": bool(state.get("generation_blocked")),
+            "pending_result_validation": bool(state.get("pending_result_validation")),
             "route_recovery_status": state.get("evidence_recovery_status"),
         },
         artifact_summary={
@@ -384,6 +391,14 @@ def _decisions(state: dict[str, Any], limit: int) -> list[DecisionRecord]:
                 source="policy",
                 invalidated_by=["state_progress", "budget_change"],
             ))
+    planned = next((item for item in reversed(state.get("main_agent_decisions") or []) if item.get("plan")), {})
+    for index, step in enumerate(planned.get("plan") or []):
+        output.append(DecisionRecord(
+            decision_id=f"plan-{planned.get('decision_id', 'main')}-{index}",
+            category="execution_plan", decision=str(step["action"]),
+            reason=_clean_text(step.get("objective"), 240), source="agent",
+            valid_for="advisory_only", invalidated_by=["new_observation", "user_scope_change"],
+        ))
     user = [item for item in output if item.source == "user"]
     others = [item for item in output if item.source != "user"]
     remaining = max(0, limit - len(user))

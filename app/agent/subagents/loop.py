@@ -4,15 +4,15 @@ from __future__ import annotations
 import copy
 from uuid import uuid4
 
-from app.agent.action_contracts import CONTRACTS
 from app.agent.action_registry import (
     ACTION_REGISTRY, allowed_actions, recovery_handoff_action, tool_schemas, validate_arguments,
 )
-from app.agent.context_builder import build_main_agent_context, _goal, _stable_hash, context_source_fingerprint
+from app.agent.context_builder import _goal, _stable_hash, context_source_fingerprint
 from app.agent.execution_budget import check_execution, AgentExecutionCancelled
 from app.agent.main_policy import MainAgentPolicy, AgentDecisionError
 from app.agent.react_context import ReActContext, execute_context_recall
 from app.agent.sidecar import ActionSidecar
+from app.agent.delegation_context import context_packet, subagent_context
 from app.core.config import get_settings
 from app.prompt.agent_system import SYSTEM_PROMPTS, SUBAGENT_REACT_PROMPT
 from app.schemas.agent_message_schema import AgentMessage, SubagentReport
@@ -101,10 +101,12 @@ class SubagentLoop:
             role = spec.role.value
             from app.agent.main_loop import _progress_fingerprint
             progress = _progress_fingerprint(state)
+            packet = context_packet(state, decision)
             _session(state, role)["active"] = {
                 "id": uuid4().hex, "operation": decision.action,
                 "objective": decision.reason or spec.description,
                 "arguments": copy.deepcopy(decision.arguments),
+                "context_packet": packet,
                 "evidence_refs": list(decision.evidence_refs),
                 "source_fingerprint": context_source_fingerprint(state),
                 "goal_fingerprint": _stable_hash(_goal(state).model_dump(mode="json")),
@@ -148,6 +150,10 @@ class SubagentLoop:
                 return self._finish(state, role, "blocked", "子 Agent 无实质进展或状态循环，请主控调整任务。")
             available = [name for name in allowed_actions(state, set(handlers)) if name in names and name in handlers]
             required = active["operation"]
+            available = [name for name in available if name == required]
+            # WHY: 一次委派只授权一个研究动作；完成后必须汇报，后续计划由 Main 重新决定。
+            if required in active["completed_operations"]:
+                available = []
             # WHY: 局部改写的授权范围是主控指定章节；不能改选全篇生成来绕过约束。
             if required == "rewrite_sections":
                 available = [name for name in available if name == required]
@@ -220,39 +226,25 @@ class SubagentLoop:
 
     @staticmethod
     def _context(state, role, names, available):
-        fields = set().union(*(CONTRACTS[name].inputs for name in names))
-        projected = {key: copy.deepcopy(value) for key, value in state.items() if key in fields}
-        projected["artifact_manifest"] = {
-            key: copy.deepcopy(value) for key, value in (state.get("artifact_manifest") or {}).items()
-            if key in fields
-        }
-        session = _session(state, role)
-        projected["agent_task_results"] = [item for item in state.get("agent_task_results", []) if item.get("role") == role]
-        projected["agent_execution_budget"] = copy.deepcopy(state.get("agent_execution_budget") or {})
-        projected["agent_context_usage"] = session.get("agent_context_usage", {})
-        projected["agent_context_last_usage"] = session.get("agent_context_last_usage", {})
-        context = build_main_agent_context(projected)
-        active = session["active"]
-        context.state.allowed_actions = available
-        context.state.next_actions = available
-        context.state.delegation = {key: active[key] for key in (
-            "id", "operation", "objective", "arguments", "evidence_refs", "completed_operations", "rounds",
-        )}
-        context.state.agent_messages = copy.deepcopy(session.get("messages", [])[-6:])
-        return context
+        return subagent_context(state, role, _session(state, role)["active"], available)
 
     @staticmethod
     def _finish(state, role, status, message, suggestions=()):
         session = _session(state, role)
         active = session["active"]
         _message(state, role, status, message, suggestions)
+        last = active.get("last_result") or {}
         result = AgentTaskResult(
             task_id=active["id"], role=AgentRole(role), operation=active["operation"],
             status=AgentTaskStatus.COMPLETED,
             outcome=(AgentTaskOutcome((active.get("last_result") or {}).get("outcome", "unknown"))
                      if status == "completed" else AgentTaskOutcome.BLOCKED),
             delegation_status=status,
-            findings=[message], open_questions=[] if status == "completed" else [{
+            findings=[message],
+            evidence_refs=list(last.get("evidence_refs") or []),
+            changed_state_fields=list(last.get("changed_state_fields") or []),
+            usage=dict(last.get("usage") or {}),
+            open_questions=[] if status == "completed" else [{
                 "category": status, "question": message, "suggested_actions": list(suggestions),
             }], input_state_fingerprint=active["source_fingerprint"],
             output_state_fingerprint=context_source_fingerprint(state),

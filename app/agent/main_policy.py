@@ -40,6 +40,19 @@ class MainAgentPolicy:
                 }
                 spec = ACTION_REGISTRY.get(tool["function"]["name"])
                 if spec and spec.role:
+                    # WHY: 通用元数据会随每个工具重复；精简展示，完整限制仍由 Pydantic 校验。
+                    tool["function"]["parameters"]["properties"]["plan"] = {
+                        "type": "array", "maxItems": 6, "items": {
+                            "type": "object", "properties": {"action": {"type": "string"}, "objective": {"type": "string"}},
+                            "required": ["action", "objective"], "additionalProperties": False,
+                        },
+                    }
+                    tool["function"]["parameters"]["properties"]["context_selection"] = {
+                        "type": "object", "properties": {name: {
+                            "type": "array", "items": {"type": "string"}, "maxItems": limit,
+                        } for name, limit in (("evidence_ids", 12), ("decision_ids", 8), ("question_ids", 8), ("memory_ids", 3))},
+                        "additionalProperties": False,
+                    }
                     tool["function"]["parameters"]["properties"]["delegation_message"] = {
                         "type": "string", "minLength": 1, "maxLength": 600,
                         "description": "给专业 Agent 的任务目标或协助请求回复；不能覆盖用户约束和权限",
@@ -97,6 +110,11 @@ class MainAgentPolicy:
                         getattr(self.llm, "last_usage", {}) or {}
                     )
                     decision = AgentDecision.model_validate_json(content)
+                if self.delegation_messages:
+                    arguments = dict(decision.arguments)
+                    metadata = {name: arguments.pop(name) for name in ("plan", "context_selection") if name in arguments}
+                    if metadata:
+                        decision = AgentDecision.model_validate({**decision.model_dump(), "arguments": arguments, **metadata})
                 if self.delegation_messages and "memory_feedback" in decision.arguments:
                     arguments = dict(decision.arguments)
                     feedback = arguments.pop("memory_feedback")
@@ -117,6 +135,11 @@ class MainAgentPolicy:
                         f"action {decision.action!r} is not allowed in current state"
                     )
                 self.argument_validator(decision.action, decision.arguments)
+                if self.delegation_messages:
+                    from app.agent.delegation_context import validate_planning
+                    validate_planning(decision, context)
+                elif decision.plan or decision.context_selection is not None:
+                    raise AgentDecisionError("subagent cannot replace the main plan or context selection")
                 memory_ids = {item["memory_id"] for item in context.state.research_memory}
                 if any(item.memory_id not in memory_ids for item in decision.memory_feedback):
                     raise AgentDecisionError("memory feedback references an item not presented in the current context")

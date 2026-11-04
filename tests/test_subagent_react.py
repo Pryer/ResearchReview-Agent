@@ -82,25 +82,26 @@ def store():
 
 
 @pytest.mark.parametrize("native", [True, False])
-def test_one_delegation_runs_multiple_decisions_and_reports_to_main(native):
+def test_followup_action_requires_main_to_delegate_again(native):
     current = state()
     llm = ScriptedLLM({
-        "main_agent_decision": ["search_and_rank", "request_finish"],
-        "search_agent_decision": ["search_and_rank", "fetch_metadata", report(message="已检索并核验来源")],
+        "main_agent_decision": ["search_and_rank", "fetch_metadata", "request_finish"],
+        "search_agent_decision": ["search_and_rank", "fetch_metadata", report(message="检索完成，需要主控另行核验"),
+                                  "fetch_metadata", report(message="已检索并核验来源")],
     }, native)
     assert MainAgentLoop(llm).run(current, handlers={"search_and_rank": search, "fetch_metadata": fetch},
                                   finish_validator=lambda s: bool(s.get("paper_details"))) == "completed"
     child_calls = [m for op, m in llm.calls if op == "search_agent_decision"]
-    assert len(child_calls) == 3
+    assert len(child_calls) == 5
     assert child_calls[1][:len(child_calls[0])] == child_calls[0]
     assert "检索候选 1" in encode(child_calls[1])
     main_last = [m for op, m in llm.calls if op == "main_agent_decision"][-1]
     assert "已检索并核验来源" in encode(main_last)
     child = current["subagent_sessions"]["search"]
-    assert [m["kind"] for m in child["messages"]] == ["task", "progress", "progress", "completed"]
+    assert [m["kind"] for m in child["messages"]] == ["task", "progress", "completed", "task", "progress", "completed"]
     assert not current.get("active_subagent")
-    assert len(current["main_agent_trajectory"]["memory"]) == 2
-    assert len(child["main_agent_trajectory"]["memory"]) == 3
+    assert len(current["main_agent_trajectory"]["memory"]) == 3
+    assert len(child["main_agent_trajectory"]["memory"]) == 5
     assert current["agent_execution_budget"]["actions_committed"] == 2
 
 
@@ -250,13 +251,13 @@ def test_control_stop_propagates_without_additional_decision(stop):
 
 
 def test_no_progress_and_round_limits_return_blocked_to_main(monkeypatch):
-    monkeypatch.setattr(get_settings(), "agent_subagent_no_progress_limit", 2)
+    monkeypatch.setattr(get_settings(), "agent_subagent_no_progress_limit", 1)
     current = state()
     llm = ScriptedLLM({"search_agent_decision": ["search_and_rank"] * 4})
     result = SubagentLoop(llm, AgentController()).run(current, decision=AgentDecision(action="search_and_rank"),
                                                    handlers={"search_and_rank": lambda *args: None})
     assert result.outcome.value == "blocked"
-    assert len(llm.calls) == 2
+    assert len(llm.calls) == 1
     monkeypatch.setattr(get_settings(), "agent_subagent_max_rounds", 1)
     current = state()
     llm = ScriptedLLM({"search_agent_decision": ["search_and_rank", report()]})
@@ -287,8 +288,8 @@ def test_checkpoint_resumes_child_without_replaying_committed_action(store):
             assert child["active"]["completed_operations"] == ["search_and_rank"]
             assert not child["main_agent_trajectory"].get("pending")
             assert restored["main_agent_trajectory"]["pending"]["action"] == "search_and_rank"
-            second = ScriptedLLM({"main_agent_decision": ["request_finish"],
-                                 "search_agent_decision": ["fetch_metadata", report()]})
+            second = ScriptedLLM({"main_agent_decision": ["fetch_metadata", "request_finish"],
+                                 "search_agent_decision": [report(), "fetch_metadata", report()]})
             assert MainAgentLoop(second).run(restored,
                 handlers={"search_and_rank": counted_search, "fetch_metadata": fetch},
                 finish_validator=lambda s: bool(s.get("paper_details"))) == "completed"
@@ -322,9 +323,9 @@ def test_subagent_context_externalization_is_service_only_and_compacts_independe
 def test_all_three_roles_have_separate_decisions_contexts_and_feedback():
     current = state()
     llm = ScriptedLLM({
-        "main_agent_decision": ["search_and_rank", "extract_paper_cards", "generate_deliverables", "request_finish"],
-        "search_agent_decision": ["search_and_rank", "fetch_metadata", report(message="search-private-turn")],
-        "analysis_agent_decision": ["extract_paper_cards", "plan_claims", report(message="analysis-private-turn")],
+        "main_agent_decision": ["search_and_rank", "fetch_metadata", "extract_paper_cards", "plan_claims", "generate_deliverables", "request_finish"],
+        "search_agent_decision": ["search_and_rank", report(message="search-private-turn"), "fetch_metadata", report()],
+        "analysis_agent_decision": ["extract_paper_cards", report(message="analysis-private-turn"), "plan_claims", report()],
         "writing_agent_decision": ["generate_deliverables", report(message="writing-private-turn")],
     })
     handlers = {
@@ -345,8 +346,8 @@ def test_all_three_roles_have_separate_decisions_contexts_and_feedback():
 def test_subagent_actions_share_total_budget():
     current = state()
     current["agent_execution_budget"] = {"action_limit": 1}
-    llm = ScriptedLLM({"main_agent_decision": ["search_and_rank"],
-                       "search_agent_decision": ["search_and_rank", "fetch_metadata"]})
+    llm = ScriptedLLM({"main_agent_decision": ["search_and_rank", "fetch_metadata"],
+                       "search_agent_decision": ["search_and_rank", report(), "fetch_metadata"]})
     assert MainAgentLoop(llm).run(current, handlers={"search_and_rank": search, "fetch_metadata": fetch},
                                   finish_validator=lambda s: False) == "blocked"
     assert not current.get("paper_details")
@@ -395,15 +396,16 @@ def test_goal_change_invalidates_persisted_delegation_without_running_old_work(s
     assert restored["required_reference_count"] == 50
 
 
-def test_child_decision_has_sidecar_check_before_extra_action(monkeypatch):
+def test_child_decision_has_sidecar_check_before_authorized_action(monkeypatch):
     from types import SimpleNamespace
     monkeypatch.setattr(get_settings(), "agent_sidecar_enabled", True)
     monkeypatch.setattr(get_settings(), "agent_sidecar_review_actions", "fetch_metadata")
     current = state()
-    llm = ScriptedLLM({"search_agent_decision": ["search_and_rank", "fetch_metadata", report()]})
+    current["ranked_papers"] = [{"paper_id": "p1"}]
+    llm = ScriptedLLM({"search_agent_decision": ["fetch_metadata", report("needs_help", "授权动作被审查拒绝")]})
     runner = SubagentLoop(llm, AgentController())
     monkeypatch.setattr(runner.sidecar, "review", lambda **kw: SimpleNamespace(verdict="deny", reason="review denied"))
-    runner.run(current, decision=AgentDecision(action="search_and_rank"),
+    runner.run(current, decision=AgentDecision(action="fetch_metadata"),
                handlers={"search_and_rank": search, "fetch_metadata": lambda *a: pytest.fail("denied action")})
     assert any(item["status"] == "deny" for item in current["subagent_sessions"]["search"]["main_agent_trajectory"]["memory"])
 

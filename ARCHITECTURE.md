@@ -111,7 +111,7 @@ ResearchReview-Agent/
 ## 3. 核心数据流（`app/agent/graph.py: run_research_agent`）
 
 当前采用 Main Agent 委派与三类 Subagent 独立 ReAct 循环组成的主从编排；
-主控每轮选择一个任务，子 Agent 在本角色内多轮决策并汇报；无 LangGraph 依赖。
+主控负责短期规划、选择执行角色与分发上下文；子 Agent 每次完成一个授权动作后汇报，无 LangGraph 依赖。
 节点函数在 `app/agent/nodes/`，原子能力在 `app/tools/`。
 
 主 Agent 基于 Stable Prefix、ReAct Trajectory 与最新 Agent Status Bar 每轮选择一个已注册动作；动作权限、预算、取消、提交
@@ -123,8 +123,12 @@ ResearchReview-Agent/
 任务契约按动作白名单投影输入，再在隔离工作副本中执行；输出键、字段删除和类型
 双重校验，提交前再次检查身份、指纹和版本，旧任务不会合并到新证据状态。
 三类专业 Agent 各自维护持久化 ReAct 轨迹、状态栏、压缩 Epoch 和通信历史。
-主控委派任务后，子 Agent 可连续选择多个本角色动作，通过 `report_to_main`
-汇报完成、请求协助或报告阻断；主控可通过 `delegation_message` 回复并再次委派。
+主控委派任务后，子 Agent 执行本次唯一研究动作，通过 `report_to_main` 汇报完成、请求协助或报告阻断；
+同角色的后续动作也必须由 Main 再次委派。子循环仍可回查自身观察、读取结果并进行有界纠错。
+Main 的 `plan` 是最多六步的后续建议，观察后可修订，不预先授予未来工具权限。
+委派的 `context_selection` 可选择当前状态栏里的证据、决定、问题和记忆 ID；
+子 Agent 的必需输入按本次操作契约提供，硬约束、最新门禁、失败原因与预算始终附带。
+未提供选择的旧调用使用操作级最小视图；显式空选择不附加历史摘要。完整 PDF 和兄弟 Agent 私有轨迹不进入该选择协议。
 独立循环同步执行，共享研究数据和总预算；具体状态、恢复和权限边界见
 [上下文架构](docs/agent-context-architecture.md#independent-specialist-react-loops)。
 
@@ -146,11 +150,11 @@ Compaction 将完整观察归档，工作记忆按条数、字符和实际窗口
 ```text
 请求 → 需求解析 → 构建五字段 → 主 Agent 委派任务
                                   ↓
-                     子 Agent 独立上下文与多轮决策
+                     子 Agent 操作级上下文与执行
                                   ↓
                      Controller 授权 → 执行 → 观察
                                   ↓
-           结果校验与 CAS 提交 → 子循环继续 / 向主控汇报
+           结果校验与 CAS 提交 → 汇报 → 刷新状态栏 → Main 重新决策
 
 申请交付 → 确定性质量门禁 → 完成 / 明确降级 / 拒绝交付
 ```
@@ -179,8 +183,8 @@ Compaction 将完整观察归档，工作记忆按条数、字符和实际窗口
   4. 抽取   extract_card_node（PaperCard：研究问题/方法/数据/指标）
   5. 路线   validate_routes_node（双语 Anchor → feature matrix → Validity/Sufficiency；
   │           仅 taxonomy 类交付物且存在候选路线时生效，否则跳过）
-  │         → recovery_loop（有界证据恢复：LLM 诊断 + 确定性预算的增量补搜；
-  │           仅 research_status 类任务具备 provisional_framework 时触发）
+  │         → Analysis 诊断缺口 → Main 决策 → Search 单轮补搜 → Main 委派详情与分析
+  │           （pending_evidence_recovery 跨检查点保存；分析后结算每路线边际收益）
   │         → cluster_node（无证据支撑路线时的证据驱动聚类回退）
   │         → global_evidence_gate_node（输出综述级充分性诊断，供恢复及交付门禁消费）
   6. 写作   claim_plan_node → claim_evidence_gate_node
@@ -191,8 +195,9 @@ Compaction 将完整观察归档，工作记忆按条数、字符和实际窗口
   7. 验证   verify_claims_node / citation_check_node（以 DOI/S2/OpenAlex/arXiv ID
   │           追踪证据，双向匹配防幻觉；正文渲染为顺序编码或作者—年份引用）
   │         → claim_alignment（写作后越权主张检查）与 claim_citation_consistency
-  │         → citation_gap_repair（成文引用数低于用户显式要求时增量补检索并重写，
-  │            候选质量向量退化则保留原已验证版本）
+  │         → 引用缺口由 Main 分别委派补检索、分析和写作，禁止 Search 内嵌整条生成链
+  │         → Writing 只提交待核验候选，Main 再委派 Analysis 的 validate_result；
+  │            退化候选可恢复同证据、同授权的已验证旧稿，不能据此复活过期证据
   8. 收尾   final_answer_node（质量门禁 + 答案组装）→ 自动导出评估包到 data/eval_bundles/
 ```
 
@@ -208,7 +213,7 @@ running job 标为失败、完成待取消 job 的取消；它不自动重放在
 - **后台任务模型**：长任务经 job 服务异步执行，前端轮询 `GET /jobs/{job_id}` 获取步骤与进度；节点边界支持协作式取消（`agent/execution.py`）。
 - **多轮会话**：`research_conversation_service` 保存澄清问答、论文集合、生成版本；支持按序号/标题排除论文。
 - **节点契约**：节点经 `@node/@requires/@provides`（`agent/decorators.py`）声明输入输出；必需输入缺失写入 `contract_violations` 并随任务结果导出供审计。
-- **动作契约**：`action_contracts.py` 定义十个专业动作的输入和输出字段；未知新增字段默认不可见、不可提交，任务不能修改用户硬约束或共享预算。
+- **动作契约**：`action_contracts.py` 定义专业动作的输入和输出字段；未知新增字段默认不可见、不可提交，任务不能修改用户硬约束或共享预算。
 - **原子提交与取消**：会话租约与数据库 CAS 将任务结果、资料、检查点、事件和预算一起提交或回滚；后台领取也使用 queued→running CAS。取消先提交时拒绝迟到结果。
 - **用量账本**：每次真实请求先预留、响应后结算，解析失败/空内容重试/备用请求均记账；崩溃未决请求保守计为 estimated/uncertain，旧执行不能覆盖新账本。
 - **历史与恢复**：展示历史截断前归档，摘要只读取游标之后的新事件；读取时优先最新已提交检查点，旧版本已丢失历史不伪造恢复。

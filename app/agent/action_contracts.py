@@ -42,7 +42,9 @@ recovery_history evidence_recovery_status recovery_statistics conservative_regen
 user_accepted_best_effort_generation generation_readiness generation_blocked
 citation_gap_repair_attempted citation_gap_repair_history citation_gap_repair_count
 _citation_gap_repair_snapshot _citation_gap_repair_previous_cited""")
-# WHY: 写作/改写内部也执行写后验证；对齐与引用授权诊断属于可提交产物，不只由分析动作写入。
+# WHY: 恢复跨角色分段提交，pending 记录搜索前快照，分析后才结算收益。
+RECOVERY |= fields("pending_evidence_recovery")
+# 写作只能提交候选稿；最终主张核验由 Analysis 的 validate_result 提交。
 WRITING = fields("""review body answer introduction introduction_data related_work related_work_data references
 reference_papers citation_map citation_registry citation_validation claim_verification claim_verification_cache
 citation_source_text citation_rendered_text
@@ -53,6 +55,7 @@ deliverable_validation writer_diagnostics writer_section_diagnostics final_revie
 citation_eligible_paper_ids reference_coverage_stats target_section_ids target_claim_ids section_checkpoints
 section_candidate_checkpoints result_status autonomous_verified_fingerprint draft_available draft_released
  draft_disposition generation_readiness generation_blocked writing_version focus_coverage""")
+WRITING |= fields("pending_generation_previous pending_result_validation")
 PROTECTED = fields("""user_query research_request required_reference_count year_range_explicit max_papers_explicit
 start_year end_year selected_scope core_deliverables session_id agent_orchestration_mode user_clarifications research_query_rewrite""")
 # WHY: 这些是内层 Controller 可重建的视图；不属于专业动作提交的研究产物。
@@ -78,19 +81,25 @@ CONTRACTS = {
     "fetch_metadata": contract(SEARCH | MATERIAL | fields("validated_routes generation_readiness recovery_decision"),
         SEARCH | MATERIAL),
     "extract_paper_cards": contract(MATERIAL | fields("incremental_retrieval incremental_new_paper_ids"), fields("paper_cards pending_card_rebuild_ids")),
-    "validate_routes": contract(MATERIAL | ANALYSIS | RECOVERY | fields("ranked_papers"), ANALYSIS | fields("paper_cards paper_details")),
+    "validate_routes": contract(MATERIAL | ANALYSIS | RECOVERY | fields("ranked_papers"),
+        ANALYSIS | RECOVERY | fields("paper_cards paper_details incremental_retrieval incremental_search_window incremental_required_new_evidence citation_shortfall_count evidence_snapshot_version evidence_snapshot_fingerprint")),
     "cluster_papers": contract(MATERIAL | ANALYSIS | RECOVERY | fields("ranked_papers"), ANALYSIS | fields("paper_cards paper_details")),
     "plan_claims": contract(MATERIAL | ANALYSIS | RECOVERY | fields("ranked_papers"),
         fields("claim_plans claim_evidence_gate global_evidence_gate evidence_gap_report evidence_quality_report claim_alignment claim_citation_consistency")),
+    "diagnose_evidence_gaps": contract(SEARCH | MATERIAL | ANALYSIS | RECOVERY,
+        fields("evidence_gap_report recovery_decision evidence_recovery_status")),
+    "revise_scope": contract(SEARCH | MATERIAL | ANALYSIS | RECOVERY,
+        fields("provisional_framework keywords search_branches global_recall_queries recovery_decision scope_revision_count scope_revision_failed recovery_action_count")),
     "generate_deliverables": contract((MATERIAL - fields("pdf_paths parsed_papers")) | ANALYSIS | RECOVERY | WRITING | fields("ranked_papers language_coverage_target generation_limit required_concepts"),
         WRITING | RECOVERY | fields("evidence_quality_report evidence_yield route_merge_diagnostics language_coverage search_report theme_synthesis")),
     "rewrite_sections": contract((MATERIAL - fields("pdf_paths parsed_papers")) | ANALYSIS | RECOVERY | WRITING | fields("ranked_papers language_coverage_target generation_limit required_concepts"),
         WRITING | RECOVERY | fields("evidence_quality_report evidence_yield route_merge_diagnostics language_coverage search_report theme_synthesis")),
     "validate_result": contract(MATERIAL | ANALYSIS | RECOVERY | WRITING | fields("ranked_papers language_coverage_target required_concepts"),
-        WRITING | fields("evidence_quality_report evidence_yield language_coverage search_report")),
-    # WHY: 补检索是有界复合动作，既有实现包含提取、授权和引用修复，故显式组合依赖。
-    "targeted_search": contract(SEARCH | MATERIAL | ANALYSIS | RECOVERY | WRITING,
-        SEARCH | MATERIAL | ANALYSIS | RECOVERY | WRITING | fields("evidence_snapshot_version evidence_snapshot_fingerprint research_semantic_frame")),
+        WRITING | fields("evidence_quality_report evidence_yield language_coverage search_report recovery_candidate_rejections")),
+    # WHY: Search 不再有证据提取、主张或正文写权限，补检索只提交候选与恢复进度。
+    "targeted_search": contract(SEARCH | (RECOVERY - fields("_citation_gap_repair_snapshot"))
+        | fields("paper_cards paper_details provisional_framework validated_routes evidence_gap_report recovery_decision review unique_cited_paper_count"),
+        SEARCH | fields("pending_evidence_recovery recovery_action_count recovery_round route_recovery_attempts citation_gap_repair_attempted _citation_gap_repair_previous_cited")),
 }
 
 

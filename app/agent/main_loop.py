@@ -306,6 +306,10 @@ class MainAgentLoop:
             state_cycled = current_progress != previous_progress and current_progress in recent_progress
             recent_progress.append(current_progress)
             previous_progress = current_progress
+            # WHY: 独立核验拒绝退化候选、恢复已验证旧稿会回到历史状态；
+            # 仍须当前版本通过最终门禁，不能把安全回滚误判为无效循环。
+            if state_cycled and state.get("recovery_candidate_rejections") and finish_validator(state):
+                return str(state.get("result_status") or "completed")
             if no_progress >= progress_limit:
                 state["generation_blocked"] = True
                 state["result_status"] = "blocked"

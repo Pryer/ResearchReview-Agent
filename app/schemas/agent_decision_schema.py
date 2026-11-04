@@ -15,6 +15,21 @@ class MemoryFeedback(BaseModel):
     reason: str = Field(min_length=1, max_length=240)
 
 
+class PlanStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: str = Field(min_length=1, max_length=64)
+    objective: str = Field(min_length=1, max_length=240)
+
+
+class ContextSelection(BaseModel):
+    """只选择当前状态栏里的摘要 ID，不接受任意状态字段或原始文本。"""
+    model_config = ConfigDict(extra="forbid")
+    evidence_ids: list[str] = Field(default_factory=list, max_length=12)
+    decision_ids: list[str] = Field(default_factory=list, max_length=8)
+    question_ids: list[str] = Field(default_factory=list, max_length=8)
+    memory_ids: list[str] = Field(default_factory=list, max_length=3)
+
+
 class AgentDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -27,6 +42,8 @@ class AgentDecision(BaseModel):
     tool_call_id: str | None = None
     usage: dict[str, int] = Field(default_factory=dict)
     memory_feedback: list[MemoryFeedback] = Field(default_factory=list, max_length=5)
+    plan: list[PlanStep] = Field(default_factory=list, max_length=6)
+    context_selection: ContextSelection | None = None
 
     @field_validator("evidence_refs")
     @classmethod

@@ -35,6 +35,11 @@ _ACTION_SPECS = (
                required_fields=("paper_cards",), output_fields=("clusters", "dynamic_taxonomy")),
     ActionSpec("plan_claims", "为研究路线建立主张与证据授权", AgentRole.ANALYSIS,
                required_fields=("paper_cards",), output_fields=("claim_plans", "evidence_gap_report")),
+    ActionSpec("diagnose_evidence_gaps", "分析证据缺口并返回受约束的恢复建议，不执行检索", AgentRole.ANALYSIS,
+               required_fields=("paper_cards",), output_fields=("evidence_gap_report", "recovery_decision")),
+    ActionSpec("revise_scope", "在用户显式边界内修订研究路线框架", AgentRole.ANALYSIS,
+               required_fields=("paper_cards", "evidence_gap_report", "provisional_framework"),
+               output_fields=("provisional_framework", "scope_revision_count")),
     ActionSpec("generate_deliverables", "按计划和获准证据生成交付物", AgentRole.WRITING,
                required_fields=("paper_cards", "claim_plans"), output_fields=("review", "writing_plans")),
     ActionSpec(
@@ -94,6 +99,9 @@ def allowed_actions(
 ) -> list[str]:
     handlers = registered_handlers or set(ACTION_REGISTRY)
     mode = str(state.get("agent_operation_mode") or "initial")
+    mandatory = state.get("agent_mandatory_actions") or []
+    refreshing_existing = (mode == "regeneration" and bool(mandatory)
+                           and mandatory[0].get("action") == "fetch_metadata")
     if mode == "verification_only":
         return [
             name for name in ("validate_result", "recall_context", "search_research_memory", "request_finish", "report_blocked")
@@ -108,7 +116,7 @@ def allowed_actions(
         if spec.name in {"rewrite_sections", "generate_deliverables"}:
             from app.agent.generation_recovery import rewrite_attempt_exhausted
 
-            if rewrite_attempt_exhausted(state):
+            if state.get("pending_result_validation") or rewrite_attempt_exhausted(state):
                 continue
         if spec.name == "search_and_rank" and state.get("active_quality_recovery"):
             if (state.get("retrieval_profile") or {}).get("mode") == "hybrid":
@@ -119,12 +127,22 @@ def allowed_actions(
             from app.agent.evidence_recovery import targeted_search_kind
             if not targeted_search_kind(state):
                 continue
+        elif spec.name == "revise_scope":
+            from app.agent.evidence_recovery import route_recovery_stop_reason
+            if (route_recovery_stop_reason(state) or state.get("scope_revision_failed")
+                    or (state.get("recovery_decision") or {}).get("action") != "SCOPE_REVISION"):
+                continue
+            from app.core.config import get_settings
+            if int(state.get("scope_revision_count") or 0) >= get_settings().evidence_recovery_max_scope_revisions:
+                continue
+            if any(not state.get(field) for field in spec.required_fields):
+                continue
         elif spec.name == "fetch_metadata" and (state.get("retrieval_profile") or {}).get("mode") == "hybrid":
-            if not admitted_ranked_papers(state):
+            if not admitted_ranked_papers(state) and not refreshing_existing:
                 continue
         elif any(not state.get(field) for field in spec.required_fields):
             continue
-        if mode == "regeneration" and spec.name in {"search_and_rank", "fetch_metadata", "targeted_search"}:
+        if mode == "regeneration" and spec.name in {"search_and_rank", "fetch_metadata", "targeted_search"} and not (refreshing_existing and spec.name == "fetch_metadata"):
             continue
         allowed.append(spec.name)
     # 控制动作始终可用；研究动作仍须由真实 handler 注册。
@@ -161,6 +179,16 @@ def recovery_handoff_action(state: dict[str, Any]) -> str:
     # 不要求已经进入写作失败恢复，也不让检索角色越权提取。
     if state.get("intent") != "search_papers" and state.get("paper_details") and state.get("pending_card_rebuild_ids"):
         return "extract_paper_cards"
+    if state.get("pending_evidence_recovery") and state.get("intent") != "search_papers":
+        from app.agent.nodes.base import _paper_identity_key
+        ranked = admitted_ranked_papers(state)
+        details = {_paper_identity_key(p) for p in state.get("paper_details") or []}
+        if any(_paper_identity_key(p) not in details for p in ranked):
+            return "fetch_metadata"
+        cards = {_paper_identity_key(p) for p in state.get("paper_cards") or []}
+        if any(pid not in cards for pid in details):
+            return "extract_paper_cards"
+        return "validate_routes" if state.get("paper_cards") else ""
     if not state.get("active_quality_recovery") or state.get("intent") == "search_papers":
         return ""
     if (state.get("retrieval_profile") or {}).get("mode") != "hybrid":

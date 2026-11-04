@@ -286,3 +286,6 @@ class ResearchAgentState(TypedDict, total=False):
     draft_available: bool
     draft_released: bool
     draft_disposition: str
+    pending_evidence_recovery: Dict[str, Any]
+    pending_generation_previous: Dict[str, Any]
+    pending_result_validation: bool

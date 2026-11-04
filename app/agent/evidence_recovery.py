@@ -69,14 +69,17 @@ def should_repair_citation_gap(state: dict[str, Any]) -> bool:
 
 
 def targeted_search_kind(state: dict[str, Any]) -> str:
-    if state.get("allow_evidence_expansion") is False:
+    if state.get("allow_evidence_expansion") is False or state.get("pending_evidence_recovery"):
         return ""
     # WHY: 成文引用修复与路线补搜使用不同边界；路线耗尽不能误禁尚未尝试的引用修复。
     if should_repair_citation_gap(state):
         return "citation"
     if route_recovery_stop_reason(state):
         return ""
-    if (state.get("evidence_gap_report") or {}).get("needs_recovery"):
+    decision = state.get("recovery_decision") or {}
+    if ((state.get("evidence_gap_report") or {}).get("needs_recovery")
+            and decision.get("action") in {"TARGETED_SEARCH", "QUERY_FILTER_REVISION"}
+            and decision.get("queries")):
         return "route"
     return ""
 

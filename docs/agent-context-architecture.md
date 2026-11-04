@@ -98,10 +98,12 @@ not the child's private trajectory. A child sees only its own communication and
 the current evidence/status projection allowed by its role's action contracts.
 Authoritative research evidence remains shared and versioned through Controller.
 
-For one delegation the specialist repeatedly chooses an eligible role action,
-executes it through `AgentController`, observes the committed result and chooses
-again. It can therefore search then fetch metadata, or extract evidence then plan
-claims, without a new main-model decision between every step. It returns through
+Main owns global decisions and bounded planning. An optional `plan` contains at most
+six registered-action/objective steps; only the currently selected action is authorized.
+The specialist executes that one delegated research operation, observes its committed
+result and reports. Another operation, including one owned by the same role, requires
+a new Main delegation. Recall and bounded protocol correction remain available.
+It returns through
 `report_to_main` with `completed`, `needs_help` or `blocked` and optional suggested
 actions. Suggestions and model-written reports do not authorize tools or establish
 evidence. The main model receives these reports in `state.agent_messages` and can
@@ -115,7 +117,7 @@ The delegated operation must actually commit before a `completed` report is
 accepted. Its arguments are immutable; local rewrites cannot switch to full-draft
 generation. Mandatory recovery and evidence-handoff ordering remain authoritative.
 Requests outside the current role, action preconditions or registered handlers are
-rejected. Each additional child action receives its own Controller permission,
+rejected. Each delegated child action receives its own Controller permission,
 version and budget checks, plus Sidecar review when configured. A child's completion
 means that its operation executed, not that final review quality passed.
 
@@ -125,6 +127,19 @@ records the completed/help/block report. Main-loop consumption explicitly adds
 blocked, degraded, unknown or help outcomes to its next Status Bar's feedback,
 including restored delegations. It can replan rather than automatically ending the
 entire research job; finish requests still require the deterministic final gates.
+
+Main's optional `context_selection` names `evidence_ids`, `decision_ids`,
+`question_ids` and `memory_ids` present in its latest status bar. Unknown IDs and
+unregistered plan actions are rejected in both native and JSON transports. The
+selection is communication metadata, removed before handler argument validation
+and saved with the active delegation for checkpoint recovery. Selected evidence,
+decisions and questions are refreshed from current authoritative summaries; stale
+IDs cannot revive old evidence. Omitted selection uses an operation-level default;
+explicit empty selection attaches no additional summaries. The authoritative goal,
+constraints, current gates, failures and budgets cannot be omitted. This selects
+model-facing summaries, not arbitrary raw state keys or a new per-paper execution API.
+Handler inputs and artifact access remain bounded by the current operation contract,
+not the union of every operation owned by the role.
 
 The implementation uses synchronous delegation, not background daemon workers or
 parallel shared-state mutation. Independent contexts survive multiple delegations.
@@ -156,8 +171,19 @@ ledger conflict) is distinct from a clarification: it settles as `blocked`, or `
 for a stale lease, with one consistent reason across job, session, and result, and is
 never reported as a missing-checkpoint question. Cancellation, failure and waiting
 states do not publish a draft.
-Generation and citation-repair candidates run the normal verification chain; a
-worse candidate restores the previous generation products and is verified again.
+Writing submits a candidate with `pending_result_validation`; Main separately delegates
+`validate_result` to Analysis. Pending candidates cannot finish, publish or be rewritten.
+A worse candidate restores the old products only if evidence and authorization still
+match; a matching old verification fingerprint can be retained without mutating that
+verified draft a second time.
+
+`diagnose_evidence_gaps` returns Analysis diagnostics and a bounded recovery recommendation;
+Main can select Search `targeted_search` or Analysis `revise_scope`. Targeted search
+commits only candidates and `pending_evidence_recovery`, never evidence cards, claims
+or a new draft. Main handles subsequent metadata, extraction, route analysis, claims
+and writing through separate delegations. Per-route new evidence and marginal-gain
+limits are settled after analysis, with cumulative budgets retained across checkpoints.
+Explicit existing-evidence refresh and focus recovery also enter the Main queue.
 
 The budget ledger is shared across conversation parsing, graph entry points,
 specialist workers and automatic recovery. Each real LLM attempt reserves prompt

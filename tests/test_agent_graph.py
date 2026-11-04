@@ -1766,7 +1766,7 @@ def test_full_regeneration_cannot_release_old_draft_after_evidence_change(monkey
 def test_selected_best_effort_generation_cannot_be_skipped_by_main_agent(monkeypatch):
     from app.agent.graph import regenerate_research_agent
 
-    monkeypatch.setattr("app.agent.graph._get_llm", lambda: WorkflowLLM("request_finish"))
+    monkeypatch.setattr("app.agent.graph._get_llm", lambda: WorkflowLLM("validate_result", "request_finish"))
     monkeypatch.setattr("app.agent.graph.claim_plan_node", lambda current, **kw: current.update(
         claim_plans=[{"route_id": "r1", "claims": []}],
     ))
@@ -1795,7 +1795,7 @@ def test_selected_best_effort_generation_cannot_be_skipped_by_main_agent(monkeyp
     assert result["status"] == "partial"
     assert result["body"] == "有限证据的草稿。"
     assert [item["action"] for item in result["research_state"]["main_agent_decisions"]] == [
-        "plan_claims", "generate_deliverables",
+        "plan_claims", "generate_deliverables", "validate_result",
     ]
     assert result["quality_gate"]["passed"] is False
 
@@ -1804,7 +1804,7 @@ def test_selected_taxonomy_repair_runs_clustering_before_claims_and_writing(monk
     from app.agent.graph import regenerate_research_agent
 
     calls = []
-    monkeypatch.setattr("app.agent.graph._get_llm", lambda: WorkflowLLM("request_finish"))
+    monkeypatch.setattr("app.agent.graph._get_llm", lambda: WorkflowLLM("validate_result", "request_finish"))
 
     def cluster(current, **kwargs):
         calls.append("cluster")
@@ -1848,7 +1848,7 @@ def test_selected_taxonomy_repair_runs_clustering_before_claims_and_writing(monk
     assert result["status"] == "success"
     assert result["body"] == "重新分类后的正文。"
     assert [item["action"] for item in result["research_state"]["main_agent_decisions"]] == [
-        "cluster_papers", "plan_claims", "generate_deliverables", "request_finish",
+        "cluster_papers", "plan_claims", "generate_deliverables", "validate_result", "request_finish",
     ]
 
 
@@ -2003,7 +2003,7 @@ def test_local_regeneration_only_reuses_verification_for_unchanged_authorization
     from app.agent.graph import regenerate_research_agent
 
     actions = ["plan_claims"] if change_authorization else []
-    actions += ["generate_deliverables", "request_finish"]
+    actions += ["generate_deliverables", "validate_result", "request_finish"]
     llm = WorkflowLLM(*actions)
     monkeypatch.setattr("app.agent.graph._get_llm", lambda: llm)
     monkeypatch.setattr("app.agent.graph.claim_plan_node", lambda current, **kw: current.update(

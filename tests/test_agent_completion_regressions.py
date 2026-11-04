@@ -71,22 +71,24 @@ def test_new_default_entry_reaches_autonomous_loop(monkeypatch):
     assert len(llm.contexts) == 2
 
 
-def test_autonomous_citation_repair_passes_all_required_arguments(monkeypatch):
+def test_citation_repair_returns_search_result_without_running_analysis_or_writer(monkeypatch):
     current = state()
     current.update(review="old [p1]", required_reference_count=40, unique_cited_paper_count=1,
                    candidate_papers=[{"paper_id": "p1"}], max_papers_explicit=True)
     llm = Decisions("targeted_search", ("report_blocked", {"reason": "证据仍不足"}))
     monkeypatch.setattr(graph, "_get_llm", lambda: llm)
     calls = []
-    def repair(working, should_cancel, progress_callback, step_idx, total_steps):
-        calls.append((step_idx, total_steps))
-        working["citation_gap_repair_attempted"] = True
+    def search(working, should_cancel, **kwargs):
+        calls.append("search")
         working["candidate_papers"].append({"paper_id": "p2"})
-    monkeypatch.setattr(graph, "_repair_citation_gap", repair)
-    monkeypatch.setattr(graph, "_verify_generated_draft", lambda s: None)
-    monkeypatch.setattr(graph, "final_answer_node", lambda s: None)
+    monkeypatch.setattr(graph, "_search_rank_with_refinement", search)
+    monkeypatch.setattr(graph, "_verify_generated_draft", lambda s: pytest.fail("Search cannot verify"))
+    monkeypatch.setattr(graph, "generate_deliverables_node", lambda *a, **k: pytest.fail("Search cannot write"))
     output = graph._run_autonomous_pipeline(current)
-    assert calls == [(0, get_settings().agent_main_max_rounds)]
+    assert calls == ["search"]
+    assert current["citation_gap_repair_attempted"]
+    assert current["pending_evidence_recovery"]["kind"] == "citation"
+    assert current["review"] == "old [p1]"
     assert output["status"] == "blocked"
     assert current["agent_execution_budget"]["recovery_used"] == 1
 
@@ -295,7 +297,7 @@ def test_autonomous_rewrite_rolls_back_a_worse_candidate(monkeypatch):
                    quality_gate={"passed": True}, agent_orchestration_mode="autonomous",
                    answer="原有正文")
     current["autonomous_verified_fingerprint"] = graph._draft_fingerprint(current)
-    llm = Decisions("generate_deliverables", "request_finish")
+    llm = Decisions("generate_deliverables", "validate_result", "request_finish")
     monkeypatch.setattr(graph, "_get_llm", lambda: llm)
     monkeypatch.setattr(graph, "_generate_deliverables_or_block", lambda s, **kw: s.update(review="更差的正文"))
     def verify(s):
@@ -344,6 +346,7 @@ def test_autonomous_rewrite_rejection_survives_restart_and_new_objective(monkeyp
     calls = []
     monkeypatch.setattr(graph, "_get_llm", lambda: Decisions(
         ("rewrite_sections", {"section_ids": ["s1"]}),
+        "validate_result",
         ("report_blocked", {"reason": "缺口仍存在"}),
     ))
     def generate(working, **kwargs):

@@ -11,6 +11,7 @@ from app.agent.main_loop import _progress_fingerprint
 from app.agent.nodes.verification import claim_plan_node, claim_evidence_gate_node
 from app.agent.deliverable_router import check_generation_readiness
 from app.core.config import get_settings
+from tests.test_main_delegation_context import agent_artifacts
 
 
 def test_pending_hybrid_candidates_do_not_offer_empty_fetch():
@@ -63,6 +64,8 @@ def _state():
         'paper_cards': [_card(0)],
         'evidence_gap_report': {'needs_recovery': True},
         'quality_recovery_decision': {'action': 'TARGETED_SEARCH'},
+        'recovery_decision': {'action': 'TARGETED_SEARCH', 'queries': ['课堂行为 对照研究'],
+                              'affected_route_ids': ['r1'], 'route_targets': {'r1': 40}},
         'steps': [], 'errors': [],
     }
 
@@ -86,7 +89,7 @@ def _card(i):
     ('required_focus_evidence_not_met', 1),
     ('minimum_references_not_met', 0),
 ])
-def test_autonomous_quality_recovery_executes_focus_search_before_main_loop(
+def test_focus_recovery_is_delegated_by_main_instead_of_running_before_it(
     monkeypatch, issue_code, expected_searches,
 ):
     state = _state()
@@ -100,22 +103,17 @@ def test_autonomous_quality_recovery_executes_focus_search_before_main_loop(
     )
     calls = []
 
-    def search(current, **kwargs):
-        calls.append('focus_search')
-        assert current['agent_operation_mode'] == 'incremental'
-        assert kwargs['objective'].startswith('针对缺失的用户研究重点')
-
     def main_loop(current, **kwargs):
         calls.append('main_loop')
         return {'research_state': current}
 
     monkeypatch.setattr(graph, '_get_llm', lambda: object())
-    monkeypatch.setattr(graph, '_run_search_subagent', search)
     monkeypatch.setattr(graph, '_run_autonomous_pipeline', main_loop)
 
-    graph.continue_research_agent(state)
+    output = graph.continue_research_agent(state)
 
-    assert calls == ['focus_search'] * expected_searches + ['main_loop']
+    assert calls == ['main_loop']
+    assert output['research_state'].get('agent_mandatory_actions', []) == ([{'action': 'search_and_rank'}] if expected_searches else [])
 
 
 @pytest.mark.parametrize('boundary', ['rounds', 'marginal_gain', 'actions', 'permission'])
@@ -194,21 +192,40 @@ class Decisions:
 
 
 @pytest.mark.parametrize('usable', [39, 40])
-def test_recovery_commits_fresh_claims_and_checks_writing_readiness(monkeypatch, usable):
+def test_recovery_returns_to_main_before_claims_and_writing(monkeypatch, usable, agent_artifacts):
+    from tests.test_main_agent_loop import NativeDecisionLLM
     state = _state()
-    llm = Decisions()
-    monkeypatch.setattr(graph, '_get_llm', lambda: llm)
+    state.update(session_id='recovery-test', retrieval_profile={'mode': 'hybrid'})
+    state['paper_details'] = [{'paper_id': 'p0', 'title': _card(0)['title']}]
     calls = []
 
-    def recover(current, **kwargs):
-        calls.append('recover')
-        # 复现卡片很多、可用证据有限；不能将总卡片数量当成最终引用能力。
+    class Decisions(NativeDecisionLLM):
+        def complete_tool_call(self, messages, **kwargs):
+            answer = super().complete_tool_call(messages, **kwargs)
+            if answer['name'] == 'plan_claims':
+                assert calls == ['search', 'routes']
+            if answer['name'] == 'report_blocked':
+                answer['arguments'] = {'reason': '交付条件未满足'}
+            return answer
+
+    llm = Decisions(['targeted_search', 'plan_claims', 'generate_deliverables',
+                     *(['validate_result'] if usable >= 40 else []), 'report_blocked'])
+    monkeypatch.setattr(graph, '_get_llm', lambda: llm)
+
+    def search(current, **kwargs):
+        calls.append('search')
+        assert not current.get('claim_plans')
+        current['candidate_papers'] = [{'paper_id': 'new-candidate', 'title': '新增候选研究'}]
+        current['last_search_new_results'] = 0
+
+    def routes(current, **kwargs):
+        calls.append('routes')
         current['paper_cards'] = [_card(i) for i in range(133)]
         for card in current['paper_cards'][usable:]:
             card['quality_status'] = 'invalid'
         current['validated_routes'] = [{'route_id': 'r1', 'name': '行为分析',
+                                       'paper_ids': [f'p{i}' for i in range(usable)],
                                        'core_paper_ids': [f'p{i}' for i in range(usable)]}]
-        current['evidence_recovery_status'] = 'EXHAUSTED'
 
     def claims(current, **kwargs):
         calls.append('claims')
@@ -225,21 +242,26 @@ def test_recovery_commits_fresh_claims_and_checks_writing_readiness(monkeypatch,
         assert current['reference_coverage_stats']['claim_authorized'] == usable
         current['generation_readiness'] = ready.model_dump(mode='json')
         current['generation_blocked'] = not ready.ready
+        if ready.ready:
+            current['review'] = '有证据的候选正文 [p0]'
         current['quality_gate'] = {'passed': False, 'draft_released': False,
                                    'blocking_issues': ready.blocking_issues}
 
-    monkeypatch.setattr(graph, '_run_route_evidence_recovery', recover)
+    monkeypatch.setattr(graph, 'search_node', search)
+    monkeypatch.setattr(graph, 'extract_card_node', lambda current, **kwargs: current.update(paper_cards=[_card(0)]))
+    monkeypatch.setattr(graph, 'validate_routes_node', routes)
     monkeypatch.setattr(graph, 'claim_plan_node', claims)
     monkeypatch.setattr(graph, '_run_claim_evidence_gate', gate)
     monkeypatch.setattr(graph, '_generate_deliverables_or_block', write)
-    monkeypatch.setattr(graph, '_verify_generated_draft', lambda current: None)
+    monkeypatch.setattr(graph, '_verify_generated_draft', lambda current: calls.append('verify'))
     monkeypatch.setattr(graph, 'final_answer_node', lambda current: None)
     output = graph._run_autonomous_pipeline(state)
-    assert calls == ['recover', 'claims', 'claim_gate', 'readiness']
-    assert llm.calls == 2
+    assert all(e.get('code') == 'main_agent_blocked' for e in state.get('errors') or []), state.get('errors')
+    assert calls == ['search', 'routes', 'claims', 'claim_gate', 'readiness', *(['verify'] if usable >= 40 else [])]
+    assert [d['action'] for d in state['main_agent_decisions']] == [
+        'targeted_search', 'validate_routes', 'plan_claims', 'generate_deliverables',
+        *(['validate_result'] if usable >= 40 else []), 'report_blocked']
     assert output['status'] == 'blocked'
-    assert state['reference_coverage_stats']['claim_authorized'] == usable
-    assert state['reference_coverage_stats']['final_valid'] == 0
     assert state['required_reference_count'] == 40
     assert (state['start_year'], state['end_year']) == (2024, 2026)
     assert not state['quality_gate']['draft_released']

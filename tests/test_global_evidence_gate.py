@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import pytest
+from tests.test_main_delegation_context import agent_artifacts
 
 from app.agent.decorators import get_node_metadata
 from app.agent.global_evidence_gate import evaluate_global_sufficiency
@@ -580,6 +581,7 @@ def _install_graph_fakes(monkeypatch, *, n_papers: int) -> None:
 
     def fake_plan(current, llm=None, current_year=None):
         current.update({
+            "session_id": "global-gate-smoke",
             "user_query": "引用不少于40篇近三年目标检测论文，并生成研究现状",
             "intent": "generate_review",
             "confidence": 0.9,
@@ -707,7 +709,7 @@ def _install_graph_fakes(monkeypatch, *, n_papers: int) -> None:
     )
 
 
-def test_graph_smoke_gate_passes_with_sufficient_pool(monkeypatch):
+def test_graph_smoke_gate_passes_with_sufficient_pool(monkeypatch, agent_artifacts):
     _install_graph_fakes(monkeypatch, n_papers=40)
 
     result = run_research_agent(
@@ -721,7 +723,7 @@ def test_graph_smoke_gate_passes_with_sufficient_pool(monkeypatch):
     assert result["status"] == "success"
 
 
-def test_graph_smoke_gate_flags_deficit_and_partial_status(monkeypatch):
+def test_graph_smoke_gate_flags_deficit_and_partial_status(monkeypatch, agent_artifacts):
     _install_graph_fakes(monkeypatch, n_papers=25)
 
     result = run_research_agent(

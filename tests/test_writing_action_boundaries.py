@@ -87,6 +87,13 @@ def test_real_postwriting_checks_commit_without_releasing_insufficient_draft(mon
             state=current, handler=lambda working: handlers[operation](working, {}),
         )
         assert result.status.value == 'completed'
+        if operation != 'validate_result':
+            assert current['pending_result_validation']
+            assert not finish_validator(current)
+            assert 'claim_alignment' not in result.state_patch
+            result = loop.controller.execute(role=ACTION_REGISTRY['validate_result'].role,
+                operation='validate_result', objective='独立分析候选稿', state=current,
+                handler=lambda working: handlers['validate_result'](working, {}))
         assert current['claim_alignment']
         assert current['claim_citation_consistency']
         assert current['required_reference_count'] == 40
@@ -164,6 +171,10 @@ def test_rejected_candidate_restores_verified_draft_without_second_mutating_vali
         loop.controller.execute(role=ACTION_REGISTRY[operation].role, operation=operation,
             objective='验证候选回滚', state=current,
             handler=lambda s: handlers[operation](s, {'section_ids': ['s1']} if operation == 'rewrite_sections' else {}))
+        assert current['pending_result_validation']
+        loop.controller.execute(role=ACTION_REGISTRY['validate_result'].role, operation='validate_result',
+            objective='主控另行委派核验与版本比较', state=current,
+            handler=lambda s: handlers['validate_result'](s, {}))
         return 'blocked'
     monkeypatch.setattr(MainAgentLoop, 'run', run)
     graph._run_autonomous_pipeline(state)

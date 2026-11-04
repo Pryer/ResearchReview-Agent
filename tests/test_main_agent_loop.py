@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app.agent.main_loop import MainAgentLoop, _progress_fingerprint
+from tests.test_main_delegation_context import agent_artifacts
 
 
 class NativeDecisionLLM:
@@ -189,11 +190,12 @@ def test_unavailable_preselected_recovery_action_blocks_explicitly():
     assert llm.context_messages == []
 
 
-def test_autonomous_graph_pipeline_reuses_existing_nodes_and_quality_gate(monkeypatch):
+def test_autonomous_graph_pipeline_reuses_existing_nodes_and_quality_gate(monkeypatch, agent_artifacts):
     from app.agent import graph
 
     from tests.retrieval_fakes import admitted_paper
     state = _state()
+    state["session_id"] = "main-pipeline"
     state.update({
         "intent": "generate_review",
         "core_deliverables": ["narrative_review"],
