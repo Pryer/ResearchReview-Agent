@@ -72,6 +72,16 @@ class LLMService:
         self.backup_enabled = settings.llm_backup_enabled
         self._backup_client = None
 
+    def with_task_settings(self):
+        """把进入任务作用域前创建的服务绑定到已持久化配置。"""
+        bound=LLMService()
+        # WHY: 模型和超时取任务快照；同身份客户端可复用连接，不复用旧调度参数。
+        if (bound.base_url,bound.api_key)==(self.base_url,self.api_key):
+            bound._client=self._client
+        if (bound.backup_base_url,bound.backup_api_key)==(self.backup_base_url,self.backup_api_key):
+            bound._backup_client=self._backup_client
+        return bound
+
     def _providers(self):
         from app.agent.execution_budget import active_budget
         active = active_budget()
@@ -728,22 +738,30 @@ class _RoleBoundLLM:
         if role not in SYSTEM_PROMPTS:
             raise ValueError(f"unknown agent role: {role}")
         self._service = service
+        self._role = role
         tools = json.dumps(tools_for_role(role), ensure_ascii=False, sort_keys=True)
         self._role_prompt = SYSTEM_PROMPTS[role].strip()
         self._system_prompt = f"{self._role_prompt}\n核心工具目录：{tools}"
+
+    def _task_messages(self):
+        from app.agent.task_context import current_task_brief
+        from app.prompt.agent_system import EXECUTION_TASK_BRIEF_PREFIX
+        brief = current_task_brief(self._role)
+        return ([{"role": "user", "content": EXECUTION_TASK_BRIEF_PREFIX + json.dumps(brief, ensure_ascii=False)}]
+                if brief else [])
 
     def complete(self, prompt: str, **kwargs: Any) -> str:
         messages = kwargs.pop("messages", None)
         if messages is None:
             messages = [{"role": "user", "content": prompt}]
         return self._service.complete_messages(
-            [{"role": "system", "content": self._system_prompt}, *messages],
+            [{"role": "system", "content": self._system_prompt}, *self._task_messages(), *messages],
             **kwargs,
         )
 
     def complete_messages(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
         return self._service.complete_messages(
-            [{"role": "system", "content": self._system_prompt}, *messages],
+            [{"role": "system", "content": self._system_prompt}, *self._task_messages(), *messages],
             **kwargs,
         )
 
@@ -760,7 +778,7 @@ class _RoleBoundLLM:
     ) -> dict[str, Any]:
         return self._service.complete_tool_call(
             # WHY: 原生 tools 已携带完整契约；JSON 通道仍保留文本目录。
-            [{"role": "system", "content": self._role_prompt}, *messages],
+            [{"role": "system", "content": self._role_prompt}, *self._task_messages(), *messages],
             tools=tools,
             operation=operation,
         )

@@ -79,10 +79,10 @@ runner._runtime_precheck = check
     for name in ("result.json", "paper_retrieval.json", "chunk_retrieval.json", "claim_evidence.csv",
                  "manual_constraints.csv", "root_cause_chain.json", "evaluation_summary.json"):
         assert (output / name).exists()
-    summary = json.loads((output / "evaluation_summary.json").read_text())
+    summary = json.loads((output / "evaluation_summary.json").read_text(encoding="utf-8"))
     assert summary["human_support_rate"]["value"] is None
     assert summary["hard_constraint_adherence"]["value"] is None
-    assert "secret-test-value" not in (output / "run.json").read_text()
+    assert "secret-test-value" not in (output / "run.json").read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("failure", ["configuration", "precheck"])
@@ -133,7 +133,7 @@ runner._perform_task = task
     assert manifest["error_type"] == "RuntimeError"
     assert manifest["primary_pre_registered_run"] is True
     assert manifest["artifact_errors"] == []
-    assert "secret-test-value" not in (output / "run.json").read_text()
+    assert "secret-test-value" not in (output / "run.json").read_text(encoding="utf-8")
     assert "secret-test-value" not in process.stdout + process.stderr
 
 
@@ -365,7 +365,7 @@ runner._perform_task = lambda *args: {'status': 'completed', 'body': 'Synthetic 
     assert rows[0]["text_scope"] == "published"
     assert rows[0]["span_readable"] == "true"
     assert rows[0]["automatic_support"] == "unsupported"
-    summary = json.loads((output / "evaluation_summary.json").read_text())
+    summary = json.loads((output / "evaluation_summary.json").read_text(encoding="utf-8"))
     assert summary["human_support_rate"]["value"] is None
     assert summary["independent_acceptance"] == "pending_human_review"
     assert manifest["requirement_satisfied"] is None

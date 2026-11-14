@@ -19,6 +19,11 @@ class AgentBudgetExceeded(RuntimeError):
     pass
 
 
+class AgentFinalizationRequired(AgentBudgetExceeded):
+    """Soft research stop: return to Main; total budget remains usable for writing."""
+    pass
+
+
 class AgentExecutionCancelled(AgentCancelledError):
     pass
 
@@ -75,6 +80,7 @@ def _runtime_persist_budget(runtime, ledger):
 
 _ACTIVE = ContextVar("research_budget", default=None)
 _ACTION_DEPTH = ContextVar("research_action_depth", default=0)
+_RESEARCH_STAGE = ContextVar("research_stage", default="")
 _LOCK = threading.RLock()
 
 
@@ -87,18 +93,46 @@ def budget_scope(state, should_cancel=None):
     from app.core.config import get_settings
     existing = _ACTIVE.get()
     if existing is not None:
+        import copy
         state["agent_execution_budget"] = existing["ledger"]
-        yield existing
+        parent=existing["state"]
+        if parent.get("effective_config"):
+            state["effective_config"]=copy.deepcopy(parent["effective_config"])
+            if "delivery_mode" in parent:
+                state["delivery_mode"]=parent["delivery_mode"]
+        existing["state"]=state
+        try:
+            yield existing
+        finally:
+            existing["state"]=parent
         return
+    from app.agent.runtime_config import task_settings_scope
+    with task_settings_scope(state):
+        with _budget_scope_impl(state, should_cancel) as execution:
+            yield execution
+
+
+@contextmanager
+def _budget_scope_impl(state, should_cancel):
+    from app.core.config import get_settings
     settings = get_settings()
     ledger = state.setdefault("agent_execution_budget", {})
+    ledger.setdefault("started_at", time.time())
     ledger.setdefault("token_limit", settings.agent_main_token_budget)
+    configured_requests = settings.agent_model_request_limit
+    saved_requests = int(ledger.get("model_request_limit") or 0)
+    # WHY: 恢复继承已用次数与更严格上限；配置0不放宽已保存的正数上限。
+    positive_limits = [n for n in (configured_requests, saved_requests) if n > 0]
+    ledger["model_request_limit"] = min(positive_limits, default=0)
+    ledger.setdefault("retrieval_model_request_limit", settings.retrieval_model_request_limit)
+    ledger.setdefault("main_round_limit", settings.agent_main_max_rounds)
     ledger.setdefault("retrieval_limit", settings.agent_retrieval_budget)
     ledger.setdefault("recovery_limit", settings.recovery_total_action_budget)
     ledger["recovery_used"] = max(int(ledger.get("recovery_used") or 0), int(state.get("recovery_action_count") or 0))
     # WHY: 跨请求保存累计用量；截止时间属于本次执行，不能保存 monotonic 进数据库。
-    execution = {"ledger": ledger, "cancel": should_cancel,
-                 "deadline": time.monotonic() + settings.agent_execution_deadline_seconds}
+    execution = {"ledger": ledger, "state": state, "cancel": should_cancel,
+                 "deadline": time.monotonic() + max(0, settings.agent_execution_deadline_seconds - float(ledger.get("elapsed_seconds") or 0)),
+                 "started": time.monotonic(), "elapsed_base": float(ledger.get("elapsed_seconds") or 0)}
     token = _ACTIVE.set(execution)
     try:
         check_execution()
@@ -114,6 +148,7 @@ def check_execution():
         _runtime_check(runtime)
     current = _ACTIVE.get()
     if current:
+        current["ledger"]["elapsed_seconds"] = current["elapsed_base"] + time.monotonic() - current["started"]
         if current.get("exhausted"):
             raise AgentBudgetExceeded(current["exhausted"])
         if (int(current["ledger"].get("llm_tokens") or 0)
@@ -144,6 +179,16 @@ def consume(kind: str, amount: int = 1):
             _runtime_persist_budget(runtime, ledger)
 
 
+def _check_model_request_budget(current):
+    """调用者持有_LOCK；计数包含LLM预留尝试及每次检索模型HTTP尝试。"""
+    ledger = current["ledger"]
+    limit = int(ledger.get("model_request_limit") or 0)
+    used = int(ledger.get("llm_requests") or 0) + int(ledger.get("retrieval_model_requests") or 0)
+    if limit > 0 and used >= limit:
+        current["exhausted"] = "total model request budget exhausted"
+        raise AgentBudgetExceeded(current["exhausted"])
+
+
 def record_retrieval_request(kind: str):
     """远程 embedding/rerank 每次 HTTP 尝试均计入同一执行账本。"""
     check_execution()
@@ -154,10 +199,13 @@ def record_retrieval_request(kind: str):
 
     with _LOCK:
         ledger = current["ledger"]
+        _check_model_request_budget(current)
+        _guard_finalization(current, requests=1)
         used = int(ledger.get("retrieval_model_requests") or 0)
-        if used >= get_settings().retrieval_model_request_limit:
-            current["exhausted"] = "retrieval model request budget exhausted"
-            raise AgentBudgetExceeded(current["exhausted"])
+        if used >= int(ledger.get("retrieval_model_request_limit", get_settings().retrieval_model_request_limit)):
+            current["state"]["finalization_phase"]="finalizing"
+            current["state"]["finalization_reason"]="retrieval_model_request_limit"
+            raise AgentFinalizationRequired("retrieval model request budget exhausted; finalization allowance retained")
         ledger["retrieval_model_requests"] = used + 1
         ledger[f"retrieval_{kind}_requests"] = int(ledger.get(f"retrieval_{kind}_requests") or 0) + 1
         from app.services.durable_execution_service import active_runtime
@@ -209,6 +257,8 @@ def budgeted_create(client, *, on_response=None, operation="", **kwargs):
                                   ensure_ascii=False).encode("utf-8")) + 128
     reservation = prompt_bound + int(kwargs.get("max_tokens") or 4096)
     with _LOCK:
+        _check_model_request_budget(current)
+        _guard_finalization(current, requests=1, tokens=reservation)
         used = int(ledger.get("llm_tokens") or 0) + int(ledger.get("retrieval_model_tokens") or 0)
         reserved = int(ledger.get("tokens_reserved") or 0)
         if used + reserved + reservation > int(ledger["token_limit"]):
@@ -290,6 +340,9 @@ def research_budget(fn):
         bound.apply_defaults()
         key = "initial_state" if "initial_state" in bound.arguments else "research_state"
         state = dict(bound.arguments.get(key) or {})
+        from app.agent.runtime_config import initialize_delivery
+        if fn.__name__ == "run_research_agent":
+            initialize_delivery(state, str(bound.arguments.get("user_query") or ""), new_task=not bool(state.get("effective_config") or state.get("agent_execution_budget")))
         state["user_operation_sequence"] = int(state.get("user_operation_sequence") or 0) + 1
         bound.arguments[key] = state
         with budget_scope(state, bound.arguments.get("should_cancel")):
@@ -347,3 +400,46 @@ def commit_action(state: dict[str, Any]) -> None:
         return
     ledger = state.setdefault("agent_execution_budget", {})
     ledger["actions_committed"] = int(ledger.get("actions_committed") or 0) + 1
+
+
+@contextmanager
+def research_stage(state, operation):
+    token = _RESEARCH_STAGE.set(operation)
+    try: yield
+    finally: _RESEARCH_STAGE.reset(token)
+
+def finalization_reserve(state):
+    from app.core.config import get_settings
+    settings = get_settings()
+    # WHY: 收尾额度是总账本内尚未动用的额度，与在途预留分开，不增加总预算。
+    material_bytes = len(json.dumps({k:state.get(k) for k in ("paper_cards","claim_plans","review")}, ensure_ascii=False, default=str).encode())
+    return {"requests":settings.agent_finalization_reserve_requests,
+        "tokens":max(settings.agent_finalization_reserve_tokens, material_bytes*2+int(state.get("target_length") or 600)*4),
+        "seconds":settings.agent_finalization_reserve_seconds,
+        "main_rounds":settings.agent_finalization_reserve_main_rounds}
+
+def update_finalization(state, *, requests=0, tokens=0):
+    from app.agent.delivery import draft_first
+    current = active_budget()
+    if not current or not draft_first(state): return False
+    ledger=current["ledger"]
+    reserve=finalization_reserve(state)
+    ledger["finalization_reserve"]=reserve
+    request_limit=int(ledger.get("model_request_limit") or 0)
+    used_requests=int(ledger.get("llm_requests") or 0)+int(ledger.get("retrieval_model_requests") or 0)
+    used_tokens=int(ledger.get("llm_tokens") or 0)+int(ledger.get("retrieval_model_tokens") or 0)+int(ledger.get("tokens_reserved") or 0)
+    reasons=[]
+    if request_limit and request_limit-used_requests-requests <= reserve["requests"]: reasons.append("requests")
+    if int(ledger["token_limit"])-used_tokens-tokens <= reserve["tokens"]: reasons.append("tokens")
+    if current["deadline"]-time.monotonic() <= reserve["seconds"]: reasons.append("deadline")
+    if int(ledger.get("main_round_limit") or 96)-int(ledger.get("decision_rounds") or 0) <= reserve["main_rounds"]: reasons.append("main_rounds")
+    if reasons:
+        state["finalization_phase"]="finalizing"
+        state["finalization_reason"]=",".join(reasons)
+    return state.get("finalization_phase")=="finalizing"
+
+def _guard_finalization(current, *, requests=0, tokens=0):
+    stage=_RESEARCH_STAGE.get()
+    if stage in {"search_and_rank","targeted_search","fetch_metadata","extract_paper_cards","validate_routes","cluster_papers","revise_scope"}:
+        if update_finalization(current["state"], requests=requests, tokens=tokens):
+            raise AgentFinalizationRequired("budget_low: research stopped before consuming finalization reserve")

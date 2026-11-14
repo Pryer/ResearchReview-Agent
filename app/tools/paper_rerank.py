@@ -146,6 +146,7 @@ def llm_rerank_papers(
     cache_namespace: str = "",
     should_cancel=None,
     strict_provider_errors: bool = False,
+    stop_when_sufficient: bool = False,
 ):
     """两段式 LLM 语义重排：对规则粗排后的候选集进行全局 LLM 打分后排序。
 
@@ -438,6 +439,11 @@ def llm_rerank_papers(
                 p["_semantic_contract_complete"] = semantic_contract_complete
             all_scored.append(p)
 
+        # WHY: Small tasks stop once semantically confirmed material reaches the reserve.
+        confirmed=sum(1 for p in all_scored if p.get("_screening_decision") == "include"
+                      and p.get("_topic_relation") in {"direct","near"})
+        if stop_when_sufficient and reserve_target and confirmed >= reserve_target:
+            break
         # --- 自适应加深筛选 ---
         # WHY: 规则粗排的输出被 top_k 截断后，尾部论文再也不会被 LLM 看过；
         # 排除率一高（实测 64 篇排除 34 篇）候选池就补不回引用缺口，只能靠

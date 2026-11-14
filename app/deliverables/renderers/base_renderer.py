@@ -95,9 +95,11 @@ def _write_sections_in_chinese(
     if len(sections) != len(plan.sections):
         return draft
 
-    max_workers = min(3, max(1, len(sections)))
+    from app.core.config import get_settings
+    max_workers = min(get_settings().writer_section_max_workers, max(1, len(sections)))
     completed: dict[str, str] = {}
     diagnostics: list[dict[str, Any]] = []
+    audit_events = []
     survey_papers = _survey_papers(cards)
     # 检查是否有 Claim Plan 约束
     claim_plans = state.get("claim_plans") or []
@@ -113,7 +115,14 @@ def _write_sections_in_chinese(
                 "required_citations": len(_citation_ids(retained)),
             }
         original = sections[section.id]
-        required_ids = _citation_ids(original)
+        from app.services.writer_support import substantive, normalize_writer_citations
+        required_ids = list(dict.fromkeys([*_citation_ids(original),
+            *_allocation_by_section(plan, state, cards).get(section.id, [])]))
+        section_ids = set(section.supporting_paper_ids) | set(required_ids)
+        section_cards = [c for c in cards if c.get('paper_id') in section_ids]
+        if not required_ids and state.get('claim_plans'):
+            required_ids = [c['paper_id'] for c in section_cards if c.get('claims')]
+        trusted_numbers = {str(i): c['paper_id'] for i, c in enumerate(section_cards, 1)}
         force_targets = {
             str(value) for value in state.get("target_section_ids") or [] if value
         }
@@ -125,7 +134,7 @@ def _write_sections_in_chinese(
             and not required_ids
             and not _english_sentences(original)
             and not re.search(r"论文明确报告|从其他纳入证据看", original)
-            and len(re.sub(r"^#{2,4}[^\n]*", "", original).strip()) >= 20
+            and substantive(original)
         ):
             return section.id, original, {
                 "section_id": section.id,
@@ -160,12 +169,14 @@ def _write_sections_in_chinese(
             claim_constraints=_claim_constraints_for_title(claim_plans, section.title),
             require_cross_route_synthesis=_requires_cross_route_synthesis(plan, section.id),
         )
+        prompt += "\n【本节授权声明及使用边界】\n" + json.dumps(section_cards, ensure_ascii=False)
+        prompt += "\n【本次可信引用标签表】\n" + json.dumps(trusted_numbers, ensure_ascii=False)
         last_errors: list[str] = []
         previous_candidate = ""
         best_candidate = ""
         best_score = float("-inf")
         attempts_made = 0
-        for attempt in range(3):
+        for attempt in range(get_settings().writer_section_attempts):
             retry_context = ""
             if last_errors:
                 retry_context = (
@@ -194,6 +205,10 @@ def _write_sections_in_chinese(
                     raise
                 last_errors = [f"模型调用失败：{exc}"]
                 continue
+            audit = {'stage': f'section:{section.id}:attempt_{attempt + 1}', 'raw': response,
+                     'normalized': response, 'errors': ['section_validation_incomplete']}
+            audit_events.append(audit)
+            response, protocol_issues = normalize_writer_citations(response, section_cards, trusted_numbers=trusted_numbers)
             candidate = _strip_agent_process_clauses(
                 normalize_citation_syntax(
                     _clean_section_response(
@@ -205,6 +220,8 @@ def _write_sections_in_chinese(
             last_errors = _validate_rewritten_section(
                 candidate, section.title, required_ids, section.heading_level or 2
             )
+            last_errors.extend(i['reason'] for i in protocol_issues)
+            audit.update(normalized=candidate, errors=list(last_errors))
             score = _section_candidate_score(
                 candidate, section.title, required_ids, section.heading_level or 2
             )
@@ -232,6 +249,7 @@ def _write_sections_in_chinese(
                     required_ids=required_ids,
                     english_sentences=english_residue,
                 )
+                localized_prompt += "\n【本次可信引用标签表】\n" + json.dumps(trusted_numbers, ensure_ascii=False)
                 localized_response = llm.complete(
                     localized_prompt,
                     temperature=0.0,
@@ -241,7 +259,11 @@ def _write_sections_in_chinese(
                         f"{section.id}"
                     ),
                 )
+                localized_audit = {'stage': f'section:{section.id}:english_repair', 'raw': localized_response,
+                    'normalized': localized_response, 'errors': ['section_validation_incomplete']}
+                audit_events.append(localized_audit)
                 attempts_made += 1
+                localized_response, localized_protocol = normalize_writer_citations(localized_response, section_cards, trusted_numbers=trusted_numbers)
                 localized = _strip_agent_process_clauses(
                     normalize_citation_syntax(
                         _clean_section_response(
@@ -258,6 +280,8 @@ def _write_sections_in_chinese(
                     required_ids,
                     section.heading_level or 2,
                 )
+                localized_errors.extend(i['reason'] for i in localized_protocol)
+                localized_audit.update(normalized=localized, errors=list(localized_errors))
                 if not localized_errors:
                     return section.id, localized, {
                         "section_id": section.id,
@@ -362,6 +386,11 @@ def _write_sections_in_chinese(
                 "status": "conservative_evidence_fill",
             })
 
+    from app.services.writer_support import record_candidate
+    # WHY: 章节线程只收集响应，SQLite/Artifact写入回到所属线程，避免共享Session并发写。
+    for audit in audit_events:
+        record_candidate(state, plan, audit['stage'], audit['raw'], audit['normalized'],
+                         {'valid': not audit['errors'], 'errors': audit['errors']})
     state.setdefault("writer_section_diagnostics", []).append({
         "deliverable_type": plan.deliverable_type.value,
         "sections": sorted(diagnostics, key=lambda item: item["section_id"]),
@@ -1676,10 +1705,14 @@ class BaseRenderer:
                 fallback, plan, state, cards, llm
             )
             sectionwise = _strip_evidence_meta_language(sectionwise)
-            sectionwise = _strip_stray_numeric_citations(sectionwise)
+            from app.services.writer_support import normalize_writer_citations, record_candidate
+            sectionwise, citation_issues = normalize_writer_citations(sectionwise, cards)
+            state.setdefault('writer_attempt_issues', []).extend(citation_issues)
             from app.tools.validate_deliverable import validate_deliverable
 
             sectionwise_validation = validate_deliverable(sectionwise, plan, state)
+            state['selected_candidate_id'] = record_candidate(state, plan, 'sectionwise_assembled',
+                sectionwise, sectionwise, sectionwise_validation, issues=citation_issues)
             _record_writer_diagnostic(
                 state,
                 plan,
@@ -1691,134 +1724,96 @@ class BaseRenderer:
             # 最终质量门禁如实报告。此前这里有一个两分支都 return 的死条件。
             return sectionwise
 
-        llm_responded = False
+        from app.services.writer_support import record_candidate, normalize_writer_citations, substantive
+        from app.tools.validate_deliverable import validate_deliverable
+        from app.agent.execution_budget import is_control_exception
+        candidates = []
+        trusted_numbers = {str(i): c["paper_id"] for i, c in enumerate(cards, 1)}
+        def evaluate(raw, stage):
+            record_candidate(state, plan, stage + ":received", raw, raw, {"valid": False, "errors": [], "pending_validation": True})
+            normalized, issues = normalize_writer_citations(raw, cards, trusted_numbers=trusted_numbers)
+            validation = validate_deliverable(normalized, plan, state)
+            if issues:
+                validation = {**validation, "valid": False,
+                    "errors": [*(validation.get("errors") or []), *[i["reason"] for i in issues]]}
+            cid = record_candidate(state, plan, stage, raw, normalized, validation, issues=issues)
+            candidates.append((normalized, validation, issues, cid))
+            return normalized, validation, issues, cid
+
         survey_papers = _survey_papers(cards)
         if llm is not None:
-            try:
-                from app.prompt.writing.deliverable import WRITER_PROMPT
+            from app.prompt.writing.deliverable import WRITER_PROMPT
+            writer_prompt = WRITER_PROMPT.format(
+                spec_json=spec.model_dump_json(), deliverable_boundary=deliverable_boundary,
+                plan_json=plan.model_dump_json(), claims_json=json.dumps(cards, ensure_ascii=False),
+                synthesis_json=json.dumps(safe_synthesis, ensure_ascii=False),
+                search_report_json=json.dumps(state.get("search_report") or {}, ensure_ascii=False),
+                profile_json=json.dumps(state.get("user_paper_profile") or {}, ensure_ascii=False),
+                canonical_topic=str(state.get("canonical_topic") or state.get("topic") or ""),
+                evidence_report_json=json.dumps(state.get("evidence_quality_report") or {}, ensure_ascii=False),
+                citation_plan_json=json.dumps(state.get("citation_allocation_plan") or {}, ensure_ascii=False),
+                style_guidance=style_guidance, blueprint_json=json.dumps(plan_blueprints, ensure_ascii=False),
+                survey_papers_json=json.dumps(survey_papers, ensure_ascii=False))
+            writer_prompt += "\n【执行协议】内部正文使用[paper_id]，不生成文末书目；引用模块统一转换公开格式。以WritingPlan.target_char_range为本轮字数目标。"
+            writer_prompt += "\n【本次输入的可信引用标签表】可逐字复制完整paper_id，或使用[P1]/[1]等表内标签；生成器会按此表还原完整ID，未知标签将拒绝：\n" + json.dumps(trusted_numbers, ensure_ascii=False)
+            prior_body = str(state.get('citation_source_text') or state.get('review') or '')
+            recovery = state.get('active_quality_recovery') or {}
+            if recovery.get('issues'):
+                from app.prompt.writing.deliverable import TARGETED_REPAIR_INSTRUCTION
+                writer_prompt += TARGETED_REPAIR_INSTRUCTION.format(repair_json=json.dumps({
+                    'target_section_ids': state.get('target_section_ids') or recovery.get('target_section_ids') or [],
+                    'target_claim_ids': recovery.get('target_claim_ids') or [],
+                    'issues': recovery['issues']}, ensure_ascii=False))
+            if prior_body:
+                writer_prompt += "\n【当前选定基稿，供按问题修改；不能视为事实来源】\n" + prior_body[:16000]
+                if len(prior_body) > 16000:
+                    writer_prompt += "\n基稿展示已截断；只修改指定节，完整历史按候选引用读取。"
+            writer_prompt += "\n【独立核验发现的问题】\n" + json.dumps(
+                (state.get('check_report') or {}).get('issues') or state.get('writer_attempt_issues') or [], ensure_ascii=False)
+            for stage, operation in (("initial", "write_deliverable"), ("repair", "repair_deliverable")):
+                prompt = writer_prompt
+                if candidates:
+                    last = candidates[-1]
+                    prompt += "\n【上次候选具体失败项】\n" + json.dumps(last[1].get("errors") or [], ensure_ascii=False)
+                    prompt += "\n【隔离候选，请按失败项修改，返回全部计划正文】\n" + last[0][:16000]
+                try:
+                    raw = llm.complete(prompt, temperature=0.1 if stage == "initial" else 0.05,
+                        operation=f"{operation}:{plan.deliverable_type.value}")
+                except Exception as exc:
+                    if is_control_exception(exc):
+                        raise
+                    issue = {"code": "writer_execution_error", "reason": f"{stage}:{type(exc).__name__}"}
+                    state.setdefault("writer_attempt_issues", []).append(issue)
+                    record_candidate(state, plan, stage, "", "", {"valid": False, "errors": [issue["reason"]]}, issues=[issue])
+                    break
+                item = evaluate(raw, stage)
+                if item[1].get("valid") and _citation_target_met(item[0], plan):
+                    state["selected_candidate_id"] = item[3]
+                    return item[0]
 
-                writer_prompt = WRITER_PROMPT.format(
-                    spec_json=spec.model_dump_json(),
-                    deliverable_boundary=deliverable_boundary,
-                    plan_json=plan.model_dump_json(),
-                    claims_json=json.dumps(cards, ensure_ascii=False),
-                    synthesis_json=json.dumps(safe_synthesis, ensure_ascii=False),
-                    search_report_json=json.dumps(state.get("search_report") or {}, ensure_ascii=False),
-                    profile_json=json.dumps(state.get("user_paper_profile") or {}, ensure_ascii=False),
-                    canonical_topic=str(state.get("canonical_topic") or state.get("topic") or ""),
-                    evidence_report_json=json.dumps(state.get("evidence_quality_report") or {}, ensure_ascii=False),
-                    citation_plan_json=json.dumps(state.get("citation_allocation_plan") or {}, ensure_ascii=False),
-                    style_guidance=style_guidance,
-                    blueprint_json=json.dumps(plan_blueprints, ensure_ascii=False),
-                    survey_papers_json=json.dumps(survey_papers, ensure_ascii=False),
-                )
-                text = llm.complete(
-                    writer_prompt,
-                    temperature=0.1,
-                    operation=f"write_deliverable:{plan.deliverable_type.value}",
-                )
-                llm_responded = bool(text)
-                if text and all(_section_heading(section) in text for section in plan.sections):
-                    normalized = _strip_stray_numeric_citations(
-                        _strip_evidence_meta_language(
-                            _normalize_evidence_citations(text.strip(), cards)
-                        )
-                    )
-                    from app.tools.validate_deliverable import validate_deliverable
-                    validation = validate_deliverable(normalized, plan, state)
-                    citation_ok = _citation_target_met(normalized, plan)
-
-                    if validation.get("valid") and citation_ok:
-                        return normalized
-
-                    blocking_errors = [
-                        e for e in (validation.get("errors") or [])
-                        if not any(kw in e for kw in [
-                            "计划外章节", "出现计划外章节", "过多实验指标"
-                        ])
-                    ]
-                    if not blocking_errors and citation_ok and len(normalized) > 800:
-                        return normalized
-
-                    required_ids = _allocated_paper_ids(state)
-                    cited_ids = set(re.findall(r"\[([^\]]+)\]", normalized))
-                    missing_ids = [
-                        paper_id for paper_id in required_ids if paper_id not in cited_ids
-                    ]
-                    repair_prompt = (
-                        writer_prompt
-                        + "\n\n【首稿机器校验未通过，请完整重写，不要解释】\n"
-                        + f"校验错误：{json.dumps(validation.get('errors') or [], ensure_ascii=False)}\n"
-                        + f"尚未引用的计划论文：{json.dumps(missing_ids, ensure_ascii=False)}\n"
-                        + "必须重新输出全部计划章节；逐章落实 citation_allocation_plan 中的 paper_ids，"
-                        + "保持中文综合表达，不复制英文原句，不得在文末追加引用凑数段。\n"
-                        + "首稿仅供识别问题，不得直接沿用其不合格结构：\n"
-                        + normalized[:12000]
-                    )
-                    repaired = llm.complete(
-                        repair_prompt,
-                        temperature=0.05,
-                        operation=f"repair_deliverable:{plan.deliverable_type.value}",
-                    )
-                    llm_responded = llm_responded or bool(repaired)
-                    if repaired and all(
-                        _section_heading(section) in repaired for section in plan.sections
-                    ):
-                        repaired = _strip_stray_numeric_citations(
-                            _strip_evidence_meta_language(
-                                _normalize_evidence_citations(repaired.strip(), cards)
-                            )
-                        )
-                        repaired_validation = validate_deliverable(repaired, plan, state)
-                        if repaired_validation.get("valid") and _citation_target_met(
-                            repaired, plan
-                        ):
-                            return repaired
-            except Exception:
-                pass
+        # WHY: 确定性模板也必须有诊断；英文授权不能直接转述时，保留实际长稿供Main/Check恢复。
         fallback = self.render_fallback(plan, safe_state, cards)
-        fallback = _ensure_citation_coverage(fallback, plan, cards)
-        if llm is not None and llm_responded:
+        evaluate(fallback, "fallback")
+        if llm is not None and any(item[0].strip() for item in candidates[:-1]):
+            best = min((item for item in candidates[:-1] if item[0].strip()),
+                       key=lambda x: (len(x[1].get("errors") or []), len(x[2])))
             try:
-                from app.tools.validate_deliverable import validate_deliverable
-
-                fallback_validation = validate_deliverable(fallback, plan, state)
-                if not fallback_validation.get("valid"):
-                    required_ids = _allocated_paper_ids(state)
-                    polish_prompt = f"""你是中文学术编辑。请将下面的证据约束草稿完整改写为流畅的中文综合段落。
-
-硬性要求：
-1. 保留全部计划标题、标题层级及其顺序，不增加总标题或计划外章节。
-2. 英文证据必须忠实转述为中文；模型名、缩写和数据集名可保留英文。
-3. 必须保留以下每一个引用编号，不能遗漏、替换或新增：
-{json.dumps(required_ids, ensure_ascii=False)}
-4. 不得逐篇罗列，不得出现“论文明确报告”或文末引用凑数段；应在每节内按共同问题、方法或发现综合组织。
-5. 只使用草稿已有事实，不补充推测，不输出解释或修改说明。
-
-以下脱敏少样本只示范写法，不是事实证据；不得输出其中的〈占位内容〉或〔证据A〕：
-{json.dumps(plan_blueprints, ensure_ascii=False)}
-
-草稿：
-{fallback}
-"""
-                    polished = llm.complete(
-                        polish_prompt,
-                        temperature=0.05,
-                        operation=f"polish_fallback:{plan.deliverable_type.value}",
-                    )
-                    if polished and all(
-                        _section_heading(section) in polished for section in plan.sections
-                    ):
-                        polished = _strip_stray_numeric_citations(
-                            _strip_evidence_meta_language(
-                                _normalize_evidence_citations(polished.strip(), cards)
-                            )
-                        )
-                        polished_validation = validate_deliverable(polished, plan, state)
-                        if polished_validation.get("valid") and _citation_target_met(
-                            polished, plan
-                        ):
-                            return polished
-            except Exception:
-                pass
-        return fallback
+                polished = llm.complete(writer_prompt + "\n【最后一次有界修复，保持内部引用协议】\n"
+                    + json.dumps(best[1].get("errors") or [], ensure_ascii=False) + "\n" + best[0][:16000],
+                    temperature=0.05, operation=f"polish_fallback:{plan.deliverable_type.value}")
+                evaluate(polished, "polish")
+            except Exception as exc:
+                if is_control_exception(exc):
+                    raise
+                state.setdefault("writer_attempt_issues", []).append({"code": "writer_execution_error",
+                    "reason": f"polish:{type(exc).__name__}"})
+        viable = [item for item in candidates if substantive(item[0])]
+        if not viable:
+            state.setdefault("writer_attempt_issues", []).append({"code": "writer_no_substantive_candidate",
+                "reason": "模型与fallback均未形成实质正文，失败尝试已保存"})
+            return ""
+        # WHY: 选择仅决定下轮诊断/修复基稿，任何不合格稿仍须经独立Check且不能发布。
+        best = min(viable, key=lambda x: (not x[1].get("valid", False), len(x[1].get("errors") or []), len(x[2])))
+        state["selected_candidate_id"] = best[3]
+        state["writer_attempt_issues"] = [*state.get("writer_attempt_issues", []), *best[2]]
+        return best[0]

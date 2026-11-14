@@ -14,13 +14,19 @@ from app.agent.react_context import ReActContext, execute_context_recall
 from app.agent.sidecar import ActionSidecar
 from app.agent.delegation_context import context_packet, subagent_context
 from app.core.config import get_settings
-from app.prompt.agent_system import SYSTEM_PROMPTS, SUBAGENT_REACT_PROMPT
+from app.core.exceptions import LLMInvocationError
+from app.prompt.agent_system import SYSTEM_PROMPTS, SUBAGENT_REACT_PROMPT, SUBAGENT_REPORT_REPAIR_HINT
 from app.schemas.agent_message_schema import AgentMessage, SubagentReport
 from app.schemas.agent_task_schema import AgentRole, AgentTaskResult, AgentTaskStatus, AgentTaskOutcome
 
 
 def _validate(name, arguments):
     if name == "report_to_main":
+        message = arguments.get("message")
+        limit = SubagentReport.model_json_schema()["properties"]["message"]["maxLength"]
+        if isinstance(message, str) and len(message) > limit:
+            # WHY: 不截断或放宽上限；只返回实际长度和修复提示，避免错误回显整段汇报。
+            raise ValueError(f"report_to_main.message length {len(message)} exceeds {limit}. " + SUBAGENT_REPORT_REPAIR_HINT)
         report = SubagentReport.model_validate(arguments)
         if not report.message.strip():
             raise ValueError("report message must not be blank")
@@ -78,13 +84,14 @@ class SubagentLoop:
         self.sidecar = ActionSidecar(llm)
 
     def run(self, state, *, decision=None, handlers, should_cancel=None,
-            consume_mandatory_action=False, required_first=False):
+            consume_mandatory_action=False, required_first=False, decision_context=None):
         # WHY: 当前共享研究状态只支持串行；新委派不能冒用已有角色活动轨迹，恢复必须 decision=None。
         if decision is not None and state.get("active_subagent"):
             raise AgentDecisionError("another delegation is active; resume it explicitly")
         try:
             return self._run(state, decision=decision, handlers=handlers, should_cancel=should_cancel,
-                             consume_mandatory_action=consume_mandatory_action, required_first=required_first)
+                             consume_mandatory_action=consume_mandatory_action, required_first=required_first,
+                             decision_context=decision_context)
         except Exception as exc:
             role = state.get("active_subagent")
             if role:
@@ -93,20 +100,39 @@ class SubagentLoop:
             raise
 
     def _run(self, state, *, decision, handlers, should_cancel,
-             consume_mandatory_action, required_first):
+             consume_mandatory_action, required_first, decision_context):
         if state.get("active_subagent"):
             role = state["active_subagent"]
+            old = _session(state, role).get("active") or {}
+            if role == "analysis" and old.get("operation") == "validate_result":
+                if "validate_result" in (old.get("completed_operations") or []):
+                    return self._finish(state, role, "needs_help", "历史核验已执行；请Main按当前版本决定是否委派Check复验。")
+                from app.schemas.agent_decision_schema import AgentDecision
+                _session(state, role)["last_delegation"] = copy.deepcopy(old)
+                _session(state, role).pop("active", None)
+                state.pop("active_subagent")
+                decision = AgentDecision(action="validate_result", arguments={}, reason=old.get("objective") or "恢复核验")
+                return self._run(state, decision=decision, handlers=handlers, should_cancel=should_cancel,
+                    consume_mandatory_action=old.get("consume_mandatory_action", False),
+                    required_first=True, decision_context=None)
         else:
             spec = ACTION_REGISTRY[decision.action]
             role = spec.role.value
             from app.agent.main_loop import _progress_fingerprint
             progress = _progress_fingerprint(state)
-            packet = context_packet(state, decision)
-            _session(state, role)["active"] = {
+            try:
+                packet = context_packet(state, decision, decision_context=decision_context)
+            except ValueError as exc:
+                raise AgentDecisionError(str(exc)) from exc
+            from app.agent.delegation_memory import prepare_work_context, begin_delegation
+            _session(state, role)
+            work_context = prepare_work_context(state, role)
+            begin_delegation(state, role)
+            _session(state, role)['active'] = {
                 "id": uuid4().hex, "operation": decision.action,
                 "objective": decision.reason or spec.description,
                 "arguments": copy.deepcopy(decision.arguments),
-                "context_packet": packet,
+                "context_packet": packet, "work_context": work_context,
                 "evidence_refs": list(decision.evidence_refs),
                 "source_fingerprint": context_source_fingerprint(state),
                 "goal_fingerprint": _stable_hash(_goal(state).model_dump(mode="json")),
@@ -142,6 +168,15 @@ class SubagentLoop:
             if should_cancel and should_cancel():
                 raise AgentExecutionCancelled("subagent cancelled")
             active = _session(state, role)["active"]
+            last = active.get("last_result") or {}
+            if (settings.agent_deterministic_subagent_report and "delivery_mode" in state
+                    and active["operation"] in active["completed_operations"] and last.get("status") == "completed"):
+                outcome = str(last.get("outcome") or "unknown")
+                status = "completed" if outcome == "succeeded" else "needs_help"
+                suggestions = [item["action"] for item in last.get("suggested_actions") or []
+                               if item.get("action") in ACTION_REGISTRY]
+                return self._finish(state, role, status,
+                    "; ".join(str(x) for x in last.get("findings") or []) or f"{active['operation']}已提交，业务状态：{outcome}", suggestions)
             if active["goal_fingerprint"] != _stable_hash(_goal(state).model_dump(mode="json")):
                 return self._finish(state, role, "needs_help", "用户目标已更新，请主控重新委派。")
             if active["rounds"] >= settings.agent_subagent_max_rounds:
@@ -173,10 +208,41 @@ class SubagentLoop:
             context = self._context(state, role, names, available)
             active["rounds"] += 1
             ledger = state.setdefault("agent_execution_budget", {})
-            ledger["subagent_decision_rounds"] = int(ledger.get("subagent_decision_rounds") or 0) + 1
+            direct = settings.agent_deterministic_subagent_execute and "delivery_mode" in state
+            ledger["subagent_dispatch_rounds"] = int(ledger.get("subagent_dispatch_rounds") or 0) + 1
+            if not direct:
+                ledger["subagent_decision_rounds"] = int(ledger.get("subagent_decision_rounds") or 0) + 1
             # WHY: 恢复后继续原委派的轮数与已提交观察，不重置局部预算或重放已完成动作。
             _checkpoint(state)
-            chosen = policy.decide(context, allowed_actions=available, trajectory=trajectory)
+            from app.services.execution_report_capture import record_delegation
+            record_delegation(state,role,active)
+            try:
+                if direct:
+                    if required not in available:
+                        return self._finish(state,role,"needs_help","本次授权动作在当前状态不可执行，请Main重新规划。")
+                    from app.schemas.agent_decision_schema import AgentDecision
+                    chosen=AgentDecision(action=required,arguments=copy.deepcopy(active["arguments"]),reason=active["objective"])
+                    trajectory.proposed(chosen)
+                else:
+                    chosen = policy.decide(context, allowed_actions=available, trajectory=trajectory)
+            except (AgentDecisionError, LLMInvocationError) as exc:
+                from app.agent.execution_budget import is_control_exception
+                if is_control_exception(exc):
+                    raise
+                last = active.get("last_result") or {}
+                if required in active["completed_operations"] and last.get("status") == "completed":
+                    # WHY: 操作已原子提交，汇报失败不能重放或抹掉结果；显式needs_help交回Main处理。
+                    trajectory.observe({"status": "rejected", "error": "subagent_report_protocol_failed",
+                                        "detail": str(exc)[:240]})
+                    return self._finish(state, role, "needs_help",
+                        f"{required}已提交，但汇报协议未通过有界纠错（{str(exc)[:200]}）。请主控依据结构化结果和当前门禁决定下一步；不要重复本次工具。")
+                if isinstance(exc, LLMInvocationError):
+                    # WHY: 尚未执行的模型通信失败交回Main选择重试；余额/预算/失权已在上方透传。
+                    active["last_result"] = {"status": "failed", "outcome": "blocked", "operation": required,
+                        "error": str(exc)[:500], "issues": [{"code": "subagent_decision_failed", "reason": str(exc)[:500]}]}
+                    trajectory.observe(active["last_result"])
+                    return self._finish(state, role, "needs_help", f"{required}尚未执行，模型决策失败，请Main决定是否重试。")
+                raise
             check_execution()
             active = _session(state, role)["active"]
             if chosen.action == "recall_context":
@@ -208,17 +274,29 @@ class SubagentLoop:
                         return self._finish(state, role, "needs_help", review.reason)
                     continue
             spec = ACTION_REGISTRY[chosen.action]
-            result = self.controller.execute(
-                role=spec.role, operation=chosen.action, objective=chosen.reason or active["objective"],
-                state=state, handler=lambda working: handlers[chosen.action](working, chosen.arguments),
-                constraints=chosen.arguments, expected_output=list(spec.output_fields),
-                input_artifact_refs=(chosen.evidence_refs or active["evidence_refs"]
-                                     if chosen.action == required else chosen.evidence_refs),
-                should_cancel=should_cancel,
-                consume_mandatory_action=bool(active["consume_mandatory_action"]
-                    and chosen.action == required and required not in active["completed_operations"]),
-                invalidate_evidence=True,
-            )
+            try:
+                result = self.controller.execute(
+                    role=spec.role, operation=chosen.action, objective=active["objective"],
+                    state=state, handler=lambda working: handlers[chosen.action](working, chosen.arguments),
+                    constraints=chosen.arguments, expected_output=list(spec.output_fields),
+                    input_artifact_refs=(chosen.evidence_refs or active["evidence_refs"]
+                                         if chosen.action == required else chosen.evidence_refs),
+                    should_cancel=should_cancel,
+                    consume_mandatory_action=bool(active["consume_mandatory_action"]
+                        and chosen.action == required and required not in active["completed_operations"]),
+                    invalidate_evidence=True,
+                )
+            except Exception as exc:
+                from app.agent.execution_budget import is_control_exception
+                if is_control_exception(exc):
+                    raise
+                raw = getattr(exc, "agent_task_result", None) or {
+                    "status": "failed", "outcome": "blocked", "operation": chosen.action,
+                    "error": str(exc)[:500], "issues": [{"code": "execution_failed", "reason": str(exc)[:500]}],
+                }
+                active["last_result"] = raw
+                trajectory.observe(raw)
+                return self._finish(state, role, "needs_help", f"{chosen.action}执行失败：{type(exc).__name__}；请Main选择恢复动作。")
             # 无持久化 runtime 或命中幂等结果时仍记录；已原子记录的观察不会重复。
             record_subagent_observation(state, result.model_dump(mode="json"))
             if result.status != AgentTaskStatus.COMPLETED:
@@ -234,13 +312,28 @@ class SubagentLoop:
         active = session["active"]
         _message(state, role, status, message, suggestions)
         last = active.get("last_result") or {}
+        executed = active['operation'] in active.get('completed_operations', []) and last.get('status') == 'completed'
+        if not executed:
+            last = {**last, 'issues': [*last.get('issues', []), {'code': 'delegated_action_not_executed',
+                'reason': '本次委派没有完成工具观察；历史执行不能替代本次执行', 'recoverable': True}]}
+            message = '本次尚未执行' + active['operation'] + '。子Agent报告（未验证）：' + message
+        typed_suggestions = copy.deepcopy(last.get("suggested_actions") or [])
+        for action in suggestions:
+            if action not in {item["action"] for item in typed_suggestions}:
+                typed_suggestions.append({"action": action, "reason": message[:300]})
         result = AgentTaskResult(
             task_id=active["id"], role=AgentRole(role), operation=active["operation"],
             status=AgentTaskStatus.COMPLETED,
-            outcome=(AgentTaskOutcome((active.get("last_result") or {}).get("outcome", "unknown"))
-                     if status == "completed" else AgentTaskOutcome.BLOCKED),
+            outcome=(AgentTaskOutcome.BLOCKED if status == "blocked" else
+                     AgentTaskOutcome(last.get("outcome", "unknown")) if last else AgentTaskOutcome.UNKNOWN),
             delegation_status=status,
             findings=[message],
+            proposed_decisions=copy.deepcopy(last.get("proposed_decisions") or []),
+            issues=copy.deepcopy(last.get("issues") or []),
+            suggested_actions=typed_suggestions,
+            check_report_ref=last.get("check_report_ref"),
+            output_artifact_refs=list(last.get("output_artifact_refs") or []),
+            error=last.get("error"),
             evidence_refs=list(last.get("evidence_refs") or []),
             changed_state_fields=list(last.get("changed_state_fields") or []),
             usage=dict(last.get("usage") or {}),
@@ -251,8 +344,14 @@ class SubagentLoop:
         )
         ReActContext(state, namespace=role).observe({"status": status, "findings": [message]})
         ReActContext(state).observe(result.model_dump(mode="json"))
+        from app.agent.delegation_memory import complete_work_context
+        complete_work_context(state, role, {**result.model_dump(mode='json'),
+            'findings': copy.deepcopy(last.get('findings') or ['本次没有已提交工具观察']),
+            'task_executed': executed, 'model_report': message[:300]})
         session["last_delegation"] = copy.deepcopy(active)
         session.pop("active")
         state.pop("active_subagent")
         _checkpoint(state)
+        from app.services.execution_report_capture import record_delegation_result
+        record_delegation_result(state,role,active,result)
         return result

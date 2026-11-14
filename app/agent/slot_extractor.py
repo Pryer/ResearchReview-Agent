@@ -66,6 +66,7 @@ def extract_slots(
         requested_sections=extract_requested_sections(user_query, intent_str),
         language=extract_language(user_query),
         citation_style=extract_citation_style(user_query),
+        target_length=extract_target_length(user_query),
     )
 
     # LLM 只补充规则无法稳定提取的主题。年份和篇数必须来自用户原文，
@@ -83,6 +84,14 @@ def extract_slots(
             logger.warning("LLM slot extraction failed: %s", e)
 
     return slot
+
+
+def extract_target_length(user_query: str) -> int | None:
+    matches = list(re.finditer(r"(?<![\d.])(\d{2,6})\s*(?:字|words?\b)", user_query, re.I))
+    # WHY: 多项分别指定时不能把最后一项当全文目标；此类要求交分项规划。
+    if len(matches) != 1 or re.search(r"分别|各(?:写|约|为)?\s*\d", user_query):
+        return None
+    return int(matches[0].group(1))
 
 
 def extract_requested_sections(user_query: str, intent: str = "generate_review") -> list[str]:
@@ -121,6 +130,14 @@ def extract_topic(user_query: str) -> Optional[str]:
     策略：找到「关于/针对/调研/检索 ... 相关」中的主题部分。
     未匹配时返回 None 让 LLM 补充。
     """
+    # WHY: 无分隔符、年份或交付要求的短语优先作为裸主题；不能把其中的
+    # “检索／研究”自动解释成命令（例如检索增强生成、研究方法）。
+    bare = str(user_query or "").strip()
+    if (re.match(r"^(?:检索|研究)\S", bare) and len(bare) <= 40
+            and not re.search(r"论文|文献|综述|研究背景|研究现状|相关工作|\d|[，。,.;；!?！？\n]", bare)):
+        candidate = _clean_topic(bare)
+        if has_topic_content(candidate):
+            return candidate
     patterns = [
         r"(?:关于|针对)([^，。,.\n]{2,40}?)(?:的)?(?:文献综述|综述|survey|review)",
         r"(?:找几篇|找|推荐一些|推荐)(?:关于|有关)?([^，。,.\n]{2,40}?)(?:相关)?(?:的)?(?:论文|paper|papers)",
@@ -188,9 +205,10 @@ def _clean_topic(topic: str) -> str:
         topic,
         flags=re.IGNORECASE,
     )
-    topic = re.sub(r"(?:并)?(?:生成|写|输出).*$", "", topic)
+    # WHY: “检索增强生成／生成式模型”中的生成是主题；仅截断明确交付指令。
+    topic = re.sub(r"(?:并(?:生成|写|输出)|(?:生成|写|输出)(?=(?:一篇|一个|一份)?(?:中文|英文)?(?:文献综述|综述|研究背景|研究现状|相关工作|正文))).*$", "", topic)
     # 主题不含并列子句：“综述并引用30篇”类捕获的“并…”部分是请求参数
-    topic = re.sub(r"并.*$", "", topic)
+    topic = re.sub(r"并(?=引用|提供|撰写|检索|生成|写|输出|分析|给出|总结).*$", "", topic)
     topic = re.sub(
         r"(?:论文|文献)?\s*\d+\s*(?:[-~—到至]\s*\d+)?\s*篇.*$",
         "",
@@ -307,14 +325,17 @@ def _derive_count_targets(required_reference_count: int, explicit: bool) -> tupl
     检索循环是否停止还要同时满足证据覆盖；这里的目标仅提供去重、筛选和
     重排损耗所需的候选余量，不能把显式引用要求机械放大为三倍。
 
-    余量比例由实测损耗定标：文献形态复核、元数据核验、证据卡片降级与引用
+    显式引用任务默认以约2倍合格候选为目标，首批详情/制卡仍由独立证据池策略控制。
+    大额请求继续受40篇绝对余量上限约束，避免自动放大外部调用。
+
+    历史余量比例由实测损耗定标：文献形态复核、元数据核验、证据卡片降级与引用
     分配逐级筛除。2026-09-01 实测 45 篇证据卡片 → 32 篇可用 → 25 篇被引用，
     端到端成品率约 0.556，即 40 篇引用要求需要约 72 篇候选池。0.60 的余量
     只到 64，恰好在天花板处夹住池目标，显式引用要求系统性不达标。
     ``min(40, ...)`` 上限保证大额请求不被无节制放大（200 篇仍为 240）。
     """
     required_reference_count = max(1, int(required_reference_count or 30))
-    margin_ratio = 0.80 if explicit else 0.40
+    margin_ratio = 1.0 if explicit else 0.50
     safety_margin = max(5, min(40, math.ceil(required_reference_count * margin_ratio)))
     retrieval_target = required_reference_count + safety_margin
     generation_limit = retrieval_target

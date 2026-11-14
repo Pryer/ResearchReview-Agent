@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from app.core.config import get_settings
+from app.agent.quality_feedback import quality_feedback
 from app.utils.search_constraints import search_count_bounds, exact_search_title
 from app.schemas.context_schema import (
     AgentStateContext,
@@ -36,6 +37,7 @@ def context_source_payload(state: dict[str, Any]) -> dict[str, Any]:
             "start_year": state.get("start_year"),
             "end_year": state.get("end_year"),
             "required_reference_count": state.get("required_reference_count"),
+            "target_length": state.get("target_length"),
         },
         "plan": state.get("research_plan") or {},
         "semantic_frame": state.get("research_semantic_frame") or {},
@@ -48,6 +50,8 @@ def context_source_payload(state: dict[str, Any]) -> dict[str, Any]:
             "candidate_papers", "paper_details", "parsed_papers", "pdf_paths",
         )}),
         "claim_authorization": _stable_hash(state.get("claim_plans") or []),
+        "writer_attempt_issues": state.get("writer_attempt_issues") or [],
+        "writer_authorization_coverage": state.get("writer_authorization_coverage") or {},
         "writing_version": state.get("writing_version") or 0,
         "writing_content": _stable_hash({
             "review": state.get("review") or "",
@@ -58,6 +62,7 @@ def context_source_payload(state: dict[str, Any]) -> dict[str, Any]:
         "recovery": state.get("recovery_decision") or state.get("quality_recovery_decision") or {},
         "quality_gate": state.get("quality_gate") or {},
         "pending_validation": bool(state.get("pending_result_validation")),
+        "check_report": state.get("check_report") or {},
         "delegation_recovery": {
             "pending": state.get("pending_evidence_recovery") or {},
             "round": state.get("recovery_round") or 0,
@@ -90,6 +95,8 @@ def _clean_text(value: Any, limit: int = 360) -> str:
 def _explicit_constraints(state: dict[str, Any]) -> list[dict[str, Any]]:
     request = state.get("research_request") or {}
     constraints: list[dict[str, Any]] = []
+    if state.get("target_length") or request.get("target_length"):
+        constraints.append({"name": "target_length", "value": state.get("target_length") or request["target_length"], "source": "user", "hard": False})
     title = exact_search_title(state)
     if title:
         constraints.append({"name": "exact_title", "value": title, "source": "user", "hard": True})
@@ -113,7 +120,9 @@ def _explicit_constraints(state: dict[str, Any]) -> list[dict[str, Any]]:
     # 硬约束。同时保留原始请求，避免未被解析器识别的否定或尾部条件被静默裁掉。
     semantic = state.get("research_semantic_frame") or {}
     for item in semantic.get("evidence_requirements") or []:
-        if item.get("source") == "user_explicit" or item.get("explicit"):
+        if (item.get("source") == "user_explicit" or item.get("explicit")) and not (
+            item.get("inferred") or item.get("source") in {"llm_inference", "mixed"}
+        ):
             constraints.append({"name": "evidence_requirement", "value": item, "source": "user", "hard": True})
     for answer in state.get("user_clarifications") or []:
         constraints.append({"name": "user_clarification", "value": answer, "source": "user", "hard": True})
@@ -156,6 +165,8 @@ def _current_stage(state: dict[str, Any]) -> str:
 
 def _next_actions(state: dict[str, Any]) -> list[str]:
     from app.agent.action_registry import recovery_handoff_action
+    if state.get("intent") != "search_papers" and state.get("pending_result_validation"):
+        return ["validate_result"]
 
     plan = state.get("research_plan") or {}
     pending = [
@@ -192,6 +203,11 @@ def _agent_state(state: dict[str, Any]) -> AgentStateContext:
     generation_quality = state.get("generation_quality") or {}
     used = int(state.get("recovery_action_count") or 0)
     ledger = state.get("agent_execution_budget") or {}
+    # WHY: 模型需看到总请求余量；恢复后采用账本上限，与执行层保持一致。
+    model_request_limit = int(ledger.get("model_request_limit", settings.agent_model_request_limit) or 0)
+    model_request_budget = ({"model_requests": max(0, model_request_limit
+        - int(ledger.get("llm_requests") or 0) - int(ledger.get("retrieval_model_requests") or 0))}
+        if model_request_limit > 0 else {})
     execution_status = str(state.get("agent_execution_status") or "idle")
     research_status = str(
         state.get("result_status")
@@ -234,6 +250,9 @@ def _agent_state(state: dict[str, Any]) -> AgentStateContext:
         cleaned = _clean_text(value, 240)
         if cleaned:
             failures.append(cleaned)
+    from app.agent.deliverable_router import check_generation_readiness
+    # WHY: 就绪统计直接取当前证据/授权，不能将“尚未调用Writer”误报为授权0篇；副本隔离派生写入。
+    prewriting = check_generation_readiness(dict(state)) if state.get('core_deliverables') else None
     return AgentStateContext(
         status=research_status,
         execution_status=execution_status,
@@ -259,7 +278,15 @@ def _agent_state(state: dict[str, Any]) -> AgentStateContext:
             **{"last_" + key: int(value) for key, value in (state.get("agent_context_last_usage") or {}).items()},
         },
         failure_reasons=list(dict.fromkeys(failures)),
+        quality_feedback=quality_feedback(state),
+        last_task_result={key: (state.get("agent_task_results") or [{}])[-1].get(key)
+                          for key in ("role", "operation", "status", "outcome", "error", "check_report_ref")},
         gate_status={
+            "delivery_mode": state.get("delivery_mode", "strict"),
+            "delivery_status": state.get("delivery_status", "none"),
+            "published_draft_version": state.get("published_draft_version"),
+            "finalization_phase": state.get("finalization_phase", "research"),
+            "finalization_reason": state.get("finalization_reason", ""),
             "quality": quality.get("passed"),
             "quality_phase": quality.get("phase"),
             "evidence": global_gate.get("status"),
@@ -273,8 +300,14 @@ def _agent_state(state: dict[str, Any]) -> AgentStateContext:
             "paper_details": len(state.get("paper_details") or []),
             "paper_cards": len(state.get("paper_cards") or []),
             "claim_plans": len(state.get("claim_plans") or []),
+            "writer_candidate_count": len(state.get("writer_candidates") or []),
+            'claim_authorized_paper_count': (prewriting.authorized_reference_count
+                if prewriting is not None and 'claim_plans' in state else 'not_planned'),
+            'writer_authorized_paper_count': ((state.get('writer_authorization_coverage') or {}).get('papers_with_claims', 'not_projected')),
+            'prewriting_ready': prewriting.ready if prewriting is not None else 'not_applicable',
             "has_review": bool(str(state.get("review") or "").strip()),
-            "valid_citations": int(state.get("unique_valid_cited_paper_count") or 0),
+            'valid_citations': (int(state.get('unique_valid_cited_paper_count') or 0)
+                if state.get('claim_verification') or state.get('check_report') else 'not_checked'),
             "unverified_claims": int(
                 semantic_verification.get("not_completed")
                 or generation_quality.get("unverified_claims")
@@ -282,12 +315,19 @@ def _agent_state(state: dict[str, Any]) -> AgentStateContext:
             ),
             "structural_claim_failures": int(semantic_verification.get("structural_failures") or 0),
         },
-        remaining_action_budget=max(0, int(settings.recovery_total_action_budget) - used),
+        remaining_action_budget=max(0, int(ledger.get("recovery_limit", settings.recovery_total_action_budget)) - max(used, int(ledger.get("recovery_used") or 0))),
         budget_remaining={
+            **model_request_budget,
+            "deadline_seconds": max(0, int(settings.agent_execution_deadline_seconds - float(ledger.get("elapsed_seconds") or 0))),
+            "finalization_requests": int((ledger.get("finalization_reserve") or {}).get("requests") or 0),
+            "finalization_tokens": int((ledger.get("finalization_reserve") or {}).get("tokens") or 0),
+            "retrieval_model_requests": max(0, int(ledger.get("retrieval_model_request_limit", settings.retrieval_model_request_limit)) - int(ledger.get("retrieval_model_requests") or 0)),
+            "retrieval_token_usage_unknown_requests": int(ledger.get("retrieval_usage_unknown_count") or 0),
+            "main_rounds": max(0, int(ledger.get("main_round_limit", settings.agent_main_max_rounds)) - int(ledger.get("decision_rounds") or 0)),
             "actions": max(0, int(ledger.get("action_limit", settings.agent_execution_action_budget)) - int(ledger.get("actions_reserved") or 0)),
-            "tokens": max(0, int(ledger.get("token_limit", settings.agent_main_token_budget)) - int(ledger.get("llm_tokens") or 0) - int(ledger.get("tokens_reserved") or 0)),
+            "tokens": max(0, int(ledger.get("token_limit", settings.agent_main_token_budget)) - int(ledger.get("llm_tokens") or 0) - int(ledger.get("retrieval_model_tokens") or 0) - int(ledger.get("tokens_reserved") or 0)),
             "retrieval": max(0, int(ledger.get("retrieval_limit", settings.agent_retrieval_budget)) - int(ledger.get("retrieval_used") or 0)),
-            "recovery": max(0, int(settings.recovery_total_action_budget) - max(used, int(ledger.get("recovery_used") or 0))),
+            "recovery": max(0, int(ledger.get("recovery_limit", settings.recovery_total_action_budget)) - max(used, int(ledger.get("recovery_used") or 0))),
             "route_recovery_rounds": max(0, int(settings.evidence_recovery_max_rounds) - int(state.get("recovery_round") or 0)),
         },
         source_state_version=source_state_version(state),

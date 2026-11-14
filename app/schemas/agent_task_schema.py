@@ -7,12 +7,14 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
+from app.schemas.check_schema import ResultIssue, SuggestedAction
 
 
 class AgentRole(str, Enum):
     SEARCH = "search"
     ANALYSIS = "analysis"
     WRITING = "writing"
+    CHECK = "check"
 
 
 class AgentTaskStatus(str, Enum):
@@ -72,3 +74,6 @@ class AgentTaskResult(BaseModel):
     state_patch: dict[str, Any] = Field(default_factory=dict, exclude=True)
     removed_state_fields: list[str] = Field(default_factory=list, exclude=True)
     error: str | None = None
+    issues: list[ResultIssue] = Field(default_factory=list)
+    suggested_actions: list[SuggestedAction] = Field(default_factory=list)
+    check_report_ref: str | None = None

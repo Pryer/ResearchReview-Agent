@@ -166,6 +166,7 @@ def test_actual_authorization_projection_and_draft_invalidate():
     ]}
     state["paper_cards"][0]["evidence_spans"] = [{"evidence_id":"p1:e1","text":"明确报告的方法",
         "source_type":"full_text","page":1,"char_start":0,"char_end":len("明确报告的方法")}]
+    state["claim_plans"][0]["claims"][0].update(evidence_ids=["p1:e1"], claim_text="明确报告的方法")
     before = _section_input_fingerprint(plan, plan.sections[0], state)
     other = deepcopy(plan)
     other.sections.append(WritingSection(id="background", title="背景", purpose="背景", supporting_claim_ids=["p1:e2"]))

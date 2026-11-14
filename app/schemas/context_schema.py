@@ -36,9 +36,12 @@ class AgentStateContext(StrictContextModel):
     delegation: dict[str, Any] = Field(default_factory=dict)
     agent_messages: list[dict[str, Any]] = Field(default_factory=list)
     research_memory: list[dict[str, Any]] = Field(default_factory=list)
+    context_selection_ids: dict[str, list[str]] = Field(default_factory=dict)
     memory_retrieval: dict[str, Any] = Field(default_factory=dict)
     failure_reasons: list[str] = Field(default_factory=list)
     gate_status: dict[str, Any] = Field(default_factory=dict)
+    quality_feedback: dict[str, Any] = Field(default_factory=dict)
+    last_task_result: dict[str, Any] = Field(default_factory=dict)
     artifact_summary: dict[str, int | bool | str | None] = Field(default_factory=dict)
     remaining_action_budget: int | None = None
     budget_remaining: dict[str, int] = Field(default_factory=dict)

@@ -17,8 +17,8 @@ class AgentMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     message_id: str = Field(default_factory=lambda: uuid4().hex)
     delegation_id: str
-    sender: Literal["main", "search", "analysis", "writing"]
-    recipient: Literal["main", "search", "analysis", "writing"]
+    sender: Literal["main", "search", "analysis", "writing", "check"]
+    recipient: Literal["main", "search", "analysis", "writing", "check"]
     kind: Literal["task", "progress", "completed", "needs_help", "blocked"]
     content: str = Field(max_length=1200)
     suggested_actions: list[str] = Field(default_factory=list)

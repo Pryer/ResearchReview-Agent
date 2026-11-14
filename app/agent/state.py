@@ -252,6 +252,10 @@ class ResearchAgentState(TypedDict, total=False):
     background: Dict[str, Any]  # task_definition, importance, application_scenarios
     existing_limitations: List[Dict[str, Any]]  # limitation, supporting_paper_ids
     verified_results: List[Dict[str, Any]]  # statement, source
+    writer_candidates: List[Dict[str, Any]]
+    selected_candidate_id: str
+    writer_attempt_issues: List[Dict[str, Any]]
+    writer_authorization_coverage: Dict[str, Any]
     target_length: int  # 目标字数
 
     # ---------- 执行记录 ----------
@@ -289,3 +293,25 @@ class ResearchAgentState(TypedDict, total=False):
     pending_evidence_recovery: Dict[str, Any]
     pending_generation_previous: Dict[str, Any]
     pending_result_validation: bool
+    check_report: Dict[str, Any]
+    check_protocol_version: int
+
+    # Task configuration and public immutable delivery are Controller-owned.
+    delivery_mode: str
+    effective_config: dict[str, Any]
+    delivery_status: str
+    execution_status: str
+    verification_status: str
+    requirements_satisfied: bool | None
+    stop_reason: str
+    published_versions: list[dict[str, Any]]
+    published_artifact_ref: str
+    published_draft_version: int
+    finalization_phase: str
+    finalization_reason: str
+    search_query_ledger: dict[str, Any]
+    extraction_cache: dict[str, Any]
+
+    delivery_metrics: dict[str, Any]
+
+    publication_reviews: dict[str, Any]

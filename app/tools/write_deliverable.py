@@ -302,6 +302,10 @@ def _writer_inputs(plan: WritingPlan, state: dict[str, Any]):
                     not allowed_claim_ids or evidence_id in allowed_claim_ids
                 ):
                     claims.append({"field": field, **claim})
+        from app.services.writer_support import authorized_writer_claims
+        authorized = authorized_writer_claims(state, paper_id)
+        if state.get("claim_plans"):
+            claims = [q for q in authorized if not allowed_claim_ids or set(q["evidence_ids"]) & allowed_claim_ids]
         cards.append({
             "paper_id": paper_id,
             "title": card.get("title"),
@@ -327,6 +331,14 @@ def _writer_inputs(plan: WritingPlan, state: dict[str, Any]):
                 or ""
             ),
             "claims": claims,
+            # WHY: ID映射不构成事实授权；原始field/spans的事实使用仍由claims投影限定。
+            "evidence_spans": [{"evidence_id": eid} for eid in dict.fromkeys(
+                [e.get('evidence_id') for e in card.get('evidence_spans') or [] if e.get('evidence_id')] +
+                [q.get('evidence_id') for values in (card.get('field_claims') or {}).values()
+                 for q in values if q.get('evidence_id')])],
+            # WHY: 确定性渲染同样只读投影后的合法声明，不能因字段镜像丢失退化为书目列表。
+            "research_problem": "；".join(q.get('claim', '') for q in claims if q.get('field') == 'research_problem'),
+            "method": "；".join(q.get('claim', '') for q in claims if q.get('field') == 'method'),
         })
     safe_synthesis = []
     for synthesis in state.get("theme_synthesis") or []:
@@ -400,6 +412,20 @@ def write_deliverable(
     """交付物主写作入口，按 deliverable_type 委派给独立渲染器。"""
     plan = plan if isinstance(plan, WritingPlan) else WritingPlan.model_validate(plan)
     cards, safe_synthesis = _writer_inputs(plan, state)
+    from app.services.writer_support import authorized_writer_claims
+    allocated = set(_allocated_paper_ids(state))
+    supplied = {c['paper_id'] for c in cards if c.get('claims')}
+    missing = sorted(allocated - supplied) if state.get('claim_plans') else []
+    state['writer_authorization_coverage'] = {
+        'planned_papers': len(allocated), 'papers_with_claims': len(supplied),
+        'missing_paper_ids': missing,
+        'coverage_claims': sum(q.get('authorization_kind') == 'coverage' for c in cards for q in c.get('claims') or []),
+        'claim_plan_claims': sum(q.get('authorization_kind') == 'claim_plan' for c in cards for q in c.get('claims') or []),
+    }
+    if missing:
+        state.setdefault('writer_attempt_issues', []).append({'code': 'citation_plan_input_mismatch',
+            'reason': '引用计划存在没有可用授权声明的论文', 'paper_ids': missing})
+        return ''
     renderer = get_renderer(plan.deliverable_type)
     reusable_sections = _reusable_checkpoint_sections(plan, state)
     sentinel = object()
@@ -423,7 +449,7 @@ def write_deliverable(
             state["_reusable_section_texts"] = previous_reusable
     # 交付物级不删空：渲染器全链失败返回空文本时回退确定性渲染器，
     # 保证用户要求的章节（如"二、研究现状"）不会整章消失。
-    if not str(text or "").strip():
+    if not str(text or "").strip() and not state.get("writer_attempt_issues"):
         # 降级渲染同样只消费授权数据：theme_synthesis 必须替换为过滤后的
         # safe_synthesis（与 base_renderer.render 内部的 safe_state 构造
         # 一致），否则 claim 门禁未放行的综合条目会经原始 state 泄漏进正文。

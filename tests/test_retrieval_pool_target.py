@@ -82,7 +82,7 @@ def test_generation_limit_leaves_room_for_the_absolute_target():
     """40 篇显式要求的 generation_limit 必须容得下 72 篇绝对目标。"""
     retrieval_target, generation_limit = _derive_count_targets(40, True)
 
-    assert retrieval_target == generation_limit == 72
+    assert retrieval_target == generation_limit == 80
     assert generation_limit >= absolute_evidence_pool_target(
         40, {"end_to_end_rate": 25 / 45}, reserve_ratio=0.5
     )

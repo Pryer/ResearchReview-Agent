@@ -245,6 +245,9 @@ def record_memory_control_outcome(state, operation, status, outcome):
 
 
 def record_failure(state, trajectory, feedback):
+    # WHY: 专业动作的观察已记入同一会话；Main接收委派汇报不是第二次执行故障。
+    if feedback.get("delegation_status") and not feedback.get("error"):
+        return
     if not (feedback.get("error") or feedback.get("status") in {"failed", "rejected", "blocked", "deny", "escalate"}
             or feedback.get("outcome") in {"blocked", "degraded"}):
         return
@@ -255,7 +258,11 @@ def record_failure(state, trajectory, feedback):
         # WHY: 停止后的辅助记忆不能再次写库或覆盖原取消/预算异常；研究提交边界仍会传播停止信号。
         check_execution()
         service.memory.append_event(session_id=str(state["session_id"]), event_type="agent_failure",
-            payload={"operation": feedback["action"], "error": feedback.get("error") or
+            payload={"operation": feedback["action"],
+                     "event_category": "execution_failed" if feedback.get("error") or feedback.get("status") == "failed"
+                         else "quality_rejected" if feedback.get("outcome") in {"blocked", "degraded"}
+                         else "no_progress" if feedback.get("status") == "no_progress" else "action_rejected",
+                     "error": feedback.get("error") or
                          "; ".join(feedback.get("findings") or []) or str(feedback.get("outcome") or feedback.get("status")),
                      "status": feedback.get("status"), "outcome": feedback.get("outcome"),
                      "task": str(state.get("canonical_topic") or state.get("topic") or state.get("user_query") or "")[:240],

@@ -163,6 +163,7 @@ def search_papers(
     diagnostics: Optional[List[SourceDiagnostic]] = None,
     should_cancel: Callable[[], bool] | None = None,
     enable_dual_channel: bool = True,
+    query_ledger: dict | None = None,
 ) -> List[PaperMetadata]:
     """从多个开放数据源检索论文。
 
@@ -254,6 +255,12 @@ def search_papers(
         1,
         min(get_settings().search_source_max_workers, len(valid_tasks) or 1),
     )
+    import time
+    import hashlib
+    import json
+    def query_key(source, channel, quota):
+        return hashlib.sha256(json.dumps(["search.v1", source, " ".join(query.split()).casefold(),
+            start_year, end_year, channel, quota, {"page": 1, "cursor": None}], sort_keys=True).encode()).hexdigest()
     results_by_key: dict[str, list[PaperMetadata]] = {}
     diagnostics_by_source: dict[str, SourceDiagnostic] = {}
 
@@ -273,8 +280,23 @@ def search_papers(
             future_to_meta = {}
             for source, fn, sort_by, quota in valid_tasks:
                 task_key = f"{source}:{sort_by}"
+                ledger_key = query_key(source, sort_by, quota)
+                entry = (query_ledger or {}).get(ledger_key) or {}
+                if entry.get("status") in {"success", "empty"}:
+                    results_by_key[task_key] = [PaperMetadata.model_validate(p) for p in entry.get("papers") or []]
+                    diagnostics_by_source[source] = _merge_source_diagnostic(source, diagnostics_by_source.get(source), len(results_by_key[task_key]), None)
+                    entry["cache_hits"] = int(entry.get("cache_hits") or 0) + 1
+                    continue
+                if entry and (int(entry.get("attempts") or 0) >= get_settings().search_query_max_attempts or time.time() < float(entry.get("retry_after") or 0)):
+                    diagnostics_by_source[source] = _merge_source_diagnostic(source, diagnostics_by_source.get(source), 0,
+                        _diagnostic_for_outcome(source, "skipped", error_code="QUERY_RETRY_DEFERRED", message="已记录查询暂未达到重试条件"))
+                    continue
+                if query_ledger is not None:
+                    query_ledger[ledger_key] = {"query":query,"source":source,"channel":sort_by,
+                        "start_year":start_year,"end_year":end_year,"quota":quota,"page":1,"cursor":None,
+                        "status":"running","attempts":int(entry.get("attempts") or 0)+1}
                 future = submit_with_context(executor, invoke, fn, query, start_year, end_year, quota, sort_by)
-                future_to_meta[future] = (source, sort_by, task_key)
+                future_to_meta[future] = (source, sort_by, task_key, ledger_key)
 
             pending = set(future_to_meta)
             while pending:
@@ -282,7 +304,7 @@ def search_papers(
                 done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
                 for future in done:
                     check_retrieval_execution()
-                    source, sort_by, task_key = future_to_meta[future]
+                    source, sort_by, task_key, ledger_key = future_to_meta[future]
                     try:
                         papers, client_events = future.result()
                         results_by_key[task_key] = papers
@@ -292,6 +314,10 @@ def search_papers(
                             source, str(event.get("outcome") or "api_failed"),
                             error_code=event.get("error_code"), message=event.get("message"),
                         ) if event else None)
+                        if query_ledger is not None:
+                            query_ledger[ledger_key].update(status="failed" if failure and failure.failure_category else "success" if papers else "empty",
+                                papers=[p.model_dump(mode="json") if hasattr(p,"model_dump") else p for p in papers],
+                                retry_after=time.time()+get_settings().search_query_retry_seconds)
                         diagnostics_by_source[source] = _merge_source_diagnostic(
                             source, diagnostics_by_source.get(source), len(papers), failure,
                         )
@@ -314,6 +340,9 @@ def search_papers(
                         else:
                             outcome, error_code = _classify_search_exception(e)
                             message = f"{type(e).__name__}: {e}"
+                        if query_ledger is not None:
+                            query_ledger[ledger_key].update(status="failed", outcome=outcome,
+                                retry_after=time.time()+get_settings().search_query_retry_seconds)
                         failure = _diagnostic_for_outcome(source, outcome, error_code=error_code, message=message)
                         diagnostics_by_source[source] = _merge_source_diagnostic(
                             source, diagnostics_by_source.get(source), 0, failure,

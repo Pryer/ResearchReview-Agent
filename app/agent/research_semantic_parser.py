@@ -306,7 +306,10 @@ def _annotate_requirement_provenance(
                 "source": "legacy_unknown",
             }))
             continue
-        explicit = all(bool(item.explicit) for item in linked)
+        # WHY: 主题实体明确不代表从它派生的研究策略也由用户指定；保留要求自身的推断来源。
+        explicit = (all(bool(item.explicit) for item in linked)
+                    and not requirement.inferred
+                    and requirement.source not in {"llm_inference", "mixed"})
         sources = {str(item.source or "unknown") for item in linked}
         basis = "; ".join(dict.fromkeys(
             str(item.inference_basis).strip()
@@ -318,6 +321,8 @@ def _annotate_requirement_provenance(
             "inferred": not explicit,
             "source": (
                 "user_explicit" if explicit
+                else requirement.source if requirement.source in {"llm_inference", "mixed"}
+                else "llm_inference" if requirement.inferred
                 else next(iter(sources)) if len(sources) == 1
                 else "mixed"
             ),

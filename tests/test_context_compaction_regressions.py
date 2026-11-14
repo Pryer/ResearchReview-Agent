@@ -216,7 +216,7 @@ def test_main_and_subagent_can_recall_without_executing_research_tools(store):
     result = SubagentLoop(llm, AgentController()).run(current, decision=AgentDecision(action="search_and_rank"),
                                                     handlers={"search_and_rank": search})
     assert result.delegation_status == "needs_help"
-    assert result.outcome.value == "blocked" and result.status.value == "completed"
+    assert result.outcome.value == "unknown" and result.status.value == "completed"
     assert "child fact" in encode(llm.calls[1][1])
 
 

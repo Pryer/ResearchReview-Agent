@@ -18,6 +18,7 @@ class SearchAgent(BaseSubAgent):
         ranked = state.get("ranked_papers") or []
         findings = [
             f"检索候选 {len(candidates)} 篇，排序后保留 {len(ranked)} 篇",
+            f"本轮来源新增结果 {int(state.get('last_search_new_results') or 0)} 条；材料是否新增仍按去重身份和证据记录判断",
             f"停止原因：{state.get('retrieval_stop_reason') or '未记录'}",
         ]
         refs = [

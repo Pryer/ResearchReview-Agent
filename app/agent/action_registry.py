@@ -24,7 +24,12 @@ _ACTION_SPECS = (
     ActionSpec("search_and_rank", "按当前范围检索、筛选和排序论文", AgentRole.SEARCH,
                output_fields=("candidate_papers", "ranked_papers", "source_diagnostics")),
     ActionSpec("targeted_search", "针对已确认的证据缺口执行一次有界补检索", AgentRole.SEARCH,
-               required_fields=("evidence_gap_report",), output_fields=("candidate_papers", "ranked_papers")),
+               required_fields=("evidence_gap_report",), output_fields=("candidate_papers", "ranked_papers"),
+               parameters={"type":"object", "properties":{
+                   "purpose":{"type":"string","maxLength":600},
+                   "gap_ids":{"type":"array","items":{"type":"string"},"maxItems":12},
+                   "queries":{"type":"array","items":{"type":"string","minLength":2,"maxLength":300},"maxItems":6}},
+                   "additionalProperties":False}),
     ActionSpec("fetch_metadata", "补全并核验已排序论文的元数据", AgentRole.SEARCH,
                required_fields=("ranked_papers",), output_fields=("paper_details", "source_diagnostics")),
     ActionSpec("extract_paper_cards", "从已核验资料提取带溯源的证据卡", AgentRole.ANALYSIS,
@@ -52,12 +57,12 @@ _ACTION_SPECS = (
             "additionalProperties": False,
         },
     ),
-    ActionSpec("validate_result", "运行确定性的主张、引用和输出验证", AgentRole.ANALYSIS,
-               required_fields=("review",), output_fields=("quality_gate", "claim_verification")),
+    ActionSpec("validate_result", "独立核验主张、引用和交付要求，返回版本绑定报告", AgentRole.CHECK,
+               required_fields=("review",), output_fields=("quality_gate", "claim_verification", "check_report")),
     ActionSpec("recall_context", "按证据 ID 或来源引用回查本 Agent 已归档观察；历史不授予当前证据权限", None,
                parameters={"type": "object", "properties": {
                    "evidence_id": {"type": "string", "minLength": 1, "maxLength": 256},
-                   "limit": {"type": "integer", "minimum": 1, "maximum": 3},
+                   "limit": {"type": "integer", "minimum": 1, "maximum": 8},
                }, "required": ["evidence_id"], "additionalProperties": False}),
     ActionSpec("search_research_memory", "按当前任务查询本会话研究摘要和失败经验；结果不是当前证据授权", None,
                parameters={"type": "object", "properties": {
@@ -73,6 +78,7 @@ _ACTION_SPECS = (
             "required": ["question"], "additionalProperties": False,
         },
     ),
+    ActionSpec("publish_draft", "发布当前可用草稿并继续优化；Controller执行来源预检和版本校验", None),
     ActionSpec("request_finish", "申请交付当前结果；最终门禁由代码裁决", None),
     ActionSpec(
         "report_blocked", "在无法安全继续时报告明确阻断原因", None,
@@ -102,6 +108,13 @@ def allowed_actions(
     mandatory = state.get("agent_mandatory_actions") or []
     refreshing_existing = (mode == "regeneration" and bool(mandatory)
                            and mandatory[0].get("action") == "fetch_metadata")
+    # WHY: 新候选须由独立Check判定；诊断/重规划不能带着旧报告绕过当前版本复验。
+    if state.get("intent") != "search_papers" and state.get("pending_result_validation"):
+        from app.agent.delivery import published_delivery
+        return [name for name in ("validate_result", "publish_draft", "request_finish", "report_blocked")
+                if name == "report_blocked" or (name == "publish_draft" and _draft_publishable(state))
+                or (name == "request_finish" and bool(published_delivery(state)))
+                or (name == "validate_result" and name in handlers)]
     if mode == "verification_only":
         return [
             name for name in ("validate_result", "recall_context", "search_research_memory", "request_finish", "report_blocked")
@@ -109,6 +122,10 @@ def allowed_actions(
         ]
     allowed: list[str] = []
     for spec in _ACTION_SPECS:
+        if spec.name == "publish_draft" and not _draft_publishable(state):
+            continue
+        if state.get("finalization_phase") == "finalizing" and spec.name in {"search_and_rank", "targeted_search", "fetch_metadata", "extract_paper_cards", "validate_routes", "cluster_papers", "revise_scope"}:
+            continue
         if state.get("intent") == "search_papers" and spec.role is not None and spec.name != "search_and_rank":
             continue
         if spec.role is not None and spec.name not in handlers:
@@ -116,7 +133,7 @@ def allowed_actions(
         if spec.name in {"rewrite_sections", "generate_deliverables"}:
             from app.agent.generation_recovery import rewrite_attempt_exhausted
 
-            if state.get("pending_result_validation") or rewrite_attempt_exhausted(state):
+            if state.get("pending_result_validation") or state.get("pending_evidence_recovery") or rewrite_attempt_exhausted(state):
                 continue
         if spec.name == "search_and_rank" and state.get("active_quality_recovery"):
             if (state.get("retrieval_profile") or {}).get("mode") == "hybrid":
@@ -175,6 +192,12 @@ def admitted_ranked_papers(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 def recovery_handoff_action(state: dict[str, Any]) -> str:
     """质量恢复后优先把已确认的候选推进到当前证据与授权。"""
+    from app.agent.delivery import draft_first, draft_preflight, published_delivery
+    if (not state.get("active_subagent") and draft_first(state) and not published_delivery(state)
+            and draft_preflight(state)["ready"]):
+        return "publish_draft"
+    if state.get("intent") != "search_papers" and state.get("pending_result_validation"):
+        return ""
     # WHY: 普通 rules 任务也会在详情刷新时失效旧卡；先交回分析角色重建，
     # 不要求已经进入写作失败恢复，也不让检索角色越权提取。
     if state.get("intent") != "search_papers" and state.get("paper_details") and state.get("pending_card_rebuild_ids"):
@@ -188,7 +211,14 @@ def recovery_handoff_action(state: dict[str, Any]) -> str:
         cards = {_paper_identity_key(p) for p in state.get("paper_cards") or []}
         if any(pid not in cards for pid in details):
             return "extract_paper_cards"
+        if (state.get("pending_evidence_recovery") or {}).get("kind") == "quality":
+            return "plan_claims" if state.get("paper_cards") else ""
         return "validate_routes" if state.get("paper_cards") else ""
+    # 背景综述不强制构造路线；新证据和授权齐备后交回Main选择写作。
+    if (state.get("active_quality_recovery") or {}).get("origin") == "main":
+        if not state.get("claim_plans") and state.get("paper_cards"):
+            return "plan_claims"
+        return ""
     if not state.get("active_quality_recovery") or state.get("intent") == "search_papers":
         return ""
     if (state.get("retrieval_profile") or {}).get("mode") != "hybrid":
@@ -209,7 +239,8 @@ def recovery_handoff_action(state: dict[str, Any]) -> str:
            for p in state.get("paper_details") or []):
         return "extract_paper_cards"
     if state.get("paper_cards") and not state.get("validated_routes"):
-        return "validate_routes"
+        from app.agent.delivery import draft_first
+        return "plan_claims" if draft_first(state) and state.get("core_deliverables")==["research_background"] else "validate_routes"
     if state.get("paper_cards") and not state.get("claim_plans"):
         return "plan_claims"
     return ""
@@ -227,6 +258,7 @@ def tool_schemas(names: list[str]) -> list[dict[str, Any]]:
 
 
 def validate_arguments(name: str, arguments: dict[str, Any]) -> None:
+    from app.core.config import get_settings
     schema = action_spec(name).parameters
     allowed = set((schema.get("properties") or {}).keys())
     unknown = set(arguments) - allowed
@@ -238,8 +270,8 @@ def validate_arguments(name: str, arguments: dict[str, Any]) -> None:
     if name == "recall_context":
         if not isinstance(arguments["evidence_id"], str) or not arguments["evidence_id"].strip() or len(arguments["evidence_id"]) > 256:
             raise ValueError("evidence_id must contain 1 to 256 characters")
-        if "limit" in arguments and (type(arguments["limit"]) is not int or not 1 <= arguments["limit"] <= 3):
-            raise ValueError("history limit must be between 1 and 3")
+        if "limit" in arguments and (type(arguments["limit"]) is not int or not 1 <= arguments["limit"] <= get_settings().agent_context_recall_limit):
+            raise ValueError("history limit exceeds configured recall allowance")
     if name == "search_research_memory":
         if not isinstance(arguments["query"], str) or not arguments["query"].strip() or len(arguments["query"]) > 600:
             raise ValueError("memory query must contain 1 to 600 characters")
@@ -247,6 +279,13 @@ def validate_arguments(name: str, arguments: dict[str, Any]) -> None:
             raise ValueError("unknown research memory kind")
         if "limit" in arguments and (type(arguments["limit"]) is not int or not 1 <= arguments["limit"] <= 3):
             raise ValueError("memory result limit must be between 1 and 3")
+    if name == "targeted_search":
+        for field,limit in (("gap_ids",12),("queries",6)):
+            value=arguments.get(field,[])
+            if not isinstance(value,list) or len(value)>limit or any(not isinstance(x,str) or not x.strip() or len(x)>300 for x in value):
+                raise ValueError("invalid targeted_search."+field)
+        if "purpose" in arguments and (not isinstance(arguments["purpose"],str) or len(arguments["purpose"])>600):
+            raise ValueError("invalid targeted_search.purpose")
     if name == "rewrite_sections" and (not isinstance(arguments.get("section_ids"), list) or not arguments["section_ids"] or not all(
         isinstance(item, str) and item.strip() for item in arguments["section_ids"]
     )):
@@ -254,3 +293,8 @@ def validate_arguments(name: str, arguments: dict[str, Any]) -> None:
     for name in ("question", "reason"):
         if name in schema.get("required", []) and (not isinstance(arguments.get(name), str) or not arguments[name].strip()):
             raise ValueError(f"{name} must be a nonempty string")
+
+
+def _draft_publishable(state):
+    from app.agent.delivery import has_unpublished_draft
+    return has_unpublished_draft(state)

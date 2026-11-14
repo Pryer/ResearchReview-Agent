@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Literal, Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -89,6 +89,7 @@ class SlotResult(BaseModel):
     )
     language: str = Field(default="zh", description="综述语言")
     citation_style: str = Field(default="gbt7714", description="引用格式")
+    target_length: Optional[int] = Field(default=None, ge=1, description="显式正文总字数")
 
 
 class AgentStep(BaseModel):
@@ -109,6 +110,7 @@ class AgentStep(BaseModel):
 
 
 class AgentRequest(BaseModel):
+    delivery_mode: Literal["draft_first", "strict"] | None = None
     """Agent 自然语言请求。"""
 
     user_query: str = Field(..., description="用户自然语言请求", min_length=1, max_length=20_000)
@@ -171,6 +173,16 @@ class ResearchRevisionRequest(BaseModel):
 
 
 class AgentOutput(BaseModel):
+    execution_report: Optional[Dict[str, Any]] = None
+    body: str = ""
+    execution_status: str = ""
+    stop_reason: str = ""
+    delivery_status: str = "none"
+    verification_status: str = "not_started"
+    requirements_satisfied: bool | None = None
+    published_draft_version: int | None = None
+    published_artifact_ref: str | None = None
+
     """Agent 最终输出。"""
 
     answer: str = Field(default="", description="最终回复文本")

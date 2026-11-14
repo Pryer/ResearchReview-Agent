@@ -28,6 +28,21 @@ class ResearchArtifactService:
     def __init__(self, db: Session) -> None:
         self.repo = ResearchArtifactRepository(db)
 
+    def read_published_delivery(self, session_id, *, status="running"):
+        from app.database.models import ResearchRuntimeModel
+        from app.agent.delivery import published_delivery, delivery_output
+        row=self.repo.db.get(ResearchRuntimeModel,session_id,populate_existing=True)
+        if row is None or not row.state_json: return None
+        stored=json.loads(row.state_json)
+        minimal={key:stored[key] for key in ("session_id","user_query","quality_original_query","research_request",
+            "published_versions","publication_reviews","published_artifact_ref","delivery_metrics") if key in stored}
+        minimal["result_status"]=status
+        minimal["artifact_manifest"]={key:value for key,value in (stored.get("artifact_manifest") or {}).items()
+            if key=="published_versions"}
+        state=self.hydrate_state(session_id,minimal)
+        if not published_delivery(state):return None
+        return delivery_output(state,{"status":status})
+
     def persist_main_context(self, session_id: str, state: dict[str, Any]) -> str:
         snapshot = build_context_snapshot(state)
         version = max(1, int(state.get("context_snapshot_version") or 0) + 1)
@@ -127,12 +142,21 @@ class ResearchArtifactService:
         if ref.startswith("state://"):
             if (state or {}).get("session_id", session_id) != session_id:
                 raise PermissionError("legacy state belongs to another session")
-            result = self._resolve_legacy_state_ref(ref, state or {})
+            if ref.startswith('state://writer-candidate/'):
+                from app.services.writer_support import read_candidate
+                result = {'artifact_type': 'writer_candidate', 'payload': read_candidate(
+                    state or {}, ref.removeprefix('state://writer-candidate/'), role=role)}
+            else:
+                result = self._resolve_legacy_state_ref(ref, state or {})
             if result is None:
                 raise ArtifactNotFoundError("legacy artifact does not exist")
             spec = ARTIFACT_TYPES[result["artifact_type"]]
             if role not in spec.roles or (allowed_types is not None and result["artifact_type"] not in allowed_types):
                 raise PermissionError("legacy artifact type or role is not allowed")
+            if result["artifact_type"] == "published_delivery":
+                if expected_version is not None and expected_version != result["payload"]["version"]:
+                    raise ArtifactVersionError("published draft version mismatch")
+                return copy.deepcopy(result)
             if expected_version not in {None, 1}:
                 raise ArtifactVersionError("legacy artifact has only version 1")
             return copy.deepcopy(result)
@@ -193,12 +217,12 @@ class ResearchArtifactService:
             value = stored.pop(field)
             is_text = isinstance(value, str)
             shape = "text" if is_text else "list"
-            if field in {"agent_task_results", "quarantined_generation_snapshot", "pending_generation_previous", "main_agent_trajectory", "subagent_sessions"}:
+            if field in {"agent_task_results", "quarantined_generation_snapshot", "pending_generation_previous", "main_agent_trajectory", "subagent_sessions", "check_report", "published_versions", "extraction_cache", "search_query_ledger"}:
                 # WHY: 任务补丁和隔离候选可能超过单条资料上限，统一 JSON 分片
                 # 保存；候选使用仅 service 可读的独立类型，不能混入当前任务授权。
                 self.validate_payload(value, max_bytes=8 * 1024 * 1024)
                 value = json.dumps(value, ensure_ascii=False)
-                shape = "json_list" if field == "agent_task_results" else "json_object"
+                shape = "json_list" if field in {"agent_task_results", "published_versions"} else "json_object"
             values = [value[i:i + 16000] for i in range(0, len(value), 16000)] if shape != "list" else value
             if not isinstance(values, list):
                 raise ValueError(f"invalid state artifact field: {field}")
@@ -207,6 +231,7 @@ class ResearchArtifactService:
                 "paper_details": ("ranked_papers",), "paper_cards": ("paper_details",),
                 "claim_plans": ("paper_cards",), "writing_plans": ("claim_plans",),
                 "review": ("writing_plans", "claim_plans"),
+                "check_report": ("review", "claim_plans", "paper_cards"),
             }.get(field, ())
             source_refs = [entry["ref"] for parent in parents for entry in manifest.get(parent, {}).get("items", [])]
             for index, item in enumerate(values):
@@ -241,8 +266,8 @@ class ResearchArtifactService:
         for field, manifest in (state.get("artifact_manifest") or {}).items():
             expected_type = "document_fragment" if field == "parsed_papers" else STATE_ARTIFACT_FIELDS.get(field)
             expected_shape = "documents" if field == "parsed_papers" else "text" if field == "review" else "list"
-            if field in {"quarantined_generation_snapshot", "pending_generation_previous", "main_agent_trajectory", "subagent_sessions"}:
-                expected_shape = "json_object"
+            if field in {"quarantined_generation_snapshot", "pending_generation_previous", "main_agent_trajectory", "subagent_sessions", "check_report", "published_versions", "extraction_cache", "search_query_ledger"}:
+                expected_shape = "json_list" if field == "published_versions" else "json_object"
             allowed_shapes = {expected_shape} | ({"json_list"} if field == "agent_task_results" else set())
             if expected_type is None or manifest.get("shape") not in allowed_shapes:
                 raise ValueError("artifact manifest field or shape is invalid")
@@ -276,6 +301,21 @@ class ResearchArtifactService:
     @staticmethod
     def _resolve_legacy_state_ref(ref: str, state: dict[str, Any]) -> dict | None:
         """只读兼容旧 state:// 引用；新任务应使用不可变 artifact:// 引用。"""
+        if ref.startswith("state://writer-candidate/"):
+            from app.services.writer_support import read_candidate
+            return {"artifact_type": "writer_candidate", "payload": read_candidate(state, ref.removeprefix("state://writer-candidate/"), role="service")}
+        if ref.startswith("state://published-draft/"):
+            version=ref.removeprefix("state://published-draft/")
+            from app.agent.delivery import publication_identity
+            record=next((v for v in state.get("published_versions") or [] if str(v.get("version"))==version
+                and v.get("task_identity")==publication_identity(state)),None)
+            return {"artifact_type":"published_delivery", "payload":copy.deepcopy(record)} if record else None
+        if ref.startswith("state://check-report/"):
+            report_id = ref.removeprefix("state://check-report/")
+            reports = [state.get("check_report") or {}, *[
+                item.get("check_report") or {} for item in state.get("recovery_candidate_rejections") or []]]
+            report = next((item for item in reports if item.get("report_id") == report_id), None)
+            return {"artifact_type": "check_report", "payload": report} if report else None
         if ref.startswith("state://paper-card/"):
             paper_id = ref.removeprefix("state://paper-card/")
             value = next(

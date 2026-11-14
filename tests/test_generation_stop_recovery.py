@@ -98,6 +98,7 @@ def test_failed_full_rebuild_keeps_private_candidate_across_restarts(monkeypatch
         assert result['previous_draft_available'] is True
         private = result['research_state']['quarantined_generation_snapshot']
         assert private['generation_products'] == {
+        'writing_version': 0,
             **old, 'section_checkpoints': {}, 'section_candidate_checkpoints': {},
         }
         assert private['evidence_snapshot_version'] == 3

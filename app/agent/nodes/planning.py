@@ -308,6 +308,14 @@ def plan_node(state: "ResearchAgentState", llm=None, current_year: int | None = 
             or plan.get("requested_sections")
             or ["related_work"]
         )
+        if slots.target_length:
+            state['target_length'] = slots.target_length
+        elif 'target_length' in original_request:
+            # WHY: 新研究显式缺省字数时清除上次任务遗留；直接API目标仍由未携带该键的路径兼容。
+            if original_request['target_length']:
+                state['target_length'] = int(original_request['target_length'])
+            else:
+                state.pop('target_length', None)
         state["language"] = original_request.get("language") or plan["language"]
         state["citation_style"] = (
             original_request.get("citation_style") or plan["citation_style"]

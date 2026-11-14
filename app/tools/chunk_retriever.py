@@ -12,7 +12,7 @@ from app.clients.retrieval_http import RetrievalProviderError
 from app.prompt.paper_card import FIELD_RETRIEVAL_QUERIES
 from app.schemas.chunk_schema import ChunkHit, ChunkRetrievalReport
 from app.schemas.retrieval_schema import RetrievalQuery, fingerprint
-from app.services.retrieval_ranking_service import VectorCache
+from app.services.retrieval_ranking_service import VectorCache, _rerank_cached
 from app.tools.hybrid_retrieval import lexical_rank, fuse_rankings
 from app.tools.chunk_pdf import section_family
 from app.schemas.vector_schema import ChunkVectorIndex, IndexCoverage, VectorIntegrityError, VectorStoreUnavailable
@@ -157,7 +157,7 @@ def retrieve_chunks(paper_id, chunks, *, settings, topic="", should_cancel=None,
         scores = {}
         if window and settings.card_chunk_enable_rerank:
             try:
-                values = reranker.score(text, [texts[item["index"]] for item in window], should_cancel=should_cancel)
+                values, _ = _rerank_cached(reranker, settings, text, [texts[item["index"]] for item in window], should_cancel)
                 if len(values) != len(window) or not np.isfinite(values).all():
                     raise RetrievalProviderError("Chunk 重排响应无效")
                 scores = {item["index"]: float(score) for item, score in zip(window, values)}

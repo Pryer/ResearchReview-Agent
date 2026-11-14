@@ -66,7 +66,7 @@ def test_background_outline_is_local_and_cannot_be_reused_from_old_state():
 def test_real_postwriting_checks_commit_without_releasing_insufficient_draft(monkeypatch, operation):
     state = _state()
     llm = OutlineLLM()
-    draft = state.pop('review')
+    draft = state.pop('review') + '已有研究以课堂互动为对象，记录课堂行为并讨论不同观察条件下的方法适用性，相关结论仍须由独立核验确认。'
     monkeypatch.setattr(graph, '_get_llm', lambda: llm)
 
     def generate(current, **kwargs):
@@ -145,6 +145,7 @@ def test_rejected_writing_blocks_both_entrypoints_before_creating_task(rejected_
 @pytest.mark.parametrize('operation', ['generate_deliverables', 'rewrite_sections'])
 def test_rejected_candidate_restores_verified_draft_without_second_mutating_validation(monkeypatch, operation):
     state = _state()
+    state['writing_plans'] = [build_writing_plan('research_background', state).model_dump(mode='json')]
     state.update(quality_gate={'passed': False, 'draft_released': False},
                  agent_orchestration_mode='autonomous',
                  reference_coverage_stats={'final_valid': 40},
@@ -152,25 +153,28 @@ def test_rejected_candidate_restores_verified_draft_without_second_mutating_vali
                  claim_verification_cache={'original': {'status': 'supported'}},
                  section_checkpoints={'original': {'text': '旧章节'}}, answer='旧稿说明')
     state['autonomous_verified_fingerprint'] = graph._draft_fingerprint(state)
+    from tests.agent_decision_fakes import checked_result
+    checked_result(state)
+    state['autonomous_verified_fingerprint'] = graph._draft_fingerprint(state)
     previous = copy.deepcopy(state)
     validations = []
     def generate(current, **kwargs):
-        current['review'] = '候选较差正文'
+        current['review'] = '候选较差正文，已有研究以课堂互动为对象，记录课堂行为并讨论不同观察条件下的方法适用性，相关结论仍须由独立核验确认。'
         current['section_checkpoints'] = {'candidate': {'text': '新章节'}}
     def verify(current, **kwargs):
         validations.append(current['review'])
-        current['review'] += '验证链改写'
+        assert kwargs.get('read_only') is True
         current['reference_coverage_stats'] = {'final_valid': 38}
         current['claim_verification_cache'] = {'candidate': {'status': 'unsupported'}}
     monkeypatch.setattr(graph, '_get_llm', lambda: OutlineLLM())
     monkeypatch.setattr(graph, '_generate_deliverables_or_block', generate)
     monkeypatch.setattr(graph, '_verify_generated_draft', verify)
-    monkeypatch.setattr(graph, 'final_answer_node', lambda s: s.update(quality_gate={'passed': False}))
+    monkeypatch.setattr('app.agent.nodes.synthesis._apply_final_quality_gate', lambda s: s.update(quality_gate={'passed': False}))
     monkeypatch.setattr('app.agent.generation_recovery.candidate_is_not_worse', lambda a, b: False)
     def run(loop, current, *, handlers, **kwargs):
         loop.controller.execute(role=ACTION_REGISTRY[operation].role, operation=operation,
             objective='验证候选回滚', state=current,
-            handler=lambda s: handlers[operation](s, {'section_ids': ['s1']} if operation == 'rewrite_sections' else {}))
+            handler=lambda s: handlers[operation](s, {'section_ids': ['background_body']} if operation == 'rewrite_sections' else {}))
         assert current['pending_result_validation']
         loop.controller.execute(role=ACTION_REGISTRY['validate_result'].role, operation='validate_result',
             objective='主控另行委派核验与版本比较', state=current,
@@ -178,7 +182,7 @@ def test_rejected_candidate_restores_verified_draft_without_second_mutating_vali
         return 'blocked'
     monkeypatch.setattr(MainAgentLoop, 'run', run)
     graph._run_autonomous_pipeline(state)
-    assert validations == ['候选较差正文']
+    assert validations == ['候选较差正文，已有研究以课堂互动为对象，记录课堂行为并讨论不同观察条件下的方法适用性，相关结论仍须由独立核验确认。']
     for key in ('review', 'answer', 'reference_coverage_stats', 'claim_verification_cache',
                 'section_checkpoints', 'autonomous_verified_fingerprint'):
         assert state[key] == previous[key]

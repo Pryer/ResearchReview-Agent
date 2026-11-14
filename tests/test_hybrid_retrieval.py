@@ -347,3 +347,32 @@ def test_embedding_usage_shares_execution_budget(tmp_path):
         ledger["retrieval_model_requests"] = get_settings().retrieval_model_request_limit
         with pytest.raises(AgentBudgetExceeded, match="retrieval model request"):
             EmbeddingClient(settings, session=_FakeSession(payload)).embed(["sample"], text_type="query")
+
+
+def test_embedding_accepts_native_index_alias_and_restores_input_order(tmp_path):
+    settings = _settings(tmp_path)
+    payload = {"output": {"embeddings": [
+        {"index": 1, "embedding": [0.0, 2.0], "type": "dense"},
+        {"index": 0, "embedding": [3.0, 0.0], "type": "dense"},
+    ]}}
+    client = EmbeddingClient(settings, session=_FakeSession(payload))
+    assert client.embed(["a", "b"], text_type="document") == [[1.0, 0.0], [0.0, 1.0]]
+
+
+def test_embedding_accepts_equal_explicit_index_fields(tmp_path):
+    payload = {"output": {"embeddings": [{"text_index": 0, "index": 0, "embedding": [1.0, 0.0]}]}}
+    assert EmbeddingClient(_settings(tmp_path), session=_FakeSession(payload)).embed(["a"], text_type="query") == [[1.0, 0.0]]
+
+
+@pytest.mark.parametrize("indices", [
+    [{"index": 0}, {"index": 0}],
+    [{"index": True}, {"index": 1}],
+    [{"index": 2}, {"index": 0}],
+    [{"index": "0"}, {"index": 1}],
+    [{"text_index": 0, "index": 1}, {"index": 1}],
+    [{"text_index": 0, "index": False}, {"index": 1}],
+])
+def test_embedding_alias_keeps_duplicate_type_range_and_conflict_checks(tmp_path, indices):
+    payload = {"output": {"embeddings": [{**i, "embedding": [1.0, 0.0]} for i in indices]}}
+    with pytest.raises(RetrievalProviderError):
+        EmbeddingClient(_settings(tmp_path), session=_FakeSession(payload)).embed(["a", "b"], text_type="document")

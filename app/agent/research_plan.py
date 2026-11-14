@@ -102,6 +102,7 @@ def build_research_request_plan(
             retrieval_target=slots.retrieval_target,
             language=slots.language,
             citation_style=slots.citation_style,
+            target_length=slots.target_length,
         ),
         assumptions=assumptions,
         clarification=clarification,

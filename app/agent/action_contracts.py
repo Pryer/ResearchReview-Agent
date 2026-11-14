@@ -9,7 +9,8 @@ from app.agent.state import ResearchAgentState
 def fields(value):
     return frozenset(value.split())
 
-GOAL = fields("""user_query session_id user_operation_sequence agent_orchestration_mode agent_operation_mode
+GOAL = fields("""delivery_mode effective_config finalization_phase finalization_reason
+user_query session_id user_operation_sequence agent_orchestration_mode agent_operation_mode
 user_clarifications intent intent_context_role confidence topic canonical_topic start_year end_year
 max_papers required_reference_count year_range_explicit strict_year_range max_papers_explicit
 requested_sections core_deliverables user_paper_profile research_request research_plan research_semantic_frame research_query_rewrite
@@ -17,7 +18,8 @@ quality_original_query quality_constraint_changes
 selected_scope language citation_style workflow our_work background existing_limitations verified_results target_length
 state_schema_version state_revision evidence_snapshot_version evidence_snapshot_fingerprint writing_version""")
 TRACE = fields("steps errors step_metrics contract_violations state_invariant_check")
-SEARCH = fields("""keywords core_keywords expanded_keywords keyword_batches required_concepts topic_anchors
+SEARCH = fields("""search_query_ledger
+keywords core_keywords expanded_keywords keyword_batches required_concepts topic_anchors
 excluded_title_terms retrieval_target generation_limit evidence_pool_target evidence_yield screening_protocol
 retrieval_profile retrieval_screening_cache
 search_branches compiled_scope scope_search_queries scope_query_roles query_roles global_recall_queries
@@ -28,7 +30,7 @@ incremental_search_new_candidates incremental_new_paper_ids incremental_new_pape
 candidate_papers ranked_papers source_diagnostics screening_report last_search_new_results retrieval_eligible_count
 screening_report_low_pass_protection english_screening_recovery english_screening_recovery_attempted
 cnki_anchor_query_used citation_shortfall_count""")
-MATERIAL = fields("paper_details pdf_paths parsed_papers paper_cards pending_card_rebuild_ids evidence_quality_report")
+MATERIAL = fields("extraction_cache paper_details pdf_paths parsed_papers paper_cards pending_card_rebuild_ids evidence_quality_report")
 ANALYSIS = fields("""provisional_framework validated_routes route_decisions route_validation_report
 clusters dynamic_taxonomy taxonomy_validation taxonomy_remediation theme_synthesis claim_plans
 claim_evidence_gate claim_alignment claim_citation_consistency global_evidence_gate evidence_gap_report
@@ -44,7 +46,7 @@ citation_gap_repair_attempted citation_gap_repair_history citation_gap_repair_co
 _citation_gap_repair_snapshot _citation_gap_repair_previous_cited""")
 # WHY: 恢复跨角色分段提交，pending 记录搜索前快照，分析后才结算收益。
 RECOVERY |= fields("pending_evidence_recovery")
-# 写作只能提交候选稿；最终主张核验由 Analysis 的 validate_result 提交。
+# 写作只能提交候选稿；最终主张核验由 Check 的 validate_result 提交。
 WRITING = fields("""review body answer introduction introduction_data related_work related_work_data references
 reference_papers citation_map citation_registry citation_validation claim_verification claim_verification_cache
 citation_source_text citation_rendered_text
@@ -55,9 +57,15 @@ deliverable_validation writer_diagnostics writer_section_diagnostics final_revie
 citation_eligible_paper_ids reference_coverage_stats target_section_ids target_claim_ids section_checkpoints
 section_candidate_checkpoints result_status autonomous_verified_fingerprint draft_available draft_released
  draft_disposition generation_readiness generation_blocked writing_version focus_coverage""")
-WRITING |= fields("pending_generation_previous pending_result_validation")
+WRITING |= fields("writer_candidates selected_candidate_id writer_attempt_issues writer_authorization_coverage")
+WRITING |= fields("pending_generation_previous pending_result_validation check_report check_protocol_version")
+CHECK_OUTPUT = fields("""check_report claim_verification claim_verification_cache generation_quality
+evidence_quality_report references reference_papers citation_map citation_registry citation_validation
+unique_cited_paper_count unique_valid_cited_paper_count final_requirement_met claim_alignment
+claim_citation_consistency reference_coverage_stats evidence_yield final_review_integrity
+quality_gate generation_blocked quarantined_draft language_coverage search_report claim_repairs""")
 PROTECTED = fields("""user_query research_request required_reference_count year_range_explicit max_papers_explicit
-start_year end_year selected_scope core_deliverables session_id agent_orchestration_mode user_clarifications research_query_rewrite""")
+start_year end_year selected_scope core_deliverables session_id agent_orchestration_mode user_clarifications research_query_rewrite target_length""")
 # WHY: 这些是内层 Controller 可重建的视图；不属于专业动作提交的研究产物。
 DERIVED = fields("""main_agent_context main_context_snapshot main_context_artifact_ref context_snapshot_version
 agent_task_results agent_execution_status allowed_agent_actions state_revision artifact_manifest""")
@@ -80,26 +88,27 @@ CONTRACTS = {
         SEARCH | fields("generation_blocked research_semantic_frame")),
     "fetch_metadata": contract(SEARCH | MATERIAL | fields("validated_routes generation_readiness recovery_decision"),
         SEARCH | MATERIAL),
-    "extract_paper_cards": contract(MATERIAL | fields("incremental_retrieval incremental_new_paper_ids"), fields("paper_cards pending_card_rebuild_ids")),
+    "extract_paper_cards": contract(MATERIAL | fields("incremental_retrieval incremental_new_paper_ids"), fields("paper_cards pending_card_rebuild_ids extraction_cache")),
     "validate_routes": contract(MATERIAL | ANALYSIS | RECOVERY | fields("ranked_papers"),
         ANALYSIS | RECOVERY | fields("paper_cards paper_details incremental_retrieval incremental_search_window incremental_required_new_evidence citation_shortfall_count evidence_snapshot_version evidence_snapshot_fingerprint")),
     "cluster_papers": contract(MATERIAL | ANALYSIS | RECOVERY | fields("ranked_papers"), ANALYSIS | fields("paper_cards paper_details")),
     "plan_claims": contract(MATERIAL | ANALYSIS | RECOVERY | fields("ranked_papers"),
-        fields("claim_plans claim_evidence_gate global_evidence_gate evidence_gap_report evidence_quality_report claim_alignment claim_citation_consistency")),
-    "diagnose_evidence_gaps": contract(SEARCH | MATERIAL | ANALYSIS | RECOVERY,
-        fields("evidence_gap_report recovery_decision evidence_recovery_status")),
+        RECOVERY | fields("claim_plans claim_evidence_gate global_evidence_gate evidence_gap_report evidence_quality_report claim_alignment claim_citation_consistency evidence_snapshot_version evidence_snapshot_fingerprint incremental_retrieval incremental_search_window incremental_required_new_evidence citation_shortfall_count")),
+    "diagnose_evidence_gaps": contract(SEARCH | MATERIAL | ANALYSIS | RECOVERY
+        | fields("review quality_gate claim_verification deliverable_validation writing_plans unique_valid_cited_paper_count reference_coverage_stats citation_map citation_source_text citation_rendered_text"),
+        fields("evidence_gap_report recovery_decision evidence_recovery_status quality_recovery_decision")),
     "revise_scope": contract(SEARCH | MATERIAL | ANALYSIS | RECOVERY,
         fields("provisional_framework keywords search_branches global_recall_queries recovery_decision scope_revision_count scope_revision_failed recovery_action_count")),
     "generate_deliverables": contract((MATERIAL - fields("pdf_paths parsed_papers")) | ANALYSIS | RECOVERY | WRITING | fields("ranked_papers language_coverage_target generation_limit required_concepts"),
-        WRITING | RECOVERY | fields("evidence_quality_report evidence_yield route_merge_diagnostics language_coverage search_report theme_synthesis")),
+        (WRITING - fields("check_report check_protocol_version autonomous_verified_fingerprint")) | RECOVERY | fields("evidence_quality_report evidence_yield route_merge_diagnostics language_coverage search_report theme_synthesis")),
     "rewrite_sections": contract((MATERIAL - fields("pdf_paths parsed_papers")) | ANALYSIS | RECOVERY | WRITING | fields("ranked_papers language_coverage_target generation_limit required_concepts"),
-        WRITING | RECOVERY | fields("evidence_quality_report evidence_yield route_merge_diagnostics language_coverage search_report theme_synthesis")),
+        (WRITING - fields("check_report check_protocol_version autonomous_verified_fingerprint")) | RECOVERY | fields("evidence_quality_report evidence_yield route_merge_diagnostics language_coverage search_report theme_synthesis")),
     "validate_result": contract(MATERIAL | ANALYSIS | RECOVERY | WRITING | fields("ranked_papers language_coverage_target required_concepts"),
-        WRITING | fields("evidence_quality_report evidence_yield language_coverage search_report recovery_candidate_rejections")),
+        CHECK_OUTPUT),
     # WHY: Search 不再有证据提取、主张或正文写权限，补检索只提交候选与恢复进度。
     "targeted_search": contract(SEARCH | (RECOVERY - fields("_citation_gap_repair_snapshot"))
-        | fields("paper_cards paper_details provisional_framework validated_routes evidence_gap_report recovery_decision review unique_cited_paper_count"),
-        SEARCH | fields("pending_evidence_recovery recovery_action_count recovery_round route_recovery_attempts citation_gap_repair_attempted _citation_gap_repair_previous_cited")),
+        | fields("paper_cards paper_details provisional_framework validated_routes evidence_gap_report recovery_decision review unique_cited_paper_count claim_plans dynamic_taxonomy citation_map citation_source_text citation_rendered_text"),
+        SEARCH | fields("recovery_decision pending_evidence_recovery recovery_action_count recovery_round route_recovery_attempts citation_gap_repair_attempted _citation_gap_repair_previous_cited")),
 }
 
 

@@ -239,6 +239,7 @@ class TimeConstraint(BaseModel):
 
 
 class ResearchConstraints(BaseModel):
+    target_length: Optional[int] = Field(default=None, ge=1)
     time: TimeConstraint = Field(default_factory=TimeConstraint)
     minimum_references: Optional[int] = None
     maximum_references: Optional[int] = None

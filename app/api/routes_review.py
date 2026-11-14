@@ -80,6 +80,44 @@ def cancel_research_job_api(job_id: str, db: Session = Depends(get_db)):
     return APIResponse.ok(job)
 
 
+from pydantic import BaseModel, Field
+from typing import Any
+
+class ConfigurationRevision(BaseModel):
+    expected_revision: int = Field(ge=0)
+    values: dict[str, Any]
+
+@router.patch("/sessions/{session_id}/configuration", response_model=APIResponse, summary="显式修订空闲任务配置")
+def revise_configuration_api(session_id: str, request: ConfigurationRevision, db: Session = Depends(get_db)):
+    from app.database.runtime_repository import ResearchRuntimeRepository, RuntimeConflict
+    try:
+        return APIResponse.ok(ResearchRuntimeRepository(db,session_id).revise_configuration(
+            expected_revision=request.expected_revision,values=request.values))
+    except RuntimeConflict as exc:
+        raise HTTPException(status_code=409,detail=str(exc)) from exc
+    except ValueError as exc:
+        # Settings errors can include invalid secret-bearing input; do not echo it.
+        raise HTTPException(status_code=400,detail="配置无效、低于已消耗额度或包含禁止字段") from exc
+
+
+@router.get("/sessions/{session_id}/reports", response_model=APIResponse, summary="查看任务运行报告列表")
+def list_execution_reports_api(session_id: str, db: Session = Depends(get_db)):
+    from app.services.execution_report_service import list_reports
+    return APIResponse.ok(list_reports(db,session_id))
+
+
+@router.get("/sessions/{session_id}/reports/{report_id}/files/{name}", summary="读取运行报告及导出文件")
+def execution_report_file_api(session_id: str, report_id: str, name: str, db: Session = Depends(get_db)):
+    from fastapi.responses import FileResponse
+    from app.services.execution_report_service import report_file
+    path=report_file(db,session_id,report_id,name)
+    if path is None:raise HTTPException(status_code=404,detail="运行报告不存在或尚未完成")
+    media='text/html' if name=='report.html' else 'application/zip' if name=='bundle.zip' else 'application/gzip' if name.endswith('.gz') else 'application/json'
+    return FileResponse(path,media_type=media,headers={
+        'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff',
+        'Content-Security-Policy':"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"})
+
+
 @router.get("/sessions/{session_id}", response_model=APIResponse, summary="查询研究会话记忆")
 def get_research_session_api(session_id: str, db: Session = Depends(get_db)):
     """返回可展示的会话历史和当前结果，不暴露内部大体积执行状态。"""
@@ -89,6 +127,8 @@ def get_research_session_api(session_id: str, db: Session = Depends(get_db)):
     if not session:
         raise HTTPException(status_code=404, detail="研究会话不存在")
     state = session.get("state") or {}
+    from app.services.research_artifact_service import ResearchArtifactService
+    public=ResearchArtifactService(db).read_published_delivery(session_id,status=session.get("status") or "running")
     return APIResponse.ok(
         {
             "session_id": session_id,
@@ -102,7 +142,7 @@ def get_research_session_api(session_id: str, db: Session = Depends(get_db)):
             "revision_number": state.get("revision_number") or 0,
             "selected_paper_ids": state.get("selected_paper_ids") or [],
             "excluded_paper_ids": state.get("excluded_paper_ids") or [],
-            "result": state.get("result_snapshot"),
+            "result": {**(state.get("result_snapshot") or {}),**(public or {})} if public else state.get("result_snapshot"),
         }
     )
 

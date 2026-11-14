@@ -101,7 +101,8 @@ def test_followup_action_requires_main_to_delegate_again(native):
     assert [m["kind"] for m in child["messages"]] == ["task", "progress", "completed", "task", "progress", "completed"]
     assert not current.get("active_subagent")
     assert len(current["main_agent_trajectory"]["memory"]) == 3
-    assert len(child["main_agent_trajectory"]["memory"]) == 5
+    assert len(child["main_agent_trajectory"]["memory"]) == 2
+    assert child.get("delegation_history") or child["main_agent_trajectory"]["archive_refs"]
     assert current["agent_execution_budget"]["actions_committed"] == 2
 
 
@@ -320,23 +321,29 @@ def test_subagent_context_externalization_is_service_only_and_compacts_independe
         store.hydrate_state("s", stored, role="search")
 
 
-def test_all_three_roles_have_separate_decisions_contexts_and_feedback():
+def test_all_four_roles_have_separate_decisions_contexts_and_feedback(store):
+    from tests.agent_decision_fakes import checked_result
+    def verify(current, args):
+        current['quality_gate'] = {'passed': True}
+        checked_result(current)
     current = state()
     llm = ScriptedLLM({
-        "main_agent_decision": ["search_and_rank", "fetch_metadata", "extract_paper_cards", "plan_claims", "generate_deliverables", "request_finish"],
+        "main_agent_decision": ["search_and_rank", "fetch_metadata", "extract_paper_cards", "plan_claims", "generate_deliverables", "validate_result", "request_finish"],
         "search_agent_decision": ["search_and_rank", report(message="search-private-turn"), "fetch_metadata", report()],
         "analysis_agent_decision": ["extract_paper_cards", report(message="analysis-private-turn"), "plan_claims", report()],
         "writing_agent_decision": ["generate_deliverables", report(message="writing-private-turn")],
+        "check_agent_decision": ["validate_result", report(message="check-private-turn")],
     })
     handlers = {
         "search_and_rank": search, "fetch_metadata": fetch,
         "extract_paper_cards": lambda s, a: s.update(paper_cards=[{"paper_id": "p1", "title": "证据"}]),
         "plan_claims": lambda s, a: s.update(claim_plans=[{"claim_id": "c1"}]),
-        "generate_deliverables": lambda s, a: s.update(review="已授权正文", quality_gate={"passed": True}),
+        "generate_deliverables": lambda s, a: s.update(review="已授权正文", pending_result_validation=True),
+        "validate_result": verify,
     }
     assert MainAgentLoop(llm).run(current, handlers=handlers,
-                                  finish_validator=lambda s: bool((s.get("quality_gate") or {}).get("passed"))) == "completed"
-    for role, other in (("analysis", "search"), ("writing", "analysis"), ("search", "writing")):
+                                  finish_validator=lambda s: bool((s.get("quality_gate") or {}).get("passed"))) == "completed", current.get("errors")
+    for role, other in (("analysis", "search"), ("writing", "analysis"), ("search", "writing"), ("check", "writing")):
         calls = [messages for op, messages in llm.calls if op == role + "_agent_decision"]
         assert len(calls) >= 2
         assert other + "-private-turn" not in encode(calls)

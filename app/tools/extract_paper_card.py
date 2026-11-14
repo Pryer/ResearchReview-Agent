@@ -134,6 +134,9 @@ def extract_from_full_text(
     values = {name: [] for name in fields}
     spans, mapping, records = [], {}, []
     calls = 0
+    remote_requests = cache_hits = 0
+    from app.services.extraction_response_cache import ExtractionResponseCache
+    response_cache=ExtractionResponseCache(settings,paper,parsed_text,CHUNK_FIELD_EXTRACTION_PROMPT)
     stopped = False
     issues = ["chunk_retrieval:degraded"] if retrieval.degraded else []
     for chunk in chunks:
@@ -148,18 +151,27 @@ def extract_from_full_text(
         else:
             calls += 1
             try:
-                response = llm.complete(CHUNK_FIELD_EXTRACTION_PROMPT.format(
-                    title=paper.get("title", ""), text=chunk["text"]), response_format="json")
-                check_execution()
-                data = _safe_parse_json(response)
+                cache_key=response_cache.key(chunk)
+                data=response_cache.get(cache_key)
+                if data is None:
+                    remote_requests+=1
+                    response = llm.complete(CHUNK_FIELD_EXTRACTION_PROMPT.format(
+                        title=paper.get("title", ""), text=chunk["text"]), response_format="json")
+                    check_execution()
+                    data = _safe_parse_json(response)
+                else:
+                    cache_hits+=1
+                    reason="reused_cache"
                 if (not isinstance(data, dict) or not any(name in data for name in fields)
                         or any(not isinstance(data[name], list)
                                or any(not isinstance(q, str) for q in data[name])
                                for name in fields if name in data)):
                     raise ValueError("invalid chunk extraction response")
+                response_cache.put(cache_key,data)
             except Exception as exc:
                 if isinstance(exc, InterruptedError) or is_control_exception(exc):
                     raise
+                response_cache.put(response_cache.key(chunk),error=type(exc).__name__)
                 logger.warning("Chunk extraction failed: %s chunk=%s error=%s",
                                paper.get("paper_id"), chunk["chunk_id"], type(exc).__name__)
                 status, reason, stopped = "failed", type(exc).__name__, True
@@ -210,7 +222,8 @@ def extract_from_full_text(
            for key, value in data.items()},
         "extraction_coverage": ExtractionCoverage(
             status="complete" if complete else "partial",
-            chunks=sorted(records, key=lambda record: record.chunk_id), retrieval=retrieval),
+            chunks=sorted(records, key=lambda record: record.chunk_id), retrieval=retrieval,
+            remote_requests=remote_requests, cache_hits=cache_hits),
         "evidence_spans": spans, "field_evidence": mapping,
         "quality_issues": list(dict.fromkeys(issues + ([] if complete else ["extraction:partial_coverage"]))),
     })

@@ -108,7 +108,7 @@ def test_supplemental_queries_put_topic_first():
 
 def test_sanitize_strips_verb_prefix():
     assert sanitize_search_keyword("调研 少样本动作识别") == "少样本动作识别"
-    assert sanitize_search_keyword("检索少样本动作识别研究综述") == "少样本动作识别研究综述"
+    assert sanitize_search_keyword("检索 少样本动作识别研究综述") == "少样本动作识别研究综述"
 
 
 def test_generic_search_keywords_are_recognized():

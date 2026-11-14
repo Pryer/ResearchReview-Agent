@@ -68,6 +68,12 @@ def claim_plan_node(state: "ResearchAgentState", llm=None) -> "ResearchAgentStat
                     "core_paper_ids": pids,
                 })
 
+        if not validated and state.get('core_deliverables') == ['research_background']:
+            from app.agent.evidence_roles import citation_eligible_paper_ids
+            eligible = citation_eligible_paper_ids(state.get('research_semantic_frame') or {}, state.get('paper_cards') or [], deliverable_type='research_background')
+            if eligible:
+                validated = [{'route_id': 'background_argument', 'name': '研究背景论证',
+                              'core_paper_ids': sorted(eligible)}]
         if not validated:
             state["claim_plans"] = []
             append_step(state, "claim_plan", "skipped",
@@ -305,7 +311,7 @@ def global_evidence_gate_node(state: "ResearchAgentState") -> "ResearchAgentStat
     "references", "citation_map", "citation_registry", "citation_validation",
     "reference_papers", "unique_cited_paper_count", "final_requirement_met",
 )
-def citation_check_node(state: "ResearchAgentState", llm=None) -> "ResearchAgentState":
+def citation_check_node(state: "ResearchAgentState", llm=None, *, render_text: bool = True) -> "ResearchAgentState":
     """生成并校验参考文献。"""
     t0 = time.time()
     try:
@@ -357,8 +363,9 @@ def citation_check_node(state: "ResearchAgentState", llm=None) -> "ResearchAgent
         from app.core.citation_syntax import extract_citation_ids
         if any(value.isdigit() for value in extract_citation_ids(generated_text)):
             # WHY: 旧数字稿若没有同版本原文，当前卡片顺序不能证明编号身份。
-            state.pop("citation_source_text", None)
-            state.pop("citation_rendered_text", None)
+            if render_text:
+                state.pop("citation_source_text", None)
+                state.pop("citation_rendered_text", None)
             state["citation_validation"] = {"valid": False, "reason": "citation_identity_unverified"}
             state["references"] = []
             state["reference_papers"] = []
@@ -379,7 +386,8 @@ def citation_check_node(state: "ResearchAgentState", llm=None) -> "ResearchAgent
             llm=None,
             allow_positional_numeric=False,
         )
-        state["citation_source_text"] = generated_text
+        if render_text:
+            state["citation_source_text"] = generated_text
         state["references"] = result.get("references", [])
         state["citation_validation"] = result.get("validation", {})
         state["reference_papers"] = result.get("reference_papers", [])
@@ -389,7 +397,7 @@ def citation_check_node(state: "ResearchAgentState", llm=None) -> "ResearchAgent
             citation_sources,
         )
         rendered_text = result.get("rendered_text")
-        if rendered_text:
+        if rendered_text and render_text:
             if state.get("review"):
                 state["review"] = rendered_text
             elif state.get("related_work"):
@@ -404,6 +412,7 @@ def citation_check_node(state: "ResearchAgentState", llm=None) -> "ResearchAgent
             if paper.get("paper_id")
         }
         state["unique_cited_paper_count"] = len(cited_ids & citable_ids)
+        # WHY: 历史字段只表示去重引用篇数达标；整体交付仍由当前Check和质量门禁决定。
         state["final_requirement_met"] = (
             state["unique_cited_paper_count"]
             >= int(state.get("required_reference_count") or state.get("max_papers") or 0)
@@ -464,6 +473,7 @@ def verify_claims_node(
     target_sentence_indices: list[int] | None = None,
     target_claim_ids: list[str] | None = None,
     verification_scope: dict[str, Any] | str | None = None,
+    read_only: bool = False,
 ) -> "ResearchAgentState":
     """逐句检查生成主张；可选地只重验证目标句并合并上一轮结果。"""
     t0 = time.time()
@@ -484,7 +494,8 @@ def verify_claims_node(
         elif any(value.isdigit() for value in extract_citation_ids(generated_text)):
             # WHY: 旧会话只有数字正文而没有可证实的渲染前版本时，不能按
             # 当前卡片顺序猜测论文。保持未验证，由质量门禁阻止正式交付。
-            state.pop("citation_source_text", None)
+            if not read_only:
+                state.pop("citation_source_text", None)
             prior = state.get("claim_verification")
             state["claim_verification"] = {
                 "status": "identity_unverified", "valid": False,
@@ -502,7 +513,7 @@ def verify_claims_node(
             if card.get("paper_id")
         }
         normalized_text = normalize_citation_syntax(generated_text, citable_ids)
-        if normalized_text != generated_text:
+        if normalized_text != generated_text and not read_only:
             generated_text = normalized_text
             if state.get("review"):
                 state["review"] = normalized_text
@@ -625,122 +636,129 @@ def verify_claims_node(
                 )
             )
         ]
-        # 少量独立坏句可安全隔离；大量删除会破坏段落结构并把40篇引用静默
-        # 删成34篇。超过保守阈值时保留原稿并让质量门禁阻断，交给章节重写。
-        factual_count = max(1, int(report.get("factual_claims") or 0))
-        safe_removal_limit = max(2, min(5, int(factual_count * 0.1)))
-        if (
-            unsupported_before
-            and len(unsupported_before) <= safe_removal_limit
-            and (state.get("review") or state.get("related_work") or state.get("introduction"))
-        ):
-            repaired_text, removed_claims = _remove_unsupported_claims(
-                generated_text, unsupported_before
-            )
-            if removed_claims and repaired_text != generated_text:
-                repaired_integrity_errors = _integrity_errors(repaired_text)
-                if repaired_integrity_errors - current_integrity_errors:
-                    state["claim_repairs"] = {
-                        "strategy": "section_rewrite_required",
-                        "removed_count": 0,
-                        "unsupported_count": len(unsupported_before),
-                        "reason": "删除候选新增正文完整性错误，已保留原稿",
-                    }
-                else:
-                    _update_state_review_text(state, repaired_text)
-                    generated_text = repaired_text
-                    current_integrity_errors = repaired_integrity_errors
-                    state["claim_repairs"] = {
-                        "strategy": "remove_unsupported_sentences",
-                        "removed_count": len(removed_claims),
-                        "removed_claim_ids": [
-                            str(claim.get("claim_id") or "")
-                            for claim in removed_claims
-                        ],
-                        "removed_samples": [
-                            str(claim.get("sentence") or "")[:180]
-                            for claim in removed_claims[:5]
-                        ],
-                    }
-                    report = _run_verification(repaired_text, **reverify_kwargs)
-        elif unsupported_before and (state.get("review") or state.get("related_work") or state.get("introduction")):
-            repaired_text, rewritten_records = _rewrite_and_weaken_unsupported_claims(
-                generated_text,
-                unsupported_before,
-                state.get("paper_cards") or [],
-                llm=llm,
-            )
-            if rewritten_records and repaired_text != generated_text:
-                # WHY: 修复前后必须使用同一验证契约。中文主张与英文证据
-                # 只靠词面重合会产生系统性假阴性，不能在重写后退回该口径。
-                new_report = _run_verification(repaired_text, **reverify_kwargs)
-                # WHY: 旧条件是 OR，support_rate 只要不低于原值（哪怕零改善）
-                # 就把整批改写落盘；实测 rewritten_count=7 而未支持主张仍是 22，
-                # 支持率反而从 47.1% 掉到 36.1%。改写必须真正减少未支持主张，
-                # 否则不落盘，改由 section_rewrite_required 如实报告缺口。
-                repaired_integrity_errors = _integrity_errors(repaired_text)
-                if (
-                    int(new_report.get("unsupported") or 0)
-                    < int(report.get("unsupported") or 0)
-                    and not (repaired_integrity_errors - current_integrity_errors)
-                ):
-                    generated_text = repaired_text
-                    _update_state_review_text(state, repaired_text)
-                    report = new_report
-                    current_integrity_errors = repaired_integrity_errors
-                    reverify_kwargs["previous"] = report
+        if not read_only:
+            # 少量独立坏句可安全隔离；大量删除会破坏段落结构并把40篇引用静默
+            # 删成34篇。超过保守阈值时保留原稿并让质量门禁阻断，交给章节重写。
+            factual_count = max(1, int(report.get("factual_claims") or 0))
+            safe_removal_limit = max(2, min(5, int(factual_count * 0.1)))
+            if (
+                unsupported_before
+                and len(unsupported_before) <= safe_removal_limit
+                and (state.get("review") or state.get("related_work") or state.get("introduction"))
+            ):
+                repaired_text, removed_claims = _remove_unsupported_claims(
+                    generated_text, unsupported_before
+                )
+                if removed_claims and repaired_text != generated_text:
+                    repaired_integrity_errors = _integrity_errors(repaired_text)
+                    if repaired_integrity_errors - current_integrity_errors:
+                        state["claim_repairs"] = {
+                            "strategy": "section_rewrite_required",
+                            "removed_count": 0,
+                            "unsupported_count": len(unsupported_before),
+                            "reason": "删除候选新增正文完整性错误，已保留原稿",
+                        }
+                    else:
+                        _update_state_review_text(state, repaired_text)
+                        generated_text = repaired_text
+                        current_integrity_errors = repaired_integrity_errors
+                        state["claim_repairs"] = {
+                            "strategy": "remove_unsupported_sentences",
+                            "removed_count": len(removed_claims),
+                            "removed_claim_ids": [
+                                str(claim.get("claim_id") or "")
+                                for claim in removed_claims
+                            ],
+                            "removed_samples": [
+                                str(claim.get("sentence") or "")[:180]
+                                for claim in removed_claims[:5]
+                            ],
+                        }
+                        report = _run_verification(repaired_text, **reverify_kwargs)
+            elif unsupported_before and (state.get("review") or state.get("related_work") or state.get("introduction")):
+                repaired_text, rewritten_records = _rewrite_and_weaken_unsupported_claims(
+                    generated_text,
+                    unsupported_before,
+                    state.get("paper_cards") or [],
+                    llm=llm,
+                )
+                if rewritten_records and repaired_text != generated_text:
+                    # WHY: 修复前后必须使用同一验证契约。中文主张与英文证据
+                    # 只靠词面重合会产生系统性假阴性，不能在重写后退回该口径。
+                    new_report = _run_verification(repaired_text, **reverify_kwargs)
+                    # WHY: 旧条件是 OR，support_rate 只要不低于原值（哪怕零改善）
+                    # 就把整批改写落盘；实测 rewritten_count=7 而未支持主张仍是 22，
+                    # 支持率反而从 47.1% 掉到 36.1%。改写必须真正减少未支持主张，
+                    # 否则不落盘，改由 section_rewrite_required 如实报告缺口。
+                    repaired_integrity_errors = _integrity_errors(repaired_text)
+                    if (
+                        int(new_report.get("unsupported") or 0)
+                        < int(report.get("unsupported") or 0)
+                        and not (repaired_integrity_errors - current_integrity_errors)
+                    ):
+                        generated_text = repaired_text
+                        _update_state_review_text(state, repaired_text)
+                        report = new_report
+                        current_integrity_errors = repaired_integrity_errors
+                        reverify_kwargs["previous"] = report
 
-                    remaining_unsupported = [
-                        claim for claim in report.get("claims") or []
-                        if claim.get("factual")
-                        and claim.get("support_status") == "unsupported"
-                    ]
-                    if remaining_unsupported and len(remaining_unsupported) <= safe_removal_limit:
-                        final_text, removed_claims = _remove_unsupported_claims(
-                            generated_text, remaining_unsupported
-                        )
-                        if removed_claims and final_text != generated_text:
-                            final_integrity_errors = _integrity_errors(final_text)
-                            if not (final_integrity_errors - current_integrity_errors):
-                                _update_state_review_text(state, final_text)
-                                generated_text = final_text
-                                current_integrity_errors = final_integrity_errors
-                                report = _run_verification(final_text, **reverify_kwargs)
+                        remaining_unsupported = [
+                            claim for claim in report.get("claims") or []
+                            if claim.get("factual")
+                            and claim.get("support_status") == "unsupported"
+                        ]
+                        if remaining_unsupported and len(remaining_unsupported) <= safe_removal_limit:
+                            final_text, removed_claims = _remove_unsupported_claims(
+                                generated_text, remaining_unsupported
+                            )
+                            if removed_claims and final_text != generated_text:
+                                final_integrity_errors = _integrity_errors(final_text)
+                                if not (final_integrity_errors - current_integrity_errors):
+                                    _update_state_review_text(state, final_text)
+                                    generated_text = final_text
+                                    current_integrity_errors = final_integrity_errors
+                                    report = _run_verification(final_text, **reverify_kwargs)
 
-                    state["claim_repairs"] = {
-                        "strategy": "rewrite_and_weaken_unsupported_claims",
-                        "rewritten_count": len(rewritten_records),
-                        "rewritten_samples": [
-                            {
-                                "original": r["original"][:120],
-                                "revised": r["revised"][:120],
-                                "method": r.get("method"),
-                            }
-                            for r in rewritten_records[:5]
-                        ],
-                        "unsupported_after_rewrite": int(report.get("unsupported") or 0),
-                    }
+                        state["claim_repairs"] = {
+                            "strategy": "rewrite_and_weaken_unsupported_claims",
+                            "rewritten_count": len(rewritten_records),
+                            "rewritten_samples": [
+                                {
+                                    "original": r["original"][:120],
+                                    "revised": r["revised"][:120],
+                                    "method": r.get("method"),
+                                }
+                                for r in rewritten_records[:5]
+                            ],
+                            "unsupported_after_rewrite": int(report.get("unsupported") or 0),
+                        }
+                    else:
+                        state["claim_repairs"] = {
+                            "strategy": "section_rewrite_required",
+                            "removed_count": 0,
+                            "unsupported_count": len(unsupported_before),
+                            "safe_removal_limit": safe_removal_limit,
+                            "unsupported_after_rewrite": int(new_report.get("unsupported") or 0),
+                            "reason": (
+                                "改写候选新增正文完整性错误，已保留原稿"
+                                if repaired_integrity_errors - current_integrity_errors
+                                else "改写未减少未支持主张，且批量删除会破坏段落完整性和最低引用覆盖量"
+                            ),
+                        }
                 else:
                     state["claim_repairs"] = {
                         "strategy": "section_rewrite_required",
                         "removed_count": 0,
                         "unsupported_count": len(unsupported_before),
                         "safe_removal_limit": safe_removal_limit,
-                        "unsupported_after_rewrite": int(new_report.get("unsupported") or 0),
-                        "reason": (
-                            "改写候选新增正文完整性错误，已保留原稿"
-                            if repaired_integrity_errors - current_integrity_errors
-                            else "改写未减少未支持主张，且批量删除会破坏段落完整性和最低引用覆盖量"
-                        ),
+                        "reason": "批量删除会破坏段落完整性和最低引用覆盖量",
                     }
-            else:
-                state["claim_repairs"] = {
-                    "strategy": "section_rewrite_required",
-                    "removed_count": 0,
-                    "unsupported_count": len(unsupported_before),
-                    "safe_removal_limit": safe_removal_limit,
-                    "reason": "批量删除会破坏段落完整性和最低引用覆盖量",
-                }
+        elif unsupported_before:
+            state["claim_repairs"] = {
+                "strategy": "main_delegation_required", "removed_count": 0,
+                "unsupported_count": len(unsupported_before),
+                "reason": "Check仅报告问题；由Main委派Writing修复具体主张",
+            }
         state["claim_verification"] = report
         state["evidence_quality_report"] = {
             "evidence_summary": report.get("evidence_summary") or {},

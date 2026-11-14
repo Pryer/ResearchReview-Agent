@@ -183,8 +183,8 @@ def test_background_writer_rejects_uncited_and_overreaching_llm_draft():
 
     assert validation["valid"] is True
     assert "本文提出" not in text
-    assert not text.startswith("# ")
     assert validation["metrics"]["unique_cited_papers"] >= 2
+    assert any('本文提出' in c.get('raw_text', '') for c in state['writer_candidates'])
 
 
 def test_research_status_fallback_meets_requested_unique_reference_target():

@@ -46,7 +46,11 @@ class EmbeddingClient:
                 raise RetrievalProviderError("embedding 返回数量与请求不一致")
             ordered = [None] * len(batch)
             for record in records:
-                index = record.get("text_index") if isinstance(record, dict) else None
+                # WHY: 原生端点可能返回text_index或index；只兼容名称，整数、去重与位置校验不变。
+                index = record.get("text_index", record.get("index")) if isinstance(record, dict) else None
+                if isinstance(record, dict) and "text_index" in record and "index" in record:
+                    if type(record["index"]) is not int or record["index"] != index:
+                        raise RetrievalProviderError("embedding 索引字段冲突")
                 raw = record.get("embedding") if isinstance(record, dict) else None
                 if type(index) is not int or not 0 <= index < len(batch) or ordered[index] is not None:
                     raise RetrievalProviderError("embedding text_index 重复或越界")

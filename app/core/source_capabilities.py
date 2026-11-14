@@ -27,7 +27,8 @@ def is_generic_search_keyword(query: str) -> bool:
 
 
 _TIME_PREFIX_RE = re.compile(r"^(?:近[一二三四五六七八九十\d]+\s*年|最新|近年来|最近)\s*")
-_VERB_PREFIX_RE = re.compile(r"^(?:调研|检索|搜索|查询|查找|研究)\s*")
+# WHY: 检索增强生成、研究方法等连续术语不能按命令动词截断。
+_VERB_PREFIX_RE = re.compile(r"^(?:请(?:帮我)?|帮我)?(?:调研|检索|搜索|查询|查找|研究)[\s：:]+")
 
 
 def sanitize_search_keyword(query: str) -> str | None:

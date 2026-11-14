@@ -77,6 +77,13 @@ def targeted_search_kind(state: dict[str, Any]) -> str:
     if route_recovery_stop_reason(state):
         return ""
     decision = state.get("recovery_decision") or {}
+    if (decision.get("kind") == "quality" and decision.get("action") == "TARGETED_SEARCH"
+            and decision.get("queries") and (state.get("evidence_gap_report") or {}).get("quality_claim_gaps")):
+        from app.agent.generation_recovery import input_fingerprint
+        # WHY: 查询只适用于被Analysis诊断的正文/证据/授权，资料变化后必须重新诊断。
+        if (state.get("evidence_gap_report") or {}).get("quality_input_fingerprint") == input_fingerprint(state):
+            return "quality"
+        return ""
     if ((state.get("evidence_gap_report") or {}).get("needs_recovery")
             and decision.get("action") in {"TARGETED_SEARCH", "QUERY_FILTER_REVISION"}
             and decision.get("queries")):

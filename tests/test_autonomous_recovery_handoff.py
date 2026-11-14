@@ -1,4 +1,5 @@
 """恢复耗尽不空转；新证据必须重新授权后才进入写作，终态关闭恢复记录。"""
+from tests.agent_decision_fakes import completed_verifier, accept_check_kwargs
 import json
 
 import pytest
@@ -253,8 +254,8 @@ def test_recovery_returns_to_main_before_claims_and_writing(monkeypatch, usable,
     monkeypatch.setattr(graph, 'claim_plan_node', claims)
     monkeypatch.setattr(graph, '_run_claim_evidence_gate', gate)
     monkeypatch.setattr(graph, '_generate_deliverables_or_block', write)
-    monkeypatch.setattr(graph, '_verify_generated_draft', lambda current: calls.append('verify'))
-    monkeypatch.setattr(graph, 'final_answer_node', lambda current: None)
+    monkeypatch.setattr(graph, '_verify_generated_draft', completed_verifier(lambda current: calls.append('verify')))
+    monkeypatch.setattr(graph, 'final_answer_node', accept_check_kwargs(lambda current: None))
     output = graph._run_autonomous_pipeline(state)
     assert all(e.get('code') == 'main_agent_blocked' for e in state.get('errors') or []), state.get('errors')
     assert calls == ['search', 'routes', 'claims', 'claim_gate', 'readiness', *(['verify'] if usable >= 40 else [])]

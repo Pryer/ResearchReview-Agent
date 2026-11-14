@@ -4,6 +4,7 @@
 """
 
 from __future__ import annotations
+from tests.agent_decision_fakes import completed_verifier, accept_check_kwargs
 
 import pytest
 from tests.test_main_delegation_context import agent_artifacts
@@ -663,7 +664,9 @@ def _install_graph_fakes(monkeypatch, *, n_papers: int) -> None:
         current["writing_plans"] = [{"sections": []}]
         return current
 
-    def fake_verify(current, llm=None):
+    def fake_verify(current, llm=None, **kwargs):
+        current['claim_verification'] = {'valid': True, 'unsupported': 0, 'unverified': 0, 'verification_coverage': 1.0}
+        current['generation_quality'] = {'passed': True, 'support_rate': 1.0}
         return current
 
     def fake_citation(current, llm=None):
@@ -689,8 +692,8 @@ def _install_graph_fakes(monkeypatch, *, n_papers: int) -> None:
     monkeypatch.setattr("app.agent.graph.claim_evidence_gate_node", fake_claim_gate)
     monkeypatch.setattr("app.agent.graph.generate_deliverables_node", fake_generate)
     monkeypatch.setattr("app.agent.graph._claim_alignment_check", lambda current: None)
-    monkeypatch.setattr("app.agent.graph.verify_claims_node", fake_verify)
-    monkeypatch.setattr("app.agent.graph.citation_check_node", fake_citation)
+    monkeypatch.setattr("app.agent.graph.verify_claims_node", accept_check_kwargs(fake_verify))
+    monkeypatch.setattr("app.agent.graph.citation_check_node", accept_check_kwargs(fake_citation))
     # 隔离收尾阶段的完整性校验与评估导出，让 smoke 聚焦门禁集成
     monkeypatch.setattr(
         "app.tools.validate_deliverable.validate_final_review_integrity",
@@ -739,7 +742,7 @@ def test_graph_smoke_gate_flags_deficit_and_partial_status(monkeypatch, agent_ar
     assert "全局证据门提示" in result["answer"]
 
 
-def test_gate_runs_after_claim_plan_and_reports_real_claim_source(monkeypatch):
+def test_gate_runs_after_claim_plan_and_reports_real_claim_source(monkeypatch, agent_artifacts):
     """全局门禁必须排在 claim_plan 之后，否则主张强度永远落到回退值。
 
     回归 2026-08-29 实测缺陷：门禁在 claim_plan 之前执行，

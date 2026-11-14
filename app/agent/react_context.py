@@ -123,6 +123,10 @@ class ReActContext:
             self.data["messages"].append({"role": "user", "content": encode({"goal": goal})})
         status = context.model_dump(mode="json")
         status["state"]["allowed_actions"] = list(allowed_actions)
+        if self.namespace is None:
+            from app.agent.delegation_context import selectable_context_ids
+            # WHY: ID目录随最新状态更新，保持五字段与稳定工具前缀；不从历史或论文ID补造。
+            status["state"]["context_selection_ids"] = selectable_context_ids(context)
         # WHY: 状态栏也追加保留；下一次请求完全保留本次输入前缀，直至 epoch 压缩。
         prefix = {"role": "system", "content": system}
         settings = get_settings()

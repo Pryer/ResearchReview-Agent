@@ -153,6 +153,15 @@ def search_node(
                 keyword = str(item).strip()
             if keyword and keyword not in keywords:
                 keywords.append(keyword)
+        from app.core.source_capabilities import sanitize_search_keyword
+        # WHY: 在查历史窗口之前规范化；原始指令词不能永远冒充新查询。
+        normalized=[]
+        for value in keywords:
+            clean=sanitize_search_keyword(value)
+            if clean and clean.casefold() not in {q.casefold() for q in normalized}:
+                normalized.append(clean)
+                if value.casefold() in keyword_roles: keyword_roles[clean.casefold()]=keyword_roles[value.casefold()]
+        keywords=normalized
         state["query_roles"] = keyword_roles
         scope_query_roles: dict[str, str] = {}
         for query in (state.get("scope_search_queries") or []):
@@ -310,6 +319,15 @@ def search_node(
                     search_keywords = [anchor_keyword]
                     anchor_promotion = f"(空批) -> {anchor_keyword}"
 
+        # WHY: 锚点替换后必须再次去重；替换不能重新发送已完成的窗口。
+        final_keywords=[]
+        for query in search_keywords:
+            query=sanitize_search_keyword(query)
+            if not query or query.casefold() in {q.casefold() for q in final_keywords}: continue
+            if _normalized_window_key(query, search_start_year, search_end_year) in searched_windows: continue
+            final_keywords.append(query)
+        search_keywords=final_keywords
+
         def _is_pure_chinese_query(query: str) -> bool:
             return bool(re.search(r"[\u4e00-\u9fff]", query)) and not bool(
                 re.search(r"[A-Za-z]{3,}", query)
@@ -405,6 +423,7 @@ def search_node(
                 sources=sources,
                 diagnostics=local_diagnostics,
                 should_cancel=should_cancel,
+                query_ledger=state.setdefault("search_query_ledger", {}),
             )
             return index, keyword, sources, found, local_diagnostics
 
@@ -416,6 +435,7 @@ def search_node(
             1, min(settings.search_keyword_max_workers, len(search_keywords))
         )
         dispatched: dict[int, tuple[int, str, list[str], list, List[SourceDiagnostic]]] = {}
+        failed_keyword_indices=set()
         with ThreadPoolExecutor(
             max_workers=keyword_workers, thread_name_prefix="keyword-search"
         ) as executor:
@@ -435,6 +455,9 @@ def search_node(
                 try:
                     dispatched[index] = future.result()
                 except Exception as exc:  # noqa: BLE001
+                    from app.agent.execution_budget import is_control_exception
+                    if is_control_exception(exc) or isinstance(exc, InterruptedError): raise
+                    failed_keyword_indices.add(index)
                     keyword = search_keywords[index]
                     logger.warning(
                         "search_node: keyword=%r dispatch failed, keeping other keywords: %s",
@@ -500,8 +523,7 @@ def search_node(
             paper for paper in papers if candidate_key(paper) not in previous_keys
         ]
         newly_added_unique = len(new_papers)
-        # 本轮新增论文的身份键集合（跨轮累积）：供增量轮末尾 LLM 重排
-        # 区分新论文与旧榜单，只对新增部分做重排归并。
+        # 新增身份用于诊断；全局BM25/RRF重算，昂贵模型通过内容缓存增量复用。
         if state.get("incremental_retrieval"):
             state["incremental_new_paper_keys"] = list(dict.fromkeys([
                 *(state.get("incremental_new_paper_keys") or []),
@@ -515,12 +537,14 @@ def search_node(
         duplicate_count = len(combined_dicts) - len(papers)
         state["candidate_papers"] = papers
         searched_keywords = list(state.get("searched_keywords") or [])
-        for keyword in search_keywords:
+        completed_keywords = [keyword for index, keyword in enumerate(search_keywords)
+            if index not in failed_keyword_indices and all(getattr(d, "status", "failed") in {"success", "empty"} for d in dispatched[index][4])]
+        for keyword in completed_keywords:
             if keyword not in searched_keywords:
                 searched_keywords.append(keyword)
         state["searched_keywords"] = searched_keywords
         query_windows = list(state.get("searched_query_windows") or [])
-        for keyword in search_keywords:
+        for keyword in completed_keywords:
             window_key = f"{str(keyword).strip().lower()}|{search_start_year}|{search_end_year}"
             if window_key not in query_windows:
                 query_windows.append(window_key)

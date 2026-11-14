@@ -10,14 +10,14 @@
 
 ## ✨ 核心能力
 
-按「**1 条工程底座 + 3 个业务模块**」组织：底座是让这套 RAG 在生产上跑得住的运行时能力，
+按「**1 条工程底座 + 3 个业务模块**」组织：底座提供长任务运行、状态恢复和受控执行能力，
 三个模块是业务数据流（发现 → 检索抽取 → 生成质检）。
 
 ### ▍工程底座（跨模块）
 
 | 能力 | 说明 |
 |------|------|
-| Agent 编排模型 | 统一主从调度：主 Agent 每轮选一个任务；Search / Analysis / Writing 各自独立 ReAct 循环，跨委派保留上下文，通过结构化消息完成委派、汇报与协助请求 |
+| Agent 编排模型 | 统一主从调度：主 Agent 每轮选一个任务；Search / Analysis / Writing / Check 各自独立 ReAct 循环，同一委派内连续对话，跨委派按角色摘要与依赖增量继承，通过结构化消息完成委派、汇报与协助请求 |
 | 受控执行边界 | Controller 按动作投影输入，校验角色工具权限、输出白名单、类型、身份与版本后才提交；建议动作不等于授权执行 |
 | 上下文工程 | Stable Prefix + 追加式 ReAct Trajectory + 动态 Agent Status Bar；Token 水位触发的有界 Compaction（含滞回阈值）、Artifact 归档与历史观察回查 |
 | 会话记忆检索 | Append-only Event Log + Cursor 增量摘要；主控按任务做中英文词项检索、有界注入，并记录采用反馈与后续结果 |
@@ -83,8 +83,10 @@ CNKI 是 **Selenium 网页适配器，不是官方 API**，默认 `CNKI_ENABLED=
 
 ## 当前架构
 
-研究执行采用统一的主从调度：主 Agent 每轮选择一个任务，Search、Analysis、Writing
-各自通过独立 ReAct 循环决定本角色的后续动作并向主控汇报；动作权限、预算、
+Main 负责规划与委派；Search、Analysis、Writing 和 Check 分别处理检索、证据分析、写作与独立核验。Controller 校验权限、状态版本和发布条件，核验失败后可在预算内补证或修订。具体实现见 [架构介绍](ARCHITECTURE.md) 和 [Check 与反馈闭环](docs/check-agent-and-feedback.md)。
+
+研究执行采用统一的主从调度：主 Agent 每轮选择一个任务，Search、Analysis、Writing、Check
+各自通过独立 ReAct 循环执行本次授权动作并向主控汇报；动作权限、预算、
 取消、证据版本与质量门禁由确定性代码裁决。历史会话（含未记录模式或标记为
 `legacy` 的旧状态）在恢复入口统一规范为这套调度；原研究目标、显式约束、论文
 与证据卡、恢复历史与预算消耗全部保留，只重算与旧调度绑定的派生结果。
@@ -95,7 +97,7 @@ CNKI 是 **Selenium 网页适配器，不是官方 API**，默认 `CNKI_ENABLED=
 ```text
 用户请求 → 需求解析 → 构建五字段 → 主 Agent 委派任务
                                       ↓
-                         Search / Analysis / Writing 独立上下文
+                         Search / Analysis / Writing / Check 独立上下文
                                       ↓
                          子 Agent 决策 → Controller 校验执行
                               ↑              ↓
@@ -127,7 +129,7 @@ Main Agent 可用 `search_research_memory(query, kind, limit)` 查询本会话�
 输入采用保守估算，实际用量来自服务商 usage。轨迹压缩需要会话 Artifact Store，
 详细配置及边界见 [上下文架构](docs/agent-context-architecture.md#react-epochs-and-context-capacity)。
 
-三个子 Agent 的角色规则、追加式交互轨迹、预算视图和压缩 Epoch 分别保存，跨委派
+四个子 Agent 的角色规则、追加式交互轨迹、预算视图和压缩 Epoch 分别保存，跨委派
 复用，并随会话检查点恢复。主控通过任务目标、参数和证据引用下达任务，子 Agent
 通过结构化进展、完成、协助请求和阻断消息反馈。它们按需持续决策到汇报或执行边界，
 当前采用同步委派，不启动后台常驻线程或并行写入共享研究状态。
@@ -136,6 +138,9 @@ Main Agent 可用 `search_research_memory(query, kind, limit)` 查询本会话�
 已有委派；未开放同角色并发。`status=completed` 只代表执行生命周期结束，
 `outcome` 和 `delegation_status` 分别报告业务结果与完成/协助/阻断通信状态；
 主控会显式消费这些状态，子任务完成不能替代最终质量门禁。
+核验失败时，Main依据逐条主张和证据缺口决定改写、补检索或重新分析；新增论文必须先提取证据和更新授权。
+新候选必须独立核验，残稿不能标记可用。常规显式引用任务默认按约2倍保留合格候选，首批证据池约1.5倍，
+大额任务仍受既有绝对余量与执行预算约束。详见[质量反馈与恢复闭环](docs/main-quality-feedback-loop.md)。
 
 ---
 
@@ -330,7 +335,7 @@ ResearchReview-Agent/
 │   │   ├── controller.py / action_contracts.py # 动作授权、输入投影、补丁与版本校验
 │   │   ├── context_builder.py # 五字段状态摘要与主控可见的子 Agent 汇报
 │   │   ├── react_context.py   # 按角色隔离的追加式轨迹、观察和 Epoch 压缩
-│   │   ├── subagents/loop.py  # Search/Analysis/Writing 独立循环与主从通信
+│   │   ├── subagents/loop.py  # Search/Analysis/Writing/Check 独立循环与主从通信
 │   │   ├── execution_budget.py # 跨主决策、专业任务和重试共享预算
 │   │   ├── nodes/             # 按阶段分组的节点包：planning/retrieval/extraction/synthesis/verification
 │   │   ├── retrieval_loop.py  # ReAct 检索精化循环
@@ -389,6 +394,7 @@ ResearchReview-Agent/
 | `RESEARCH_MEMORY_CONTEXT_CHARS` | 检索结果 JSON 字符上限，另受单次工具反馈上限的一半约束 | `1600` |
 | `AGENT_EXECUTION_ACTION_BUDGET` | 会话累计专业动作预留上限 | `64` |
 | `AGENT_MAIN_TOKEN_BUDGET` | 主决策、解析、专业任务、重试及备用共享累计 token 上限 | `10000000` |
+| `AGENT_MODEL_REQUEST_LIMIT` | LLM、Embedding、Reranker总尝试上限；恢复沿用已用次数及更严格的已存上限，0为不额外限制；E2E runner默认1024 | `1024` |
 | `AGENT_RETRIEVAL_BUDGET` | 累计检索轮次上限 | `64` |
 | `CARD_EXTRACTION_CHUNK_CHARS` | 全文抽取每块字符上限，优先页及章节边界 | `6000` |
 | `CARD_EXTRACTION_MAX_CHUNKS` | 单篇最多块抽取调用次数，未读块记录为覆盖不全 | `8` |
@@ -540,3 +546,18 @@ UI 片段保留 360 字符，语义核验使用完整的已选证据。
 3. 不编造论文、作者、年份、引用量
 4. 综述引用必须来自已检索到的论文
 5. 证据来源明确标注（abstract / full_text）
+
+
+## 可用草稿交付与增量处理（2026-11-10）
+
+新任务默认采用 `draft_first` 策略，在满足草稿发布条件时可先交付明确标记的草稿；旧任务及显式 `strict` 任务继续使用正式门禁。已发布版本可在后续优化期间阅读和下载，配置快照贯穿恢复。默认 Main 最多 96 轮、总模型请求 1024 次、检索模型子预算 512 次，每篇最多抽取 8 块；这些限制可配置。正式交付仍须通过当前版本的独立核验与质量门禁。
+
+配置、草稿等级、补检索与缓存依赖见[实现说明](docs/draft-delivery-and-incremental-retrieval.md)。
+
+历史验证（2026-11-11）：离线测试 2037 项通过、17 项跳过；原生 pgvector 集成测试另行通过 17 项。一次真实任务交付了引用 5 篇的 `partial` 草稿，未满足正式要求，也未经过独立人工验收；另一项 strict 任务被阻断。上述结果只代表当次运行，详见[验证报告](docs/validation/2026-11-11-draft-delivery.md)。
+
+## 自动运行报告（2026-11-11）
+
+每次任务结束后默认生成可离线阅读的HTML时间线，包含Main每轮上下文、专业Agent输入/角色记忆、工具步骤和返回结果。前端任务消息提供报告下载；默认保存在`data/execution_reports/<report_id>/report.html`。E2E目录另存`execution_report.html`与ZIP包。重启服务后新任务生效；配置与接口见[自动运行报告](docs/execution-reports.md)。
+
+报告相对路径按本仓库根目录解析；历史导出工具为 `scripts/export_execution_report.py`。运行报告可能包含任务上下文，分享前应检查内容。

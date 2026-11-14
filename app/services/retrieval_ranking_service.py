@@ -171,6 +171,13 @@ def build_queries(state: dict[str, Any], max_queries: int) -> list[RetrievalQuer
     context = " ".join(str(value) for value in (scope.get("include_terms") or [])[:3])
     add(" ".join(part for part in (topic, context) if part), "overall", "overall", "semantic_frame")
     for index, branch in enumerate(state.get("search_branches") or []):
+        if isinstance(branch, dict) and branch.get("constraint_level") == "targeted_recovery":
+            for query in (branch.get("queries") or [])[:2]:
+                add(str(query), "gap", f"gap:{index}", "targeted_recovery")
+    for query in ((state.get("recovery_decision") or {}).get("queries") or [])[:2]:
+        if isinstance(query, dict): query=query.get("query") or query.get("keyword") or ""
+        add(str(query), "gap", "gap:active", "recovery_decision")
+    for index, branch in enumerate(state.get("search_branches") or []):
         if not isinstance(branch, dict):
             continue
         for query in (branch.get("queries") or [])[:2]:
@@ -243,6 +250,8 @@ def _rerank_cached(client, settings, query: str, documents, should_cancel):
             scores[index] = value
     if missing:
         fresh = client.score(query, [item[2] for item in missing], should_cancel=should_cancel)
+        if len(fresh) != len(missing) or not np.isfinite(fresh).all():
+            raise RetrievalProviderError("rerank response count or scores invalid")
         for (index, key, _), score in zip(missing, fresh):
             cache.put(key, score)
             scores[index] = score
@@ -376,10 +385,26 @@ def rank_candidates(state, *, settings, include_rerank=False, should_cancel=None
     rerank = (reranker_client or RerankerClient(settings)) if include_rerank else None
     reranked_new = 0
     if include_rerank and max_window:
-        window = min(max_window, settings.retrieval_cross_encoder_initial_k)
+        prior=((state.get("screening_report") or {}).get("hybrid") or {}).get("screening") or {}
+        needed=int(state.get("required_reference_count") or 0)
+        expand=bool(prior and needed and int(prior.get("confirmed_count") or 0)<needed)
+        window = min(max_window, settings.retrieval_cross_encoder_max_k if expand else settings.retrieval_cross_encoder_initial_k)
         try:
             scores, reranked_new = _rerank_cached(rerank, settings, queries[0].text,
                 [_document(paper).text for paper in ranked[:window]], should_cancel)
+            gap_queries=[q for q in queries if q.role == "gap"]
+            gap_scores=[]
+            for q in gap_queries:
+                values,new_count=_rerank_cached(rerank, settings, q.text,
+                    [_document(p).text for p in ranked[:window]], should_cancel)
+                reranked_new+=new_count
+                gap_scores.append(values)
+            combined=[scores,*gap_scores]
+            rank_scores={i:0.0 for i in range(window)}
+            for channel in combined:
+                for rank,i in enumerate(sorted(range(window),key=lambda i:(-channel[i],i)),1):
+                    rank_scores[i]+=1/(settings.retrieval_rrf_k+rank)
+            scores=[rank_scores[i] for i in range(window)] if gap_scores else scores
             for paper, score in zip(ranked[:window], scores):
                 paper["_retrieval_features"]["ce"] = score
                 paper["_retrieval_stage"] = "cross_encoder"
@@ -405,6 +430,7 @@ def rank_candidates(state, *, settings, include_rerank=False, should_cancel=None
         "embedding_total_tokens": _usage_total(getattr(embed, "usage", [])),
         "rerank_calls": getattr(rerank, "calls", None),
         "reranked_new_count": reranked_new,
+        "dedicated_rerank_window": window if include_rerank and max_window else 0,
         "rerank_total_tokens": _usage_total(getattr(rerank, "usage", [])),
         "degraded": degraded,
         "query_fingerprints": [query.query_fingerprint for query in queries],
@@ -473,6 +499,8 @@ def screen_candidates(state, candidates, llm, *, target: int, should_cancel=None
         minimum_required=int(state.get("required_reference_count") or 0),
         required_conditions=conditions,
         screening_cache=screening_cache,
+        stop_when_sufficient=True,
+        candidate_min=settings.rerank_batch_size,
         cache_namespace=namespace,
         should_cancel=should_cancel,
         **({"strict_provider_errors": True} if strict_provider_errors else {}),

@@ -269,7 +269,46 @@ def diagnose_generation_issues(state: dict[str, Any]) -> list[GenerationRecovery
             available_actions=actions,
             details=dict(raw),
         ))
+    # WHY: 门禁汇总用于阻断，逐句报告用于定位；Main摘要截断不能丢失修复目标。
+    from app.agent.checking import check_is_current
+    current = not state.get("check_report") or check_is_current(state)
+    if current and gate.get("passed") is False and not state.get("pending_result_validation"):
+        known = {cid for issue in issues for cid in issue.affected_claim_ids}
+        for claim in (state.get("claim_verification") or {}).get("claims") or []:
+            cid = str(claim.get("claim_id") or "")
+            if not cid or cid in known or claim.get("support_status") not in {"unsupported", "partially_supported"}:
+                continue
+            issues.append(GenerationRecoveryIssue(
+                code="claim_evidence_quality_not_met", phase=phase, category="claim_or_citation",
+                message="；".join(str(x) for x in claim.get("issues") or []) or "主张缺少充分证据",
+                affected_claim_ids=[cid], affected_section_ids=[str(claim["section_id"])] if claim.get("section_id") else [],
+                available_actions=[RecoveryAction.REWRITE_SECTIONS, RecoveryAction.TARGETED_SEARCH],
+                details=dict(claim)))
+            known.add(cid)
     return issues
+
+
+class RewriteTargetError(ValueError):
+    """可由Main纠正的目标拒绝，不代表模型或研究执行故障。"""
+
+
+def resolve_rewrite_sections(state: dict[str, Any], targets: list[str]) -> list[str]:
+    """只按当前计划解析章节与交付物类型，不以未知目标触发整篇重写。"""
+    plans = state.get("writing_plans") or []
+    sections = {str(s.get("id") or s.get("section_id")) for p in plans
+                for s in p.get("sections") or [] if s.get("id") or s.get("section_id")}
+    result = []
+    for target in targets:
+        if target in sections:
+            result.append(target)
+            continue
+        matches = [p for p in plans if p.get("deliverable_type") == target]
+        if len(matches) != 1 or not matches[0].get("sections"):
+            raise RewriteTargetError("invalid or ambiguous rewrite target: " + str(target))
+        result.extend(str(s.get("id") or s.get("section_id")) for s in matches[0]["sections"])
+    if not result or any(s not in sections for s in result):
+        raise RewriteTargetError("missing rewrite target in current writing plan")
+    return list(dict.fromkeys(result))
 
 
 def _missing_allocation_sections(state: dict[str, Any]) -> list[str]:
@@ -322,11 +361,24 @@ def draft_has_unsafe_quality(state: dict[str, Any], issues=None) -> bool:
     )))
 
 
+def repair_basis_fingerprint(state: dict[str, Any]) -> str:
+    # WHY: 改写文本不等于补充证据；相同授权与问题上的失败不能靠新正文重置额度。
+    basis = {**state, "review": "", "related_work": "", "introduction": "",
+             "citation_source_text": "", "citation_map": {}}
+    return hashlib.sha256(json.dumps({"input": input_fingerprint(basis),
+        "quality": quality_progress_vector(state).model_dump(mode="json")},
+        sort_keys=True).encode()).hexdigest()[:20]
+
+
 def rewrite_attempt_exhausted(state: dict[str, Any]) -> bool:
     """生成与章节改写共用持久化的同输入无效写作限制。"""
     # WHY: task 幂等键含决策措辞，不能替代恢复资格；改变 objective 或重启
     # 不会让相同正文/证据/授权重新获得已拒绝的重写机会。
-    return RecoveryAction.REWRITE_SECTIONS.value in _used_actions_for_same_input(state, input_fingerprint(state))
+    return (RecoveryAction.REWRITE_SECTIONS.value in _used_actions_for_same_input(state, input_fingerprint(state))
+        or any(item.get("action") == RecoveryAction.REWRITE_SECTIONS.value
+               and item.get("outcome") == "no_progress"
+               and item.get("repair_basis_fingerprint") == repair_basis_fingerprint(state)
+               for item in state.get("quality_recovery_history") or []))
 
 
 def reverify_eligible_claim_ids(state: dict[str, Any]) -> list[str]:
@@ -616,6 +668,11 @@ def start_recovery_action(
         progress_before=decision.progress,
         input_fingerprint=input_fingerprint(state),
         verification_fingerprint_before=_draft_fingerprint(state),
+        repair_basis_fingerprint=repair_basis_fingerprint(state),
+        base_draft_version=int(state.get("writing_version") or 0),
+        repair_targets=[{"claim_id": cid, "sentence": issue.details.get("sentence", ""),
+                         "section_ids": issue.affected_section_ids}
+                        for issue in decision.issues for cid in issue.affected_claim_ids],
     ).model_dump(mode="json")
     state.setdefault("quality_recovery_history", []).append(entry)
     state["recovery_action_count"] = recovery_action_count(state) + 1
@@ -676,6 +733,21 @@ def complete_recovery_action(state: dict[str, Any]) -> None:
         after.structure_issues, after.metadata_issues,
     )
     entry["progress_after"] = after.model_dump(mode="json")
+    import re
+    def sentence_key(value):
+        return re.sub(r"\s+|\[[^\]]*\]", "", str(value or ""))
+    current_claims = (state.get("claim_verification") or {}).get("claims") or []
+    target_results = []
+    for target in entry.get("repair_targets") or []:
+        # WHY: cNNN是当前稿句序，不是跨版本身份；只凭编号相同不能认定旧问题已解决。
+        matches = [c for c in current_claims if sentence_key(target.get("sentence"))
+                   and sentence_key(c.get("sentence")) == sentence_key(target.get("sentence"))]
+        result = ("resolved" if all(c.get("support_status") == "supported" for c in matches)
+                  else "remaining") if matches and verified else (
+                      "resolved_after_full_check" if verified and gate.get("passed") is True
+                      else "unverifiable")
+        target_results.append({**target, "result": result})
+    entry["target_results"] = target_results
     # WHY: 各维质量指标都是独立硬边界。不能让首个指标改善后，以元组字典序
     # 掩盖另一个指标恶化；只有所有维度不增且至少一维下降才算取得进展。
     old_codes = set(before.hard_issue_codes)

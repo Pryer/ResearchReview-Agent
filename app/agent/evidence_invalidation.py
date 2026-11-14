@@ -6,7 +6,9 @@ def _detail_signature(paper):
     # WHY: 排序分数不改变证据；缺省来源集合与单一主来源等价。保留全部正文、
     # 元数据与准入字段（含置信度/交付资格），未知字段变化仍按失效处理。
     value = {key: item for key, item in paper.items()
-             if key not in {"_rank_score", "_llm_semantic_score", "_sources"}}
+             if key not in {"_rank_score", "_llm_semantic_score", "_sources", "_retrieval_features",
+                            "_retrieval_stage", "_search_branches", "_fusion_rank", "_rerank_id",
+                            "_decision_priority", "_relevance_score", "_quality_score"}}
     sources = paper.get("_sources") or ([paper["source"]] if paper.get("source") else [])
     value["_sources"] = sorted(set(sources))
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)

@@ -92,6 +92,7 @@ class ResearchJobService:
                     error=str(exc),
                 )
                 self.db.commit()
+                _finish_job_report(self.db,self.repo.get(job_id),None)
                 _CAPACITY.release()
                 raise
             return job_id
@@ -114,7 +115,21 @@ class ResearchJobService:
             _CAPACITY.release()
 
     def get(self, job_id: str) -> dict[str, Any] | None:
-        return self.repo.get(job_id)
+        job=self.repo.get(job_id)
+        if not job: return None
+        from app.services.research_artifact_service import ResearchArtifactService
+        public=ResearchArtifactService(self.db).read_published_delivery(job["session_id"],status=job["status"])
+        if public:job["available_delivery"]=public
+        from app.services.execution_report_service import get_report,report_id,report_urls
+        info=get_report(self.db,job['session_id'],report_id(job_id))
+        if not info and get_settings().execution_report_enabled and job['status'] in {'completed','partial','blocked','failed','cancelled','needs_clarification'}:
+            # 终态提交与报告文件发布之间可能有短暂间隔；保留可重试下载入口。
+            rid=report_id(job_id)
+            info={'report_id':rid,'state':'pending',**report_urls(job['session_id'],rid)}
+        if info:
+            job['execution_report']=info
+            if isinstance(job.get('result'),dict):job['result']['execution_report']=info
+        return job
 
     def cancel(self, job_id: str) -> dict[str, Any] | None:
         job = self.repo.get(job_id)
@@ -169,6 +184,8 @@ class ResearchJobService:
                     )
                     summary["interrupted"] += 1
             db.commit()
+            for recovered in jobs:
+                if recovered['status']!='queued':_finish_job_report(db,repo.get(recovered['job_id']),None)
         for job_id in requeue_ids:
             if ResearchJobService._enqueue(job_id):
                 summary["requeued"] += 1
@@ -207,6 +224,7 @@ class ResearchJobService:
             if job["status"] == "cancel_requested":
                 repo.update_status_if_in(job_id, {"cancel_requested"}, status="cancelled", current_step="cancelled")
                 db.commit()
+                _finish_job_report(db,repo.get(job_id),None)
                 return
             # WHY: 内存 guard 只保护本进程，数据库 CAS 阻止重复投递的另一个 worker 再执行。
             claimed = repo.update_status_if_in(job_id, {"queued"}, status="running", current_step="preflight")
@@ -223,12 +241,15 @@ class ResearchJobService:
                 )
                 db.commit()
 
+            service=None
             try:
                 service = ResearchConversationService(
                     db,
                     should_cancel=lambda: ResearchJobService._is_cancel_requested(job_id),
                     progress_callback=progress,
                 )
+                service.execution_report_id=job_id
+                service.defer_execution_report=True
                 if job.get("operation") == "revise":
                     revision = ResearchRevisionRequest.model_validate(job["request"])
                     result = service.revise(revision)
@@ -335,3 +356,21 @@ class ResearchJobService:
                     error=public_error,
                 )
                 db.commit()
+            finally:
+                _finish_job_report(db,repo.get(job_id),service)
+
+
+def _finish_job_report(db,job,service):
+    from app.core.config import get_settings
+    if not job or not get_settings().execution_report_enabled:return
+    from app.services.execution_report_capture import Capture
+    from app.services.execution_report_service import finalize_capture
+    pending=getattr(service,'pending_execution_report',None) if service else None
+    if pending:cap,result=pending
+    else:
+        # 未进入执行租约的失败/排队取消只输出空轨迹，不能读取别的执行。
+        cap=Capture(job['session_id'],str(job['request'].get('user_query') or job['request'].get('instruction') or ''),job['job_id'])
+        result=job.get('result')
+        if job.get('current_step')=='interrupted_by_restart':cap.error_type='InterruptedByRestart'
+        elif job.get('current_step')=='queue_submission_failed':cap.error_type='QueueSubmissionFailed'
+    finalize_capture(db,cap,result,job['status'])

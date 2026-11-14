@@ -87,14 +87,19 @@ def main(argv=None):
     modes.add_argument("--precheck-only", action="store_true")
     modes.add_argument("--execute", action="store_true")
     parser.add_argument("--deadline-seconds", type=int)
+    parser.add_argument("--delivery-mode", choices=["draft_first", "strict"])
+    parser.add_argument("--llm-timeout", type=int)
+    parser.add_argument("--llm-failover-timeout", type=int)
     parser.add_argument("--token-budget", type=int)
+    parser.add_argument("--model-request-budget", type=int, default=1024,
+                        help="LLM+Embedding+Reranker全部SDK尝试的总上限，默认1024")
     parser.add_argument("--sources", default="arxiv,semantic_scholar,openalex,crossref")
     parser.add_argument("--rerun-of", help="前次运行目录；原任务约束必须一致")
     parser.add_argument("--baseline-run", help="用于比较资格审查的历史运行目录")
     args = parser.parse_args(argv)
     if args.execute and (args.deadline_seconds is None or args.token_budget is None):
         parser.error("--execute requires explicit --token-budget and --deadline-seconds")
-    if any(value is not None and value <= 0 for value in (args.deadline_seconds, args.token_budget)):
+    if any(value is not None and value <= 0 for value in (args.deadline_seconds, args.token_budget, args.model_request_budget)):
         parser.error("deadline and token budget must be positive")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args.task):
         parser.error("invalid task identifier")
@@ -108,6 +113,8 @@ def main(argv=None):
         if len(matches) != 1:
             raise ValueError("task identifier must match exactly one task")
         task = matches[0]
+        if args.delivery_mode:
+            task["request"]["delivery_mode"]=args.delivery_mode
         prior = _local_manifest(args.rerun_of) if args.rerun_of else None
         baseline = _local_manifest(args.baseline_run) if args.baseline_run else None
         if prior and digest(prior["task"]) != digest(task):
@@ -144,12 +151,26 @@ def main(argv=None):
         "CARD_VECTOR_TENANT": "e2e_" + run_id, "RETRIEVAL_CACHE_DIR": str(output / "retrieval_cache"),
         "PDF_SAVE_DIR": str(output / "pdfs"), "PARSED_SAVE_DIR": str(output / "parsed"),
         "REVIEW_SAVE_DIR": str(output / "reviews"),
-        "LLM_REQUEST_TIMEOUT": "45", "LLM_CONTROL_PLANE_TIMEOUT": "45", "LLM_FAILOVER_TOTAL_TIMEOUT": "75",
+        "AGENT_MODEL_REQUEST_LIMIT": str(args.model_request_budget),
     })
+    if args.delivery_mode:
+        os.environ["REVIEW_DELIVERY_MODE"] = args.delivery_mode
+    if args.llm_timeout is not None:
+        os.environ["LLM_REQUEST_TIMEOUT"] = str(args.llm_timeout)
+        os.environ["LLM_CONTROL_PLANE_TIMEOUT"] = str(args.llm_timeout)
+    if args.llm_failover_timeout is not None:
+        os.environ["LLM_FAILOVER_TOTAL_TIMEOUT"] = str(args.llm_failover_timeout)
     if args.token_budget is not None:
         os.environ["AGENT_MAIN_TOKEN_BUDGET"] = str(args.token_budget)
     if args.deadline_seconds is not None:
         os.environ["AGENT_EXECUTION_DEADLINE_SECONDS"] = str(args.deadline_seconds)
+    cli_keys=["AGENT_MODEL_REQUEST_LIMIT"]
+    if args.delivery_mode:cli_keys.append("REVIEW_DELIVERY_MODE")
+    if args.token_budget is not None:cli_keys.append("AGENT_MAIN_TOKEN_BUDGET")
+    if args.deadline_seconds is not None:cli_keys.append("AGENT_EXECUTION_DEADLINE_SECONDS")
+    if args.llm_timeout is not None:cli_keys.extend(["LLM_REQUEST_TIMEOUT","LLM_CONTROL_PLANE_TIMEOUT"])
+    if args.llm_failover_timeout is not None:cli_keys.append("LLM_FAILOVER_TOTAL_TIMEOUT")
+    os.environ["REVIEW_CLI_OVERRIDE_KEYS"]=",".join(cli_keys)
     stage, result, state, engine, metrics = "source_identity", {}, {}, None, None
     observer = RunObserver(output / "observations.jsonl")
     observer.path.touch()
@@ -217,10 +238,22 @@ def main(argv=None):
                         source_diagnostics=state.get("source_diagnostics"),
                         resolved_years={key: state.get(key) for key in ("start_year", "end_year", "year_range_explicit")},
                         stop_error_codes=[e.get("code") for e in result.get("errors") or [] if isinstance(e, dict)])
+        if engine is not None:
+            from app.core.config import get_settings
+            if get_settings().execution_report_enabled:
+                try:
+                    from app.database.db import SessionLocal
+                    from app.services.execution_report_service import copy_report_files
+                    with SessionLocal() as report_db:
+                        manifest['execution_report']=copy_report_files(report_db,run_id,output)
+                    if (manifest.get('execution_report') or {}).get('state')=='failed':
+                        manifest['artifact_errors'].append({'stage':'execution_report','error_type':manifest['execution_report'].get('error_type') or 'ReportExportFailed'})
+                except Exception as exc:
+                    manifest['artifact_errors'].append({'stage':'execution_report','error_type':type(exc).__name__})
         keep = ("status", "answer", "references", "paper_cards", "review", "body", "related_work", "introduction",
                 "citation_map", "citation_registry", "clarification", "errors",
                 "quality_gate", "generation_readiness", "claim_verification", "generation_blocked",
-                "deliverable_validation", "final_review_integrity", "core_deliverables")
+                "deliverable_validation", "final_review_integrity", "core_deliverables", "execution_report")
         write_json(output / "result.json", {key: result[key] for key in keep if key in result})
         try:
             manifest["source_tree_unchanged"] = source_identity(ROOT)["source_tree_sha256"] == manifest.get("source_tree_sha256")

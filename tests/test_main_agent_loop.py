@@ -1,6 +1,7 @@
 """五字段主控循环的动作、终态与无进展边界。"""
 
 from __future__ import annotations
+from tests.agent_decision_fakes import completed_verifier, accept_check_kwargs
 
 from app.agent.main_loop import MainAgentLoop, _progress_fingerprint
 from tests.test_main_delegation_context import agent_artifacts
@@ -31,15 +32,15 @@ def _state():
     }
 
 
-def test_available_user_draft_finishes_without_another_model_decision():
+def test_available_user_draft_finishes_after_main_requests_delivery():
     state = _state()
     state.update(best_effort_generation=True, quality_gate={'draft_released': True})
-    llm = NativeDecisionLLM([])
+    llm = NativeDecisionLLM(["request_finish"])
     def finish(current):
         current['result_status'] = 'partial'
         return True
     assert MainAgentLoop(llm).run(state, handlers={}, finish_validator=finish) == 'partial'
-    assert llm.context_messages == []
+    assert len(llm.context_messages) == 1
 
 
 def test_partial_flag_cannot_override_finish_validation():
@@ -243,9 +244,9 @@ def test_autonomous_graph_pipeline_reuses_existing_nodes_and_quality_gate(monkey
     )
     monkeypatch.setattr(
         graph, "_verify_generated_draft",
-        lambda current, **kwargs: current.update({"quality_gate": {"passed": True}}),
+        completed_verifier(lambda current, **kwargs: current.update({"quality_gate": {"passed": True}})),
     )
-    monkeypatch.setattr(graph, "final_answer_node", lambda current: current.update({"answer": current.get("review", "")}))
+    monkeypatch.setattr(graph, "final_answer_node", accept_check_kwargs(lambda current: current.update({"answer": current.get("review", "")})))
 
     output = graph._run_autonomous_pipeline(state)
 

@@ -41,9 +41,11 @@ def source_identity(root):
 
 def configuration(settings):
     # WHY: 只导出允许公开的配置值，连接串、端点和密钥均不进入报告。
-    names = ("retrieval_ranking_mode", "enable_pdf_pipeline", "card_chunk_retrieval_mode",
+    names = ("review_delivery_mode", "agent_main_max_rounds", "agent_finalization_reserve_requests",
+             "agent_finalization_reserve_tokens", "agent_finalization_reserve_seconds", "agent_finalization_reserve_main_rounds",
+             "agent_deterministic_subagent_report", "retrieval_ranking_mode", "enable_pdf_pipeline", "card_chunk_retrieval_mode",
              "card_vector_backend", "card_vector_db_failure_policy", "card_vector_tenant",
-             "agent_main_token_budget", "agent_execution_deadline_seconds", "llm_provider", "llm_model",
+             "agent_main_token_budget", "agent_model_request_limit", "agent_execution_deadline_seconds", "llm_provider", "llm_model",
              "llm_backup_enabled", "llm_backup_provider", "llm_backup_model", "llm_request_timeout",
              "llm_control_plane_timeout", "llm_failover_total_timeout", "retrieval_provider",
              "retrieval_embedding_model", "retrieval_embedding_dimension", "retrieval_embedding_batch_size",
@@ -286,6 +288,10 @@ def evaluation_summary(manifest, rows, constraints, baseline=None, paper=None):
 
 
 def export_reports(output, manifest, state, result, events, baseline=None):
+    if result.get("body"):
+        (output/"delivered.md").write_text(str(result["body"]),encoding="utf-8")
+    manifest["delivery_observed"]={key:result.get(key) for key in ("delivery_status","execution_status",
+        "verification_status","requirements_satisfied","published_draft_version","stop_reason","delivery_metrics")}
     rows = claim_rows(state, result)
     write_csv(output / "claim_evidence.csv", CLAIM_COLUMNS, rows)
     frozen_constraints = manifest["task"].get("acceptance_constraints") or [

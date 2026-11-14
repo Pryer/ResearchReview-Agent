@@ -31,6 +31,7 @@ def offline_rag_models(monkeypatch, tmp_path):
     from tests.retrieval_fakes import OfflineEmbedding, OfflineReranker
 
     settings = get_settings()
+    monkeypatch.setattr(settings,"execution_report_enabled",False)
     monkeypatch.setattr(settings, "retrieval_cache_dir", str(tmp_path / "retrieval"))
     monkeypatch.setattr(settings, "dashscope_api_key", "offline-test")
     monkeypatch.setattr(settings, "retrieval_embedding_url", "https://example.invalid/embedding")

@@ -44,11 +44,24 @@ def _load_archive(store, session_id, ref, scope_id, remaining_bytes):
     return payload, remaining_bytes
 
 
-def recall_history(state, trajectory, evidence_id, *, limit=3):
+def recall_history(state, trajectory, evidence_id, *, limit=None):
+    from app.core.config import get_settings
+    maximum=get_settings().agent_context_recall_limit
+    limit=maximum if limit is None else min(maximum,max(1,int(limit)))
     from app.services.research_execution_service import artifact_store
     store = artifact_store()
     if store is None or not state.get("session_id"):
         raise ValueError("context history requires a session artifact store")
+    if evidence_id.startswith('state://writer-candidate/'):
+        from app.services.writer_support import read_candidate
+        role = trajectory.namespace or 'main'
+        candidate = read_candidate(state, evidence_id.removeprefix('state://writer-candidate/'), role=role)
+        body = str(candidate.get('normalized_text') or candidate.get('raw_text') or '')
+        return {'status': 'completed', 'outcome': 'no_change',
+            'candidate': {'candidate_id': candidate['candidate_id'], 'stage': candidate['stage'],
+                          'validation': candidate['validation'], 'text': body[:5000],
+                          'truncated': len(body) > 5000, 'history_is_evidence': False},
+            'findings': ['读取历史候选供修复/诊断；不是当前核验结论'], 'evidence_refs': [evidence_id]}
     terms = {evidence_id}
     for card in state.get("paper_cards") or []:
         if evidence_id in evidence_keys(card):

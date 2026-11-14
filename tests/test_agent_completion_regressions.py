@@ -1,4 +1,5 @@
 """审计发现的生产路径回归：入口、等待恢复、资料边界、预算和修复回退。"""
+from tests.agent_decision_fakes import completed_verifier, accept_check_kwargs
 import json
 from types import SimpleNamespace
 
@@ -82,7 +83,7 @@ def test_citation_repair_returns_search_result_without_running_analysis_or_write
         calls.append("search")
         working["candidate_papers"].append({"paper_id": "p2"})
     monkeypatch.setattr(graph, "_search_rank_with_refinement", search)
-    monkeypatch.setattr(graph, "_verify_generated_draft", lambda s: pytest.fail("Search cannot verify"))
+    monkeypatch.setattr(graph, "_verify_generated_draft", completed_verifier(lambda s: pytest.fail("Search cannot verify")))
     monkeypatch.setattr(graph, "generate_deliverables_node", lambda *a, **k: pytest.fail("Search cannot write"))
     output = graph._run_autonomous_pipeline(current)
     assert calls == ["search"]
@@ -297,13 +298,16 @@ def test_autonomous_rewrite_rolls_back_a_worse_candidate(monkeypatch):
                    quality_gate={"passed": True}, agent_orchestration_mode="autonomous",
                    answer="原有正文")
     current["autonomous_verified_fingerprint"] = graph._draft_fingerprint(current)
+    from tests.agent_decision_fakes import checked_result
+    checked_result(current)
+    current["autonomous_verified_fingerprint"] = graph._draft_fingerprint(current)
     llm = Decisions("generate_deliverables", "validate_result", "request_finish")
     monkeypatch.setattr(graph, "_get_llm", lambda: llm)
     monkeypatch.setattr(graph, "_generate_deliverables_or_block", lambda s, **kw: s.update(review="更差的正文"))
     def verify(s):
         s["quality_gate"] = {"passed": s["review"] == "原有正文", "blocking_issues": [] if s["review"] == "原有正文" else [{"code": "unsupported_claims"}]}
-    monkeypatch.setattr(graph, "_verify_generated_draft", verify)
-    monkeypatch.setattr(graph, "final_answer_node", lambda s: s.update(answer=s["review"]))
+    monkeypatch.setattr(graph, "_verify_generated_draft", completed_verifier(verify))
+    monkeypatch.setattr(graph, "final_answer_node", accept_check_kwargs(lambda s: s.update(answer=s["review"])))
     output = graph._run_autonomous_pipeline(current)
     assert output["status"] == "success"
     assert output["answer"] == "原有正文"
@@ -340,9 +344,11 @@ def test_autonomous_rewrite_rejection_survives_restart_and_new_objective(monkeyp
 
     current = state()
     current.update(review="原稿", paper_cards=[{"paper_id": "p1"}],
-                   claim_plans=[{"route_id": "r1"}], writing_plans=[{"section_id": "s1"}],
+                   claim_plans=[{"route_id": "r1"}], writing_plans=[{"deliverable_type": "research_background", "sections": [{"id": "s1"}]}],
                    quality_gate={"passed": False, "phase": "post_generation",
                                  "blocking_issues": [{"code": "claim_evidence_quality_not_met"}]})
+    from tests.agent_decision_fakes import checked_result
+    checked_result(current)
     calls = []
     monkeypatch.setattr(graph, "_get_llm", lambda: Decisions(
         ("rewrite_sections", {"section_ids": ["s1"]}),
@@ -358,8 +364,8 @@ def test_autonomous_rewrite_rejection_survives_restart_and_new_objective(monkeyp
             *([{"code": "reference_metadata_not_met"}] if working["review"] == "退化候选" else []),
         ]}
     monkeypatch.setattr(graph, "_generate_deliverables_or_block", generate)
-    monkeypatch.setattr(graph, "_verify_generated_draft", verify)
-    monkeypatch.setattr(graph, "final_answer_node", lambda working: None)
+    monkeypatch.setattr(graph, "_verify_generated_draft", completed_verifier(verify))
+    monkeypatch.setattr(graph, "final_answer_node", accept_check_kwargs(lambda working: None))
     graph._run_autonomous_pipeline(current)
     restored = copy.deepcopy(current)
     assert restored["review"] == "原稿"
@@ -603,8 +609,8 @@ def test_verification_only_autonomous_entry_rejects_retrieval_and_keeps_writer_i
         pytest.fail("verification-only must not retrieve or write")
     monkeypatch.setattr(graph, "_search_rank_with_refinement", unexpected)
     monkeypatch.setattr(graph, "_generate_deliverables_or_block", unexpected)
-    monkeypatch.setattr(graph, "_verify_generated_draft", lambda s: s.update(quality_gate={"passed": True}))
-    monkeypatch.setattr(graph, "final_answer_node", lambda s: s.update(answer=s["review"]))
+    monkeypatch.setattr(graph, "_verify_generated_draft", completed_verifier(lambda s: s.update(quality_gate={"passed": True})))
+    monkeypatch.setattr(graph, "final_answer_node", accept_check_kwargs(lambda s: s.update(answer=s["review"])))
     result = graph.regenerate_research_agent(current)
     assert result["status"] == "success"
     assert result["answer"] == "原有正文"

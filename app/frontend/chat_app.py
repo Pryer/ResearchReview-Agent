@@ -154,6 +154,7 @@ def _is_clarification_answer(messages: list[dict]) -> bool:
 def _result_metadata(result: dict) -> dict:
     return {
         "status": result.get("status"),
+        "execution_report": result.get("execution_report"),
         "body": result.get("body") or "",
         "clarification": result.get("clarification"),
         "paper_cards": result.get("paper_cards") or [],
@@ -181,10 +182,11 @@ def _finish_job(job: dict) -> None:
     status = job.get("status")
     if status in {"completed", "partial", "blocked", "needs_clarification"}:
         result = job.get("result") or {}
+        if job.get("execution_report"):result["execution_report"]=job["execution_report"]
         answer = result.get("answer") or "✅ 任务已完成。"
         add_message(session_id, "assistant", answer, _result_metadata(result))
     elif status == "cancelled":
-        add_message(session_id, "assistant", "⏹ 任务已取消，后续步骤未再执行。")
+        add_message(session_id, "assistant", "⏹ 任务已取消，后续步骤未再执行。", {"execution_report":job.get("execution_report")})
     else:
         from app.agent.public_errors import public_result_failure_reason
         reason = job.get("error") or public_result_failure_reason(job.get("result"))
@@ -192,6 +194,7 @@ def _finish_job(job: dict) -> None:
             session_id,
             "assistant",
             f"❌ 任务失败：{reason}",
+            {"execution_report":job.get("execution_report")},
         )
     st.session_state.active_job = None
 
@@ -211,6 +214,13 @@ def render_active_job() -> None:
     step = describe_job_step(job.get("current_step") or "等待执行")
     st.info(f"后台任务：{status} · {step}")
     st.progress(min(current / total, 1.0), text=f"进度 {current}/{total}")
+    available=job.get("available_delivery") or {}
+    if available.get("body"):
+        with st.expander("阅读已生成的草稿", expanded=True):
+            st.markdown(available["body"])
+            st.download_button("下载当前草稿", data=available["body"],
+                file_name="research_draft.md", mime="text/markdown",
+                key=f"active_draft_{active['job_id']}_{available.get('published_draft_version')}")
 
     if status in {"queued", "running", "cancel_requested"}:
         if st.button(
@@ -288,6 +298,23 @@ def render_source_diagnostics(diagnostics: list) -> None:
 
 
 def render_message_metadata(metadata: dict, *, allow_actions: bool = False) -> None:
+    report=metadata.get('execution_report') or {}
+    if report.get('state') in {'ready','pending'}:
+        with st.expander('运行报告 · Main决策与子Agent上下文',expanded=False):
+            st.caption(f"{report.get('main_rounds','—')}轮Main动作 · {report.get('delegations','—')}次专业委派")
+            if report.get('state')=='pending':st.caption('报告正在整理；若尚未就绪，稍后可再次下载。')
+            if st.button('准备下载运行报告',key='prepare_report_'+report['report_id']):
+                try:
+                    # WHY: 服务端携带API密钥读取；不把凭证放进浏览器URL或报告。
+                    url=API_BASE.removesuffix('/api')+report['download_url']
+                    response=requests.get(url,headers=_api_headers(),timeout=30)
+                    response.raise_for_status()
+                    st.download_button('下载完整运行报告.zip',response.content,file_name='运行报告.zip',mime='application/zip',key='report_zip_'+report['report_id'])
+                    st.caption('解压后打开report.html；正文以中文时间线呈现，原始字段可展开。')
+                except requests.RequestException:
+                    st.warning('运行报告暂时无法下载，请稍后重试。')
+    elif report.get('state')=='failed':
+        st.caption('运行报告生成失败，研究结果保持；可在服务端日志查看原因类型。')
     cards = metadata.get("paper_cards") or []
     verification = metadata.get("claim_verification") or {}
     steps = metadata.get("steps") or []
@@ -360,8 +387,8 @@ def render_message_metadata(metadata: dict, *, allow_actions: bool = False) -> N
             render_references_compact(references)
     if (
         allow_actions
-        and metadata.get("status") == "partial"
-        and quality_gate.get("draft_released") is True
+        and (metadata.get("delivery_status") == "draft" or metadata.get("status") == "partial")
+        and (metadata.get("draft_released") is True or quality_gate.get("draft_released") is True)
         and str(metadata.get("body") or "").strip()
     ):
         st.download_button(

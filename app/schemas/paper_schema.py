@@ -199,6 +199,8 @@ class ExtractionChunkRecord(BaseModel):
 
 
 class ExtractionCoverage(BaseModel):
+    remote_requests: int = 0
+    cache_hits: int = 0
     status: Literal["complete", "partial"] = "partial"
     chunks: List[ExtractionChunkRecord] = Field(default_factory=list)
     retrieval: Optional[ChunkRetrievalReport] = None

@@ -180,19 +180,28 @@ def extract_card_node(
         details = list(state.get("paper_details") or [])
         detail_by_key = {_paper_identity_key(paper): paper for paper in details
                          if _paper_identity_key(paper)}
-        refreshed_ids = set(state.get("incremental_new_paper_ids") or [])
-        # WHY: 增量详情可能重新确认同一篇论文；旧卡的关系与交付物资格
-        # 属于上一版详情，不能仅凭 paper_id 继续复用。
-        # WHY: Controller 已按当前详情移除失效卡；失效重建也复用仍有效的卡，
-        # 避免为重建少量论文再次消耗整池提取预算，不复用已被移除的旧卡。
-        existing_cards = [card for card in (state.get("paper_cards") or [])
-                          if (state.get("incremental_retrieval") or state.get("pending_card_rebuild_ids"))
-                          and _paper_identity_key(card) in detail_by_key
-                          and str(card.get("paper_id") or "") not in refreshed_ids
-                          and (
-                              card.get("relation_type") == detail_by_key[_paper_identity_key(card)].get("_topic_relation")
-                              and set(card.get("eligible_deliverables") or []) == set(
-                                  detail_by_key[_paper_identity_key(card)].get("_eligible_deliverables") or []))]
+        from app.agent.extraction_reuse import extraction_fingerprint, refresh_card_eligibility
+        from app.services.evidence_support import independent_spans
+        settings=get_settings()
+        cache=state.setdefault("extraction_cache", {})
+        fingerprints={_paper_identity_key(p):extraction_fingerprint(p,(state.get("parsed_papers") or {}).get(str(p.get("paper_id") or "")),state.get("topic", ""),settings) for p in details}
+        existing_cards=[]
+        for paper in details:
+            cached=cache.get(fingerprints[_paper_identity_key(paper)])
+            if cached and independent_spans(cached):
+                existing_cards.append(refresh_card_eligibility(cached,paper))
+        # WHY: Legacy pending-rebuild state already fences retained cards in Controller;
+        # preserve its contract while new tasks establish exact extraction dependencies.
+        from app.agent.delivery import draft_first
+        if not draft_first(state) and (state.get("pending_card_rebuild_ids") or state.get("incremental_retrieval")):
+            known={_paper_identity_key(c) for c in existing_cards}
+            for card in state.get("paper_cards") or []:
+                key=_paper_identity_key(card)
+                if key in detail_by_key and key not in known and str(card.get("paper_id")) not in set(state.get("pending_card_rebuild_ids") or []) and str(card.get("paper_id")) not in set(state.get("incremental_new_paper_ids") or []):
+                    paper=detail_by_key[key]
+                    if card.get("relation_type")==paper.get("_topic_relation") and set(card.get("eligible_deliverables") or [])==set(paper.get("_eligible_deliverables") or []):
+                        existing_cards.append(card)
+        # Other legacy cards without a fingerprint establish exact dependencies once.
         existing_keys = {
             _paper_identity_key(card) for card in existing_cards
             if _paper_identity_key(card)
@@ -211,6 +220,10 @@ def extract_card_node(
         new_cards = [
             c if isinstance(c, dict) else c.model_dump(mode="json") for c in cards
         ]
+        for card in new_cards:
+            key=_paper_identity_key(card)
+            if key in fingerprints and independent_spans(card):
+                cache[fingerprints[key]]=card
         state["paper_cards"] = [*existing_cards, *new_cards]
         append_step(
             state, "extract_card", "success",

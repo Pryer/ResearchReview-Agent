@@ -127,6 +127,24 @@ def build_writing_plan(
         )
     )
 
+    from app.services.writer_support import authorized_writer_claims
+    for section in sections:
+        # WHY: 只有当前ClaimPlan与来源共同授权的span才补入计划；裸原文片段不等于可写事实。
+        for pid in section.supporting_paper_ids:
+            for claim in authorized_writer_claims(state, pid):
+                section.supporting_claim_ids.extend(e for e in claim['evidence_ids'] if e not in section.supporting_claim_ids)
+    explicit_length = int(state.get('target_length') or (state.get('research_request') or {}).get('target_length') or 0)
+    target_range = spec.validation.target_char_range if spec.validation else None
+    if explicit_length > 0:
+        # WHY: 多交付物共享全文字数；按既有默认篇幅权重分配，不将总目标复制给每项。
+        requested = state.get('core_deliverables') or [dtype.value]
+        weights = {name: sum(get_deliverable_spec(name).validation.target_char_range or (1000, 1000))
+                   for name in requested}
+        local_target = max(1, round(explicit_length * weights.get(dtype.value, 1) / sum(weights.values())))
+        target_range = (max(1, round(local_target * .8)), round(local_target * 1.2))
+        total = sum(s.target_word_count or 1 for s in sections) or 1
+        for section in sections:
+            section.target_word_count = max(1, round(local_target * (section.target_word_count or 1) / total))
     return WritingPlan(
         deliverable_type=dtype,
         purpose=spec.purpose,
@@ -148,7 +166,7 @@ def build_writing_plan(
                 if conservative_evidence_mode else ""
             ),
         },
-        target_char_range=(spec.validation.target_char_range if spec.validation else None),
+        target_char_range=target_range,
         required_focuses=required_focuses,
         covered_focuses=covered_focuses,
         undercovered_focuses=undercovered_focuses,
@@ -250,6 +268,10 @@ def _induce_background_outline(
             for claim in values or []
             if authorized_field_claim(card, claim)
         ][:12]
+        if state.get('claim_plans'):
+            from app.services.writer_support import authorized_writer_claims
+            # WHY: 大纲与正文必须消费同一授权集合，不能从未获授权的字段先规划出额外事实目标。
+            claims = authorized_writer_claims(state, paper_id)
         evidence_summary.append({
             "paper_id": paper_id,
             "title": str(card.get("title") or ""),
@@ -257,7 +279,7 @@ def _induce_background_outline(
             "claims": claims,
         })
     prompt = f"""你是学术写作规划器。请根据当前研究主题、用户语义框架和可引用的声明级证据，
-动态规划“研究背景”的 3 至 5 个递进段落目标。你只规划论证结构，不写正文，不补充外部事实，
+动态规划“研究背景”的 3 至 5 个递进段落目标。只围绕下面实际授权声明组织段落，不把题名或用户期望推演为已获得的实验结果；声明少时压缩论证范围，不补造事实。你只规划论证结构，不写正文，不补充外部事实，
 不得套用任何预设学科、方法分类或应用场景。
 
 研究主题：{state.get('canonical_topic') or state.get('topic') or ''}

@@ -17,6 +17,11 @@ def compact_main_context(context: MainAgentContext, *, max_chars: int) -> MainAg
     compacted = context.model_copy(deep=True)
     max_chars = max(2000, int(max_chars))
     # WHY: 历史记忆只是辅助材料，不能挤掉当前显式要求、证据或阻断问题。
+    # WHY: 逐条主张可从权威报告回查，紧缩时先丢明细，保留候选状态与失败计数。
+    while _size(compacted) > max_chars and compacted.state.quality_feedback.get("weak_claims"):
+        compacted.state.quality_feedback["weak_claims"].pop()
+    while _size(compacted) > max_chars and compacted.state.quality_feedback.get("section_targets"):
+        compacted.state.quality_feedback["section_targets"].pop()
     while _size(compacted) > max_chars and compacted.state.research_memory:
         compacted.state.research_memory.pop()
     while _size(compacted) > max_chars and len(compacted.key_evidence) > 3:

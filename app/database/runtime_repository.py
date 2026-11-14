@@ -273,7 +273,7 @@ class ResearchRuntimeRepository:
             ledger = json.loads(row.budget_json)
             if int(ledger["token_limit"]) != expected_limit:
                 raise RuntimeConflict("token limit changed; reload before updating")
-            if new_limit < int(ledger.get("llm_tokens") or 0) + int(ledger.get("tokens_reserved") or 0):
+            if new_limit < int(ledger.get("llm_tokens") or 0) + int(ledger.get("retrieval_model_tokens") or 0) + int(ledger.get("tokens_reserved") or 0):
                 raise ValueError("new limit is below consumed and reserved usage")
             active_jobs = select(ResearchJobModel.job_id).where(
                 ResearchJobModel.session_id == self.session_id,
@@ -296,6 +296,60 @@ class ResearchRuntimeRepository:
                 "consumed_tokens": int(ledger.get("llm_tokens") or 0),
             })
         return updated
+
+    def revise_configuration(self, *, expected_revision, values):
+        from app.agent.runtime_config import _snapshot_fields, POLICY_VERSION
+        from app.core.config import get_settings
+        from app.database.models import ResearchJobModel
+        import hashlib
+        with self.transaction():
+            row=self._row()
+            if row is None: raise ValueError("session has no runtime state")
+            state=json.loads(row.state_json or "{}")
+            saved=state.get("effective_config") or {"revision":0,"values":{}}
+            if saved.get("revision",0)!=expected_revision: raise RuntimeConflict("configuration revision changed")
+            base=get_settings()
+            allowed=_snapshot_fields(base)
+            if not values or set(values)-set(allowed): raise ValueError("unsupported or sensitive configuration fields")
+            resolved=type(base)(**{**base.model_dump(),**saved.get("values",{}),**values})
+            values={key:getattr(resolved,key) for key in values}
+            ledger=json.loads(row.budget_json)
+            floors={"agent_main_token_budget":int(ledger.get("llm_tokens") or 0)+int(ledger.get("retrieval_model_tokens") or 0)+int(ledger.get("tokens_reserved") or 0),
+                "agent_model_request_limit":int(ledger.get("llm_requests") or 0)+int(ledger.get("retrieval_model_requests") or 0),
+                "retrieval_model_request_limit":int(ledger.get("retrieval_model_requests") or 0),
+                "agent_main_max_rounds":int(ledger.get("decision_rounds") or 0),
+                "agent_execution_action_budget":int(ledger.get("actions_reserved") or 0),
+                "agent_retrieval_budget":int(ledger.get("retrieval_used") or 0),
+                "recovery_total_action_budget":int(ledger.get("recovery_used") or 0),
+                "agent_execution_deadline_seconds":float(ledger.get("elapsed_seconds") or 0)}
+            for name,floor in floors.items():
+                if name in values and not (name=="agent_model_request_limit" and values[name]==0) and values[name]<floor:
+                    raise ValueError("new limit below consumed and reserved usage: "+name)
+            all_values={**saved.get("values",{}),**values}
+            snapshot={"version":POLICY_VERSION,"revision":expected_revision+1,"values":all_values,
+                "sources":{**saved.get("sources",{}),**{k:"explicit_revision" for k in values}},
+                "fingerprint":hashlib.sha256(json.dumps(all_values,sort_keys=True).encode()).hexdigest()}
+            state["effective_config"]=snapshot
+            state["delivery_mode"]=resolved.review_delivery_mode
+            state.pop("finalization_phase",None);state.pop("finalization_reason",None)
+            mapping={"agent_main_token_budget":"token_limit","agent_model_request_limit":"model_request_limit",
+                "retrieval_model_request_limit":"retrieval_model_request_limit","agent_main_max_rounds":"main_round_limit",
+                "agent_execution_action_budget":"action_limit","agent_retrieval_budget":"retrieval_limit",
+                "recovery_total_action_budget":"recovery_limit"}
+            for name,key in mapping.items():
+                if name in values: ledger[key]=values[name]
+            state["agent_execution_budget"]=ledger
+            active_jobs=select(ResearchJobModel.job_id).where(ResearchJobModel.session_id==self.session_id,
+                ResearchJobModel.status.in_(["queued","running","cancel_requested"])).exists()
+            active_attempts=select(Attempt.attempt_id).where(Attempt.session_id==self.session_id,Attempt.status=="running").exists()
+            changed=self.db.execute(update(Runtime).where(Runtime.session_id==self.session_id,
+                Runtime.version==row.version,Runtime.owner.is_(None),Runtime.state_json==row.state_json,
+                Runtime.budget_json==row.budget_json,~active_jobs,~active_attempts).values(
+                    state_json=dumps(state),budget_json=dumps(ledger),version=Runtime.version+1))
+            if changed.rowcount!=1: raise RuntimeConflict("configuration is busy or changed")
+            self.event("configuration:"+uuid4().hex,"configuration_revised",{
+                "old_revision":expected_revision,"new_revision":expected_revision+1,"changed":sorted(values)})
+        return snapshot
 
     def authorize_session_save(self, status):
         conditions = [Runtime.session_id == self.session_id, Runtime.owner == self.owner,

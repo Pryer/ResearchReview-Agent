@@ -25,7 +25,7 @@ from app.agent.execution_budget import (
     single_action_charge,
 )
 from app.agent.result_merger import StaleAgentResult, merge_task_result
-from app.agent.subagents import AnalysisAgent, SearchAgent, WritingAgent
+from app.agent.subagents import AnalysisAgent, SearchAgent, WritingAgent, CheckAgent
 from app.schemas.agent_task_schema import AgentRole, AgentTask, AgentTaskResult
 from app.core.config import get_settings
 
@@ -34,6 +34,7 @@ _AGENTS = {
     AgentRole.SEARCH: SearchAgent,
     AgentRole.ANALYSIS: AnalysisAgent,
     AgentRole.WRITING: WritingAgent,
+    AgentRole.CHECK: CheckAgent,
 }
 
 _PLAN_OPERATIONS = {
@@ -60,6 +61,24 @@ def _update_plan_status(state: dict[str, Any], operation: str, status: str) -> N
 class AgentController:
     """验证版本和权限后执行专业任务，并把精简结果并回主状态。"""
 
+    def publish_draft(self, state, *, expected_version=None):
+        from app.agent.delivery import publish_draft
+        from app.services.durable_execution_service import active_runtime
+        check_execution()
+        if expected_version is not None and source_state_version(state) != expected_version:
+            raise ValueError("publication state version changed")
+        candidate = copy.deepcopy(state)
+        record = publish_draft(candidate)
+        check_execution()
+        runtime = active_runtime()
+        if runtime:
+            runtime.snapshot(candidate, ledger=state.get("agent_execution_budget") or {})
+            state["_runtime_version"]=candidate["_runtime_version"]
+        state.update({key: candidate[key] for key in ("published_versions", "delivery_status",
+            "published_artifact_ref", "published_draft_version", "verification_status",
+            "requirements_satisfied", "delivery_metrics") if key in candidate})
+        return record
+
     @single_action_charge
     def execute(
         self,
@@ -77,7 +96,12 @@ class AgentController:
         consume_mandatory_action: bool = False,
         invalidate_evidence: bool = False,
     ) -> AgentTaskResult:
+        # WHY: 直接调用同样受候选版本协议约束，不能仅依靠给LLM的动作白名单。
+        if state.get("intent") != "search_papers" and state.get("pending_result_validation") and operation != "validate_result":
+            raise ValueError("candidate is awaiting independent validation before further research actions")
         if operation in {"rewrite_sections", "generate_deliverables"}:
+            if state.get("pending_evidence_recovery"):
+                raise ValueError("new search results require Analysis authorization before writing")
             if state.get("pending_result_validation"):
                 raise ValueError("candidate is awaiting independent validation")
             from app.agent.generation_recovery import rewrite_attempt_exhausted
@@ -115,7 +139,7 @@ class AgentController:
         for ref in input_artifact_refs or []:
             if ref.startswith("state://"):
                 prefix_fields = {"state://paper-card/": "paper_cards", "state://paper/": "paper_details",
-                                 "state://writing-plan/": "writing_plans"}
+                                 "state://writing-plan/": "writing_plans", "state://check-report/": "check_report", "state://writer-candidate/": "writer_candidates"}
                 field = next((field for prefix, field in prefix_fields.items() if ref.startswith(prefix)), None)
                 if field not in allowed_fields:
                     raise ValueError("artifact reference is not allowed by action input contract")
@@ -175,7 +199,11 @@ class AgentController:
             role=role,
             operation=operation,
             objective=objective,
-            constraints=constraints or {},
+            constraints={**(constraints or {}),
+                'explicit_constraints': snapshot.context.goal.explicit_constraints,
+                'target_length': state.get('target_length'), 'start_year': state.get('start_year'),
+                'end_year': state.get('end_year'), 'minimum_references': state.get('required_reference_count'),
+                'citation_protocol': 'paper_id-v1', 'acceptance_criteria': expected_output or []},
             input_artifact_refs=input_artifact_refs or [],
             expected_output=expected_output or [],
             budget=effective_budget,
@@ -195,7 +223,9 @@ class AgentController:
         try:
             state["agent_execution_status"] = "running"
             with task_scope(task.task_id) if runtime else nullcontext():
-                result = agent.execute(task, state, handler)
+                from app.agent.execution_budget import research_stage
+                with research_stage(state, operation):
+                    result = agent.execute(task, state, handler)
             check_execution()
             if deadline is not None and time.monotonic() >= deadline:
                 raise AgentBudgetExceeded("task deadline exceeded before commit")
@@ -203,6 +233,15 @@ class AgentController:
                 raise AgentExecutionCancelled("agent task cancelled before commit")
             candidate = copy.deepcopy(state) if runtime else state
             merge_task_result(candidate, task, result)
+            if operation in {"generate_deliverables", "rewrite_sections"}:
+                candidate.pop("check_report", None)
+                candidate.pop("autonomous_verified_fingerprint", None)
+            if operation == "validate_result":
+                # WHY: 回滚与恢复结算由Controller提交，Check本身不能改写候选。
+                from app.agent.checking import settle_checked_candidate
+                settle_checked_candidate(candidate)
+                from app.agent.delivery import review_published_delivery
+                review_published_delivery(candidate)
             invalidate_changed_evidence(candidate, operation, evidence_before)
             commit_action(candidate)
             if consume_mandatory_action and result.status.value == "completed":
@@ -258,6 +297,12 @@ class AgentController:
                                   state.get("agent_execution_budget") or {})
             _update_plan_status(state, operation, "failed")
             state["agent_execution_status"] = "failed"
+            from app.agent.execution_budget import is_control_exception
+            if role == AgentRole.WRITING and not is_control_exception(exc):
+                check_execution()
+                audit = getattr(exc, 'writer_audit_records', [])
+                existing = {r['candidate_id'] for r in state.get('writer_candidates') or []}
+                state.setdefault('writer_candidates', []).extend(copy.deepcopy(r) for r in audit if r['candidate_id'] not in existing)
             raw = getattr(exc, "agent_task_result", None)
             if raw:
                 raw["output_state_fingerprint"] = context_source_fingerprint(state)

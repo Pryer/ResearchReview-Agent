@@ -54,6 +54,9 @@ from app.services.rag_runtime import require_rag_runtime
 logger = get_logger(__name__)
 
 
+from app.services.execution_report_capture import with_execution_report
+
+
 def _role_llm(llm, role: str):
     """生产客户端使用稳定角色前缀；测试/旧适配器保持 duck typing 兼容。"""
     binder = getattr(llm, "for_agent", None)
@@ -92,6 +95,7 @@ def _run_autonomous_pipeline(
     normalize_orchestration_mode(state)
     normalize_retrieval_profile(state)
     settings = get_settings()
+    state["check_protocol_version"] = 1
     require_rag_runtime(settings)
     llm = _get_llm()
     if state.get("agent_operation_mode") == "verification_only" and not state.get("agent_mandatory_actions"):
@@ -112,11 +116,6 @@ def _run_autonomous_pipeline(
         "paper_details", "paper_cards", "claim_plans", "validated_routes",
     )}) if local_verification else None
 
-    def comparison_source(current):
-        return _stable_hash({key: current.get(key) for key in (
-            "paper_details", "paper_cards", "claim_plans", "validated_routes", "dynamic_taxonomy", "selected_scope",
-        )})
-
     def _search(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
         _search_rank_with_refinement(
             current,
@@ -129,6 +128,10 @@ def _run_autonomous_pipeline(
     def _targeted_search(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
         from app.agent.delegation_recovery import search_once
         from app.agent.evidence_recovery import targeted_search_kind
+        if _arguments.get("queries"):
+            current["recovery_decision"]={**(current.get("recovery_decision") or {}),
+                "queries":list(_arguments["queries"]),"gap_ids":list(_arguments.get("gap_ids") or []),
+                "reason":str(_arguments.get("purpose") or (current.get("recovery_decision") or {}).get("reason") or "定向补证")}
         citation_repair = targeted_search_kind(current) == "citation"
         # WHY: 引用缺口仍复用检索角色的互补查询精化，不能退化为重复上一批关键词。
         search_once(current,
@@ -140,6 +143,8 @@ def _run_autonomous_pipeline(
         from app.agent.nodes import diagnose_evidence_gaps_node, recovery_controller_node
         diagnose_evidence_gaps_node(current, llm=_role_llm(llm, "analysis"))
         recovery_controller_node(current)
+        from app.agent.quality_feedback import diagnose_quality_recovery
+        diagnose_quality_recovery(current)
 
     def _revise_scope(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
         from app.agent.nodes import scope_revision_node
@@ -160,7 +165,7 @@ def _run_autonomous_pipeline(
 
     def _fetch(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
         fetch_detail_node(current, should_cancel=should_cancel, **(
-            {"llm": llm} if (current.get("retrieval_profile") or {}).get("mode") == "hybrid" else {}
+            {"llm": _role_llm(llm, "search")} if (current.get("retrieval_profile") or {}).get("mode") == "hybrid" else {}
         ))
         if settings.enable_pdf_pipeline:
             download_pdf_node(current, should_cancel=should_cancel)
@@ -192,11 +197,19 @@ def _run_autonomous_pipeline(
     def _claims(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
         claim_plan_node(current, llm=_role_llm(llm, "analysis"))
         _run_claim_evidence_gate(current)
+        from app.agent.delivery import supplement_draft_plans
+        supplement_draft_plans(current)
         if current.get("paper_details") and settings.enable_global_evidence_gate:
             global_evidence_gate_node(current)
+        if (current.get("pending_evidence_recovery") or {}).get("kind") == "quality":
+            from app.agent.delegation_recovery import settle_after_analysis
+            settle_after_analysis(current)
 
     def _write(current: ResearchAgentState, arguments: dict[str, Any]) -> None:
         from app.agent.generation_recovery import input_fingerprint
+        if arguments.get("section_ids"):
+            from app.agent.generation_recovery import resolve_rewrite_sections
+            arguments = {**arguments, "section_ids": resolve_rewrite_sections(current, arguments["section_ids"])}
         previous = copy.deepcopy(current)
         # WHY: 保留版本比较到独立分析结束；快照只能由服务加载，不进入模型上下文。
         if previous.get("review") and not current.get("pending_generation_previous"):
@@ -204,8 +217,6 @@ def _run_autonomous_pipeline(
                 "products": _snapshot_generation_products(previous),
                 "operation": "rewrite_sections" if arguments.get("section_ids") else "generate_deliverables",
                 "input_fingerprint": input_fingerprint(previous),
-                "verified_fingerprint": previous.get("autonomous_verified_fingerprint"),
-                "source_fingerprint": comparison_source(previous),
             }
         current.pop("citation_source_text", None)
         current.pop("citation_rendered_text", None)
@@ -215,52 +226,52 @@ def _run_autonomous_pipeline(
             current.pop(key, None)
         if arguments.get("section_ids"):
             current["target_section_ids"] = list(arguments["section_ids"])
-        current.pop("autonomous_verified_fingerprint", None)
         current.pop("quality_gate", None)
+        current["writer_attempt_issues"] = []
         _generate_deliverables_or_block(current, should_cancel=should_cancel)
-        current["pending_result_validation"] = bool(str(current.get("review") or "").strip())
-        # 候选稿不产生最终验证指纹；Main 必须另行委派 Analysis 核验。
-
-    def _retain_better_generation(previous, current, *, operation=""):
-        from app.agent.generation_recovery import candidate_is_not_worse, input_fingerprint
-        if previous.get("review") and not candidate_is_not_worse(previous, current):
-            for key in _GENERATION_PRODUCT_KEYS:
-                current.pop(key, None)
-            current.update(copy.deepcopy(_snapshot_generation_products(previous)))
-            verified = previous.get("autonomous_verified_fingerprint")
-            if verified == _draft_fingerprint(current):
-                current["autonomous_verified_fingerprint"] = verified
-            current.setdefault("recovery_candidate_rejections", []).append({
-                "reason": "自主修复候选质量退化，保留已验证版本",
-                "operation": operation,
-                "input_fingerprint": input_fingerprint(previous),
-            })
-            # WHY: 完整校验会修复正文，回滚不得再次改写已验证版本。证据发生
-            # 变化时仅失效校验指纹，交付入口仍要求重新验证当前证据版本。
-            if current.get("autonomous_verified_fingerprint") != _draft_fingerprint(current):
-                current.pop("autonomous_verified_fingerprint", None)
+        from app.services.writer_support import substantive
+        if (current.get('writer_attempt_issues') or current.get('writer_candidates')) and not substantive(current.get('review')) and substantive(previous.get('review')):
+            issues = copy.deepcopy(current.get('writer_attempt_issues') or [])
+            for key, value in _snapshot_generation_products(previous).items():
+                current[key] = value
+            current['writer_attempt_issues'] = issues
+            current['pending_result_validation'] = False
+            return
+        if current.get("review") and current.get("writing_plans"):
+            citation_check_node(current, llm=None)
+        from app.services.writer_support import substantive
+        # WHY: 旧写作适配器无候选诊断时仍交Check，不能凭缺少新字段绕过既有核验。
+        legacy_candidate = (not current.get('writer_candidates') and not current.get('writer_attempt_issues')
+                            and bool(current.get('writing_plans')) and bool(str(current.get('review') or '').strip()))
+        current['pending_result_validation'] = substantive(current.get('review')) or legacy_candidate
+        if not current['pending_result_validation']:
+            from app.services.writer_support import writer_issues
+            current['quality_gate'] = {'passed': False, 'draft_available': False, 'draft_released': False,
+                'phase': 'writing', 'blocking_issues': [{'code': i['code'], 'message': i['reason']}
+                    for i in writer_issues(current)], 'recovery_options': ['修复输入或重写后重新核验']}
+            current['generation_blocked'] = True
+        # 候选稿不产生最终验证指纹；Main 必须另行委派 Check 核验。
 
     def _validate_result(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
+        from app.agent.checking import check_input_fingerprint, build_check_report
+        fingerprint = check_input_fingerprint(current)
         verify_kwargs = None
         if local_verification and local_source == _stable_hash({key: current.get(key) for key in (
             "paper_details", "paper_cards", "claim_plans", "validated_routes",
         )}):
             verify_kwargs = local_verification
-        if verify_kwargs:
-            _verify_generated_draft(current, verify_claims_kwargs=verify_kwargs)
-        else:
-            _verify_generated_draft(current)
-        final_answer_node(current)
-        current["autonomous_verified_fingerprint"] = _draft_fingerprint(current)
-        current["pending_result_validation"] = False
-        previous = current.pop("pending_generation_previous", None)
-        if previous:
-            from app.agent.generation_recovery import input_fingerprint
-            restored = {**current, **previous["products"],
-                        "autonomous_verified_fingerprint": previous.get("verified_fingerprint")}
-            if (previous["source_fingerprint"] == comparison_source(current)
-                    and previous["input_fingerprint"] == input_fingerprint(restored)):
-                _retain_better_generation(restored, current, operation=previous["operation"])
+        from app.agent.execution_budget import is_control_exception
+        # WHY: 检查失败不能复用上一轮的通过报告；局部复验的prior已由显式参数提供。
+        current.pop("claim_verification", None)
+        current.pop("generation_quality", None)
+        try:
+            _verify_generated_draft(current, **({"verify_claims_kwargs": verify_kwargs} if verify_kwargs else {}),
+                                    read_only=True, llm=_role_llm(llm, "check"))
+            build_check_report(current, fingerprint)
+        except Exception as exc:
+            if is_control_exception(exc):
+                raise
+            build_check_report(current, fingerprint, failure=type(exc).__name__ + ": " + str(exc)[:240])
 
     handlers = {
         "search_and_rank": _search,
@@ -325,6 +336,16 @@ def _run_autonomous_pipeline(
                 current.setdefault("errors", []).append({"code": "search_results_empty", "message": ""})
             final_answer_node(current)
             return True
+        from app.agent.delivery import draft_first, draft_preflight, published_delivery
+        if draft_first(current):
+            if draft_preflight(current)["ready"]:
+                from app.agent.controller import AgentController
+                AgentController().publish_draft(current)
+            published=published_delivery(current)
+            if published:
+                # WHY: 新候选失败不能阻止Main结束并交付此前仍有效的版本。
+                current["result_status"]="completed" if published["grade"]=="final" else "partial"
+                return True
         if not str(current.get("review") or "").strip():
             return False
         if current.get("pending_result_validation"):
@@ -336,14 +357,21 @@ def _run_autonomous_pipeline(
             return False
         # WHY: validate_result 已对同一指纹运行最终门禁；再次调用会重复写入
         # 质量诊断，且可能使恢复轮的事件和计数不再幂等。
+        from app.agent.checking import check_is_current
+        if current.get("check_protocol_version") and not check_is_current(current):
+            return False
+        if (current.get("check_report") or {}).get("execution_status", "completed") != "completed":
+            return False
         status = derive_result_status(current)
         if status == "success":
             current["result_status"] = "completed"
+            final_answer_node(current, prevalidated=True)
             return True
         quality = current.get("quality_gate") or {}
         from app.agent.generation_recovery import draft_has_unsafe_quality
         if status == "partial" and quality.get("draft_released") and not draft_has_unsafe_quality(current):
             current["result_status"] = "partial"
+            final_answer_node(current, prevalidated=True)
             return True
         return False
 
@@ -393,6 +421,7 @@ def _run_autonomous_pipeline(
 
 
 @research_budget
+@with_execution_report
 def run_research_agent(
     user_query: str,
     current_year: Optional[int] = None,
@@ -411,7 +440,7 @@ def run_research_agent(
 
     Returns:
         包含 answer / steps / references / paper_cards 的结果字典。
-        
+
     Raises:
         AgentCancelledError: 任务被取消时抛出。
     """
@@ -431,7 +460,7 @@ def run_research_agent(
         "steps": [],
         "errors": [],
     }
-    
+
     # 合并用户传入的初始状态（如 our_work, background 等）
     if initial_state:
         state.update(initial_state)
@@ -440,6 +469,8 @@ def run_research_agent(
         state["state_schema_version"] = "2"
         state["steps"] = []
         state["errors"] = []
+    from app.agent.runtime_config import initialize_delivery
+    initialize_delivery(state, user_query, new_task=not bool((initial_state or {}).get("effective_config")))
     normalize_retrieval_profile(state)
 
     logger.info("Agent started: %s", user_query[:100])
@@ -608,7 +639,7 @@ _GENERATION_PRODUCT_KEYS = (
     "citation_registry", "citation_validation", "claim_verification",
     "generation_quality", "deliverable_validation", "final_review_integrity",
     "quality_gate", "generation_blocked", "quarantined_draft",
-    "pending_result_validation",
+    "pending_result_validation", "check_report", "selected_candidate_id",
     # 写作就绪与章节诊断是本轮派生结果。若恢复时继续保留，状态不变量会把
     # 上一轮的 ready/失败章节误当作当前轮结论，导致尚未写作就被阻断。
     "generation_readiness", "deliverable_readiness", "evidence_quality_report",
@@ -830,7 +861,7 @@ def _snapshot_generation_products(state: ResearchAgentState) -> Dict[str, Any]:
     """保存当前写作产物快照（仅非 None 键），供修复退化时回滚。"""
     return {
         key: state.get(key)
-        for key in _GENERATION_PRODUCT_KEYS
+        for key in (*_GENERATION_PRODUCT_KEYS, "writing_version")
         if state.get(key) is not None
     }
 
@@ -980,6 +1011,8 @@ def _verify_generated_draft(
     checkpoint: Callable[[str], None] | None = None,
     verify_claims_kwargs: Dict[str, Any] | None = None,
     check_citation_authorization: bool = True,
+    read_only: bool = False,
+    llm=None,
 ) -> None:
     """写作后统一验证链：越权主张 → 逐句证据 → 参考文献 → 引用授权一致性。
 
@@ -1001,14 +1034,17 @@ def _verify_generated_draft(
         _claim_alignment_check(state)
     if state.get("writing_plans") and get_settings().enable_claim_verification:
         _mark("verify_claims")
-        verify_claims_node(state, llm=_get_llm(), **(verify_claims_kwargs or {}))
+        verify_claims_node(state, llm=llm or _get_llm(), **({"read_only": True} if read_only else {}), **(verify_claims_kwargs or {}))
     if state.get("writing_plans"):
         _mark("citation_check")
         # WHY: citation_check_node 的引用生成固定走本地校验，llm 形参不参与
         # 结果；四个入口此前传入的值不一致但对输出无影响，这里统一为 None。
-        citation_check_node(state, llm=None)
+        citation_check_node(state, llm=None, **({"render_text": False} if read_only else {}))
     if check_citation_authorization:
         _check_claim_citation_consistency(state)
+    if read_only:
+        from app.agent.nodes.synthesis import _apply_final_quality_gate
+        _apply_final_quality_gate(state)
 
 
 def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
@@ -1018,7 +1054,13 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
     refresh_main_agent_context(state)
     output_status = derive_result_status(state)
     quality_gate = state.get("quality_gate") or {}
-    if state.get("pending_result_validation"):
+    from app.agent.checking import check_is_current
+    from app.agent.delivery import published_delivery
+    published_for_output=published_delivery(state)
+    if not published_for_output and (state.get("pending_result_validation") or (
+        state.get("intent") != "search_papers" and state.get("result_status") not in {"waiting_user", "failed", "cancelled"}
+        and state.get("review") and state.get("check_protocol_version") and not check_is_current(state)
+    )):
         # WHY: 即使 renderer 的局部门禁通过，独立分析未完成的候选也不能公开。
         state["result_status"] = "blocked"
         output_status = "blocked"
@@ -1193,6 +1235,9 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
             "existing_limitations", "verified_results", "target_length",
             "unsupported_task_guard",
             "state_schema_version",
+            "delivery_mode", "effective_config", "publication_reviews", "published_versions", "delivery_status", "published_artifact_ref",
+            "published_draft_version", "verification_status", "requirements_satisfied", "delivery_metrics",
+            "finalization_phase", "finalization_reason", "search_query_ledger", "extraction_cache",
             "main_agent_context", "main_context_snapshot",
             "main_context_artifact_ref", "context_snapshot_version",
             "agent_task_results",
@@ -1216,7 +1261,8 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
             # quality_gate 的发布边界控制。
             "review", "quarantined_draft", "quarantined_generation_snapshot",
             "pending_generation_previous", "pending_evidence_recovery",
-            "pending_result_validation",
+            "writer_candidates", "selected_candidate_id", "writer_attempt_issues", "writer_authorization_coverage",
+            "pending_result_validation", "check_report", "check_protocol_version",
             "state_invariant_check",
             "best_effort_generation", "best_effort_on_failure",
             "best_effort_policy_source", "automatic_best_effort_attempted",
@@ -1246,7 +1292,8 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
             item.model_dump(mode="json") if hasattr(item, "model_dump") else item
             for item in output["research_state"]["source_diagnostics"]
         ]
-    return output
+    from app.agent.delivery import delivery_output
+    return delivery_output(state, output)
 
 
 def derive_result_status(state: Dict[str, Any]) -> str:
@@ -1309,6 +1356,7 @@ def _restore_explicit_constraint_markers(state: ResearchAgentState) -> None:
 
 
 @research_budget
+@with_execution_report
 def continue_research_agent(
     research_state: Dict[str, Any],
     should_cancel: Callable[[], bool] | None = None,
@@ -1381,21 +1429,22 @@ def _build_literature_matrix(state: ResearchAgentState) -> List[Dict[str, Any]]:
 
 
 @research_budget
+@with_execution_report
 def regenerate_research_agent(
     research_state: Dict[str, Any],
     should_cancel: Callable[[], bool] | None = None,
     progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> Dict[str, Any]:
     """基于编辑后的论文集合增量重生成，不重复检索、排序和详情补全。
-    
+
     Args:
         research_state: 持久化的研究状态（来自 output["research_state"]）。
         should_cancel: 取消检查回调函数，返回 True 时停止执行。
         progress_callback: 进度更新回调函数，接收 (step_name, current, total)。
-    
+
     Returns:
         包含 answer / steps / references / paper_cards 的结果字典。
-        
+
     Raises:
         AgentCancelledError: 任务被取消时抛出。
         ValueError: 如果删除后没有剩余论文。

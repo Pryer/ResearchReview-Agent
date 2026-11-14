@@ -122,7 +122,9 @@ ResearchReview-Agent/
 权威状态与会话级 artifact 中。检索、分析和写作阶段通过带输入指纹的专业 Agent
 任务契约按动作白名单投影输入，再在隔离工作副本中执行；输出键、字段删除和类型
 双重校验，提交前再次检查身份、指纹和版本，旧任务不会合并到新证据状态。
-三类专业 Agent 各自维护持久化 ReAct 轨迹、状态栏、压缩 Epoch 和通信历史。
+同一委派内保留工具对话，跨委派以任务隔离的角色摘要、候选引用和依赖增量衔接，详见[上下文与写作候选设计](docs/context-writer-repair.md)。Writer保存各阶段候选及拒绝原因，Check独立核验，Main选择恢复动作。
+
+四类专业 Agent（Search、Analysis、Writing、Check） 各自维护持久化 ReAct 轨迹、状态栏、压缩 Epoch 和通信历史。
 主控委派任务后，子 Agent 执行本次唯一研究动作，通过 `report_to_main` 汇报完成、请求协助或报告阻断；
 同角色的后续动作也必须由 Main 再次委派。子循环仍可回查自身观察、读取结果并进行有界纠错。
 Main 的 `plan` 是最多六步的后续建议，观察后可修订，不预先授予未来工具权限。
@@ -193,12 +195,12 @@ Compaction 将完整观察归档，工作记忆按条数、字符和实际窗口
   │            异常降级为 quality_gate 阻断而非任务失败）
   │         （paper_details 为空 → retrieval_shortfall_node 按交付物给出说明）
   7. 验证   verify_claims_node / citation_check_node（以 DOI/S2/OpenAlex/arXiv ID
-  │           追踪证据，双向匹配防幻觉；正文渲染为顺序编码或作者—年份引用）
+  │           追踪证据，双向匹配防幻觉；引用排版由 Writing 完成，Check 保持候选正文只读）
   │         → claim_alignment（写作后越权主张检查）与 claim_citation_consistency
   │         → 引用缺口由 Main 分别委派补检索、分析和写作，禁止 Search 内嵌整条生成链
-  │         → Writing 只提交待核验候选，Main 再委派 Analysis 的 validate_result；
+  │         → Writing 只提交待核验候选，Main 再委派 Check 的 validate_result；
   │            退化候选可恢复同证据、同授权的已验证旧稿，不能据此复活过期证据
-  8. 收尾   final_answer_node（质量门禁 + 答案组装）→ 自动导出评估包到 data/eval_bundles/
+  8. 收尾   Main 申请交付 → Controller 复核当前检查版本 → final_answer_node（复用门禁结果并组装答案）→ 自动导出评估包到 data/eval_bundles/
 ```
 
 协作式取消在每个节点边界检查（`agent/execution.py: checkpoint`，抛 `AgentCancelledError`）；
@@ -207,6 +209,18 @@ running job 标为失败、完成待取消 job 的取消；它不自动重放在
 中断研究通过 `resume_from_checkpoint=true` 显式恢复，保留累计预算和原约束，
 崩溃租约到期后才能接管。待澄清与已完成会话分别使用澄清、修订入口。
 编辑论文集合后的增量修订（`POST /api/reviews/jobs/revise`）只重做路线验证、写作与引用验证。
+
+## 一个请求如何流经系统
+
+以“撰写 2020—2023 年某主题的研究综述，最终引用至少 5 篇不同论文”为例：
+
+1. `app/api/routes_review.py` 接收任务，Job 服务保存并调度；`app/agent/graph.py` 进入研究流程，规划阶段识别主题、年份和最低引用数。
+2. `MainAgentLoop` 依据目标和当前状态委派 Search；`app/agent/action_registry.py` 与 Controller 限定可执行动作。检索和排序得到候选论文，候选数不等于最终引用数。
+3. 详情获取、PDF 解析与 `extract_paper_card` 形成论文卡和带来源的证据；Analysis 检查范围、证据充分性与可授权主张。未获得支持的材料不能自动变成结论。
+4. Writing 依据授权证据产生候选正文；Check 独立核验该版本的引用与主张，结果交回 Main。若存在缺口，Main 可在预算内委派补检索、分析或改写。
+5. Controller 复核当前版本并执行交付门禁。最终参考文献须有至少 5 篇不同论文且满足年份约束；证据不足时可按任务策略明确交付 `partial` 草稿或报告阻断，不能把草稿当作正式验收。
+
+这是代码流程示例，不代表一次实际检索或人工评审结果。
 
 ## 4. 关键机制
 
@@ -256,3 +270,12 @@ pytest tests/
 提交和数据库重开恢复已通过。40 篇完整综述场景因请求预留超过剩余预算而阻断，
 尚未完成交付验收，未据此宣称确定节费比例。详见
 [验收记录](docs/validation/2026-09-22-runtime-cache.md)。
+
+
+## 可用草稿交付与增量处理（2026-11-10）
+
+新任务默认采用 `draft_first` 策略，满足草稿条件后可发布明确标记的草稿；显式 `strict` 和旧任务保留正式门禁。Main 规划与委派，专业 Agent 返回结构化状态，Controller 管理版本、预算和发布。配置快照贯穿恢复，已发布版本可在后续优化期间阅读和下载。默认 Main 96 轮、总模型请求 1024 次、检索模型子预算 512 次，每篇最多抽取 8 块；正式交付仍须通过独立 Check 与质量门禁。
+
+配置、草稿等级、补检索与缓存依赖见[实现说明](docs/draft-delivery-and-incremental-retrieval.md)。
+
+历史验证（2026-11-11）：离线测试 2037 项通过、17 项跳过，原生 pgvector 测试另行通过 17 项；真实任务交付了引用 5 篇的 `partial` 草稿，未满足正式要求或完成人工验收。详见[验证报告](docs/validation/2026-11-11-draft-delivery.md)。

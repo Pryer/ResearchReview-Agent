@@ -143,6 +143,7 @@ class Settings(BaseSettings):
     # 主备模型中较小的可用窗口；包含 system/tools/messages 和决策输出预留。
     agent_context_window_tokens: int = Field(default=65536, ge=1)
     agent_context_compact_ratio: float = Field(default=0.8, gt=0, lt=1)
+    agent_context_recall_limit: int = Field(default=3, ge=1, le=8)
     agent_context_recent_turns: int = Field(default=2, ge=0)
     agent_context_tool_result_chars: int = Field(default=4000, ge=1024)
     agent_context_memory_items: int = Field(default=8, ge=1, le=64)
@@ -154,13 +155,26 @@ class Settings(BaseSettings):
     # By default no actions are reviewed; enabling requires selecting actions.
     agent_sidecar_enabled: bool = False
     agent_sidecar_review_actions: str = "generate_deliverables,rewrite_sections"
-    agent_main_max_rounds: int = 24
+    review_delivery_mode: str = "draft_first"
+    agent_finalization_reserve_requests: int = Field(default=64, ge=0)
+    agent_finalization_reserve_tokens: int = Field(default=250000, ge=0)
+    agent_finalization_reserve_seconds: int = Field(default=120, ge=0)
+    agent_finalization_reserve_main_rounds: int = Field(default=12, ge=0)
+    agent_deterministic_subagent_execute: bool = True
+    agent_deterministic_subagent_report: bool = True
+    writer_section_attempts: int = Field(default=3, ge=1, le=8)
+    writer_section_max_workers: int = Field(default=3, ge=1, le=8)
+    agent_decision_repair_attempts: int = Field(default=2, ge=1, le=5)
+    search_query_max_attempts: int = Field(default=2, ge=1, le=5)
+    search_query_retry_seconds: int = Field(default=60, ge=0)
+    agent_main_max_rounds: int = Field(default=96, ge=1)
     agent_subagent_max_rounds: int = Field(default=12, ge=1, le=64)
     agent_subagent_no_progress_limit: int = Field(default=3, ge=1)
     agent_main_no_progress_limit: int = 3
     agent_main_token_budget: int = 10000000
+    agent_model_request_limit: int = Field(default=1024, ge=0)
     agent_retrieval_budget: int = 64
-    agent_execution_deadline_seconds: int = 1800
+    agent_execution_deadline_seconds: int = Field(default=3600, gt=0)
     # 备用 LLM 提供商：主用失败后自动切换，各 120s。
     # 留空则不启用备用，行为退化为「只用主用」。
     llm_backup_provider: str = ""
@@ -230,6 +244,10 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/research_review.db"
 
     # ---------- 存储路径 ----------
+    # 运行报告独立于正文；默认自动生成，不能影响研究终态。
+    execution_report_enabled: bool = True
+    execution_report_dir: str = "./data/execution_reports"
+
     pdf_save_dir: str = "./data/pdfs"
     parsed_save_dir: str = "./data/parsed"
     review_save_dir: str = "./data/reviews"
@@ -275,7 +293,7 @@ class Settings(BaseSettings):
     retrieval_rerank_batch_size: int = Field(default=32, ge=1)
     retrieval_request_timeout: float = Field(default=60, gt=0)
     retrieval_max_retries: int = Field(default=2, ge=0, le=5)
-    retrieval_model_request_limit: int = Field(default=128, ge=1)
+    retrieval_model_request_limit: int = Field(default=512, ge=1)
     retrieval_query_max: int = Field(default=6, ge=1)
     retrieval_bm25_top_k: int = Field(default=80, ge=1)
     retrieval_dense_top_k: int = Field(default=80, ge=1)
@@ -336,7 +354,7 @@ class Settings(BaseSettings):
     search_refinement_max_rounds: int = 2
     # 路线验证后的证据恢复闭环。LLM 只诊断和生成查询，以下预算由代码强制执行。
     enable_evidence_recovery: bool = True
-    evidence_recovery_max_rounds: int = 2
+    evidence_recovery_max_rounds: int = 3
     evidence_recovery_max_route_attempts: int = 2
     evidence_recovery_max_scope_revisions: int = 1
     evidence_recovery_min_new_evidence: int = 2
@@ -344,7 +362,7 @@ class Settings(BaseSettings):
     evidence_recovery_min_query_novelty: float = 0.35
     evidence_recovery_scope_gap_ratio: float = 0.75
     # 路线补证与写作恢复共同消耗此预算，避免两层循环分别重置次数。
-    recovery_total_action_budget: int = 6
+    recovery_total_action_budget: int = 10
     # 已授权证据及最终有效引用达到此比例且仅剩篇数缺口时，可生成/发布
     # 明确标注的 partial 草稿；原始篇数约束仍保留。
     enable_reference_coverage_best_effort_release: bool = True
@@ -392,6 +410,13 @@ class Settings(BaseSettings):
     global_gate_peer_review_ratio: float = 0.8
     # 单个关键词检索的最少结果数下限（即使 retrieval_target 更小也会请求这么多）
     min_results_per_keyword: int = 30
+
+    @field_validator("review_delivery_mode")
+    @classmethod
+    def _delivery_mode(cls, value):
+        if value not in {"draft_first", "strict"}:
+            raise ValueError("REVIEW_DELIVERY_MODE must be draft_first or strict")
+        return value
 
     @field_validator("default_search_sources")
     @classmethod
@@ -469,8 +494,18 @@ class Settings(BaseSettings):
 
 
 @lru_cache(maxsize=1)
-def get_settings() -> Settings:
+def _process_settings() -> Settings:
     """获取全局配置单例。"""
     settings = Settings()
     settings.ensure_dirs()
     return settings
+
+
+from contextvars import ContextVar
+_TASK_SETTINGS = ContextVar("review_task_settings", default=None)
+
+def get_settings() -> Settings:
+    return _TASK_SETTINGS.get() or _process_settings()
+
+get_settings.cache_clear = _process_settings.cache_clear
+get_settings.cache_info = _process_settings.cache_info

@@ -34,13 +34,14 @@ TERMINAL_STATUSES = {"completed", "partial", "blocked", "failed", "cancelled", "
 
 
 def _progress_fingerprint(state: dict[str, Any]) -> str:
+    from app.agent.evidence_invalidation import _detail_signature
     def stable_items(value: Any) -> list[str]:
         # WHY: 排名或列表顺序抖动不代表证据集合变化；保留每项内容以识别真正的补证。
         return sorted(json.dumps(item, ensure_ascii=False, sort_keys=True, default=str) for item in (value or []))
 
     payload = {
         "scope": state.get("selected_scope") or {},
-        "candidates": stable_items(state.get("candidate_papers")),
+        "candidates": sorted({str(p.get("doi") or p.get("arxiv_id") or p.get("paper_id") or p.get("title")) for p in state.get("candidate_papers") or []}),
         # WHY: 排序抖动不算进展；逐篇语义合同确认后才算新增可处理材料。
         "admitted_ranked": sorted({json.dumps({
             "id": paper.get("paper_id") or paper.get("id") or paper.get("title"),
@@ -50,14 +51,19 @@ def _progress_fingerprint(state: dict[str, Any]) -> str:
             "eligible": sorted(paper.get("_eligible_deliverables") or []),
         }, ensure_ascii=False, sort_keys=True) for paper in admitted_ranked_papers(state)})
         if (state.get("retrieval_profile") or {}).get("mode") == "hybrid" else [],
-        "details": stable_items(state.get("paper_details")),
+        "details": sorted(_detail_signature(p) for p in state.get("paper_details") or []),
         "cards": stable_items(state.get("paper_cards")),
         "routes": stable_items(state.get("validated_routes")),
         "taxonomy": state.get("dynamic_taxonomy") or {},
         "claims": stable_items(state.get("claim_plans")),
         "gaps": state.get("evidence_gap_report") or {},
         "review": state.get("review") or "",
+        "published_version": state.get("published_draft_version"),
         "quality": state.get("quality_gate") or {},
+        # WHY: 完成独立复验是研究进展；同一报告重放不变，仍会被无进展/循环限制。
+        "pending_validation": bool(state.get("pending_result_validation")),
+        "verification": {key: (state.get("claim_verification") or {}).get(key)
+                         for key in ("valid", "supported", "unsupported", "unverified", "support_rate")},
         "valid_citations": state.get("unique_valid_cited_paper_count") or 0,
     }
     return hashlib.sha256(
@@ -120,17 +126,16 @@ class MainAgentLoop:
         previous_progress = _progress_fingerprint(state)
         progress_limit = max(1, int(settings.agent_main_no_progress_limit))
         recent_progress = deque([previous_progress], maxlen=max(4, 2 * progress_limit + 1))
-        for round_index in range(int(settings.agent_main_max_rounds)):
+        ledger = state.setdefault("agent_execution_budget", {})
+        limit = int(ledger.setdefault("main_round_limit", settings.agent_main_max_rounds))
+        for round_index in range(max(0, limit - int(ledger.get("decision_rounds") or 0))):
             check_execution()
+            from app.agent.execution_budget import update_finalization
+            update_finalization(state)
+            rollback_count_before = len(state.get("recovery_candidate_rejections") or [])
             if should_cancel and should_cancel():
                 state["result_status"] = "cancelled"
                 return "cancelled"
-            # WHY: 用户要求可用草稿时，已验证且获门禁释放的正文应确定性收尾；
-            # mandatory 恢复任务仍须履行，partial 标志本身不能跳过 finish 校验。
-            gate = state.get("quality_gate") or {}
-            if (state.get("best_effort_generation") and not state.get("agent_mandatory_actions")
-                    and gate.get("draft_released") and finish_validator(state)):
-                return str(state.get("result_status") or "partial")
             from app.services.research_memory_retrieval import prepare_memory_context
             prepare_memory_context(state)
             names = allowed_actions(state, set(handlers))
@@ -175,7 +180,7 @@ class MainAgentLoop:
                 elif handoff and handoff in names:
                     decision = AgentDecision(
                         action=handoff, arguments={},
-                        reason="推进已确认论文到当前证据与主张授权",
+                        reason="按草稿优先策略先发布可用版本" if handoff == "publish_draft" else "推进已确认论文到当前证据与主张授权",
                     )
                 else:
                     decision = self.policy.decide(snapshot.context, allowed_actions=names, trajectory=trajectory)
@@ -187,6 +192,8 @@ class MainAgentLoop:
                 ]
                 state["result_status"] = "failed"
                 return "failed"
+            from app.services.execution_report_capture import record_main_context
+            record_main_context(state,snapshot.context,decision,model_input=not bool(mandatory or (handoff and handoff in names)))
             state.setdefault("main_agent_decisions", []).append(
                 decision.model_dump(mode="json")
             )
@@ -259,6 +266,16 @@ class MainAgentLoop:
                 }]
                 state["result_status"] = "blocked"
                 return "blocked"
+            elif action == "publish_draft":
+                try:
+                    previous_version = state.get("published_draft_version")
+                    record = self.controller.publish_draft(state)
+                    unchanged = previous_version == record["version"]
+                    trajectory.observe({"status":"no_progress" if unchanged else "completed",
+                        "reason":"already_published" if unchanged else "published",
+                        "delivery_status":record["grade"], "version":record["version"]})
+                except ValueError as exc:
+                    trajectory.observe({"status":"rejected", "error":str(exc)[:300]})
             elif action == "request_finish":
                 if finish_validator(state):
                     trajectory.observe({"status": str(state.get("result_status") or "completed")})
@@ -281,15 +298,30 @@ class MainAgentLoop:
                         "code": "unbound_agent_action", "message": action,
                     })
                     return "failed"
+                from app.agent.generation_recovery import RewriteTargetError
+                result = None
                 try:
+                    from app.agent.quality_feedback import begin_main_recovery
+                    begin_main_recovery(state, action, decision.arguments)
                     result = self.specialists.run(
                         state, decision=decision, handlers=handlers,
+                        decision_context=snapshot.context,
                         should_cancel=should_cancel,
                         consume_mandatory_action=bool(mandatory),
                         required_first=bool(handoff),
                     )
                     self._consume_delegation_result(state, result)
+                except RewriteTargetError as exc:
+                    trajectory.observe({"status": "rejected", "error": "invalid_rewrite_target", "detail": str(exc)[:240]})
+                    state.setdefault("main_agent_rejections", []).append({"action": action, "reason": "invalid_rewrite_target"})
                 except AgentBudgetExceeded as exc:
+                    from app.agent.execution_budget import AgentFinalizationRequired
+                    if isinstance(exc, AgentFinalizationRequired):
+                        role=state.get("active_subagent")
+                        if role:
+                            result=self.specialists._finish(state, role, "needs_help", "budget_low：已保留收尾预算，请基于已提交材料写作或发布草稿。")
+                            self._consume_delegation_result(state,result)
+                        continue
                     state["result_status"] = "blocked"
                     state["generation_blocked"] = True
                     state.setdefault("errors", []).append({
@@ -297,7 +329,7 @@ class MainAgentLoop:
                         "message": str(exc),
                     })
                     return "blocked"
-                if result.status.value in {"failed", "cancelled"}:
+                if result is not None and result.status.value in {"failed", "cancelled"}:
                     state["result_status"] = result.status.value
                     return result.status.value
 
@@ -308,9 +340,26 @@ class MainAgentLoop:
             previous_progress = current_progress
             # WHY: 独立核验拒绝退化候选、恢复已验证旧稿会回到历史状态；
             # 仍须当前版本通过最终门禁，不能把安全回滚误判为无效循环。
-            if state_cycled and state.get("recovery_candidate_rejections") and finish_validator(state):
-                return str(state.get("result_status") or "completed")
+            if (state_cycled and action == "validate_result" and not state.get("pending_result_validation")
+                    and len(state.get("recovery_candidate_rejections") or []) > rollback_count_before):
+                from app.agent.graph import _draft_fingerprint
+                # WHY: 仅本次独立核验确认的安全回滚可交回Main换方案；历史回滚不能关闭循环保护。
+                if state.get("autonomous_verified_fingerprint") == _draft_fingerprint(state):
+                    state_cycled = False
+            # WHY: 生成/改写只提交候选，验证前无法判断质量进展；只延期这一次写作动作的判定。
+            # 下一轮仍受动作准入、轮数/预算限制；验证后照常检查无进展和循环，不能直接发布。
+            if (action in {"generate_deliverables", "rewrite_sections"}
+                    and state.get("pending_result_validation")):
+                continue
             if no_progress >= progress_limit:
+                from app.agent.delivery import draft_first, draft_materials
+                if draft_first(state) and draft_materials(state) and state.get("finalization_phase") != "finalizing":
+                    # WHY: 素材已可写时先给Main一次收尾机会；再次无进展仍停止，不延长硬预算。
+                    state["finalization_phase"]="finalizing"
+                    state["finalization_reason"]="research_no_progress"
+                    no_progress=0
+                    recent_progress.clear()
+                    continue
                 state["generation_blocked"] = True
                 state["result_status"] = "blocked"
                 state.setdefault("errors", []).append({

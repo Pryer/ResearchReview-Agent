@@ -184,6 +184,7 @@ def build_search_plan(
         "requested_sections": slots.requested_sections,
         "language": slots.language,
         "citation_style": slots.citation_style,
+        "target_length": slots.target_length,
     }
 
     zh_ratio, zh_ratio_reason = resolve_language_branch_zh_ratio(semantic_frame)

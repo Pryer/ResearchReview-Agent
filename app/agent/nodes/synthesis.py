@@ -544,6 +544,10 @@ def generate_deliverables_node(
         ):
             state["forced_generation_issues"] = list(global_readiness.blocking_issues)
             global_readiness = global_readiness.model_copy(update={"ready": True})
+        from app.agent.delivery import draft_first, draft_materials
+        if draft_first(state) and draft_materials(state) and any(p.get("claims") for p in state.get("claim_plans") or []):
+            state["forced_generation_issues"] = list(global_readiness.blocking_issues)
+            global_readiness = global_readiness.model_copy(update={"ready": True})
         coverage_writing_allowed = permits_reference_coverage_writing(
             state, global_readiness,
         )
@@ -869,11 +873,12 @@ def generate_deliverables_node(
     "references", "writing_plans", "quality_gate", "generation_blocked"
 )
 @provides("answer", "body")
-def final_answer_node(state: "ResearchAgentState") -> "ResearchAgentState":
+def final_answer_node(state: "ResearchAgentState", *, prevalidated: bool = False) -> "ResearchAgentState":
     """组装最终输出。"""
     t0 = time.time()
     try:
-        _apply_final_quality_gate(state)
+        if not prevalidated:
+            _apply_final_quality_gate(state)
         gate = state.get("quality_gate") or {}
         can_release_draft = (
             gate.get("passed") is True
@@ -992,6 +997,13 @@ def _backfill_global_citation_union(
         if not missing_ids:
             continue
 
+        plan_obj = WritingPlan.model_validate(plans[index])
+        from app.services.writer_support import authorized_writer_claims, record_candidate, normalize_writer_citations
+        authorized_inputs = {pid: authorized_writer_claims(state, pid) for pid in missing_ids}
+        if state.get('claim_plans') and any(not v for v in authorized_inputs.values()):
+            state.setdefault('writer_attempt_issues', []).append({'code': 'citation_plan_input_mismatch',
+                'reason': '引用补写请求缺少当前ClaimPlan授权，交Main重新规划'})
+            continue
         if llm is None:
             from app.deliverables.renderers.base_renderer import _citation_recovery_paragraph
 
@@ -1014,7 +1026,8 @@ def _backfill_global_citation_union(
                     f"- [{paper_id}] {card.get('title') or '未题名论文'}"
                     f"（{card.get('year') or '年份未知'}）：{summary}"
                 )
-            papers_block = "\n".join(paper_lines)
+            papers_block = (json.dumps(authorized_inputs, ensure_ascii=False) if state.get('claim_plans')
+                            else "\n".join(paper_lines))
             prompt = (
                 "你是中文学术编辑。下面正文的唯一引用数未达到硬性要求，"
                 "请把列出的论文自然融入最相关的段落：可以并入已有复合引用，"
@@ -1042,62 +1055,40 @@ def _backfill_global_citation_union(
         if not revised or not revised.strip():
             continue
 
-        # 补写模型有时复用证据清单中的 ``paper_id:eNNN``，与逐节写作
-        # 使用同一映射规则，先还原为论文 ID 再做新增引用检查。
-        revised = _normalize_evidence_citations(revised.strip(), list(cards_by_id.values()))
+        record_candidate(state, plan_obj, 'backfill:received', revised, revised,
+                         {'valid': False, 'errors': [], 'pending_validation': True})
+        raw_revised = revised
+        revised, protocol_issues = normalize_writer_citations(revised, list(cards_by_id.values()))
         new_ids = set(extract_citation_ids(revised, valid_ids=valid_ids))
-        old_ids = set(
-            extract_citation_ids(outputs[index], valid_ids=valid_ids)
-        )
-        # 补写必须无损：新增了缺失论文且没有丢失任何既有引用。
+        old_ids = set(extract_citation_ids(outputs[index], valid_ids=valid_ids))
+        guard_errors = []
         if not set(missing_ids) <= new_ids or not old_ids <= new_ids:
-            logger.info(
-                "Citation backfill rejected: coverage not monotonic "
-                "(deliverable=%s)",
-                allocation.get("deliverable_type"),
-            )
-            continue
-        unexpected_ids = new_ids - (old_ids | set(missing_ids))
-        if unexpected_ids:
-            logger.info(
-                "Citation backfill rejected: model introduced unrequested citations %s",
-                sorted(unexpected_ids),
-            )
-            continue
-
-        # 防截断保护：补写后的正文长度不得显著小于原正文
+            guard_errors.append('citation_coverage_not_monotonic')
+        if new_ids - (old_ids | set(missing_ids)):
+            guard_errors.append('unexpected_citations')
         if len(revised.strip()) < int(len(outputs[index].strip()) * 0.85):
-            logger.info(
-                "Citation backfill rejected: output truncated (len=%d vs orig=%d)",
-                len(revised),
-                len(outputs[index]),
-            )
-            continue
-
-        # 结构完整性保护：原正文中的所有 Markdown 标题必须全部保留
+            guard_errors.append('backfill_truncated')
         orig_headings = re.findall(r"^(#{2,4}\s+[^\n]+)", outputs[index], re.M)
         rev_headings = re.findall(r"^(#{2,4}\s+[^\n]+)", revised, re.M)
         if set(orig_headings) - set(rev_headings):
-            logger.info(
-                "Citation backfill rejected: missing headings %s",
-                sorted(set(orig_headings) - set(rev_headings)),
-            )
-            continue
-
+            guard_errors.append('backfill_missing_headings')
         try:
-            plan_obj = WritingPlan.model_validate(plans[index])
             new_validation = validate_deliverable(revised, plan_obj, state)
         except Exception as exc:
-            logger.warning("Citation backfill validation failed: %s", exc)
+            from app.agent.execution_budget import is_control_exception
+            if is_control_exception(exc):
+                raise
+            new_validation = {'valid': False, 'errors': [f'backfill_validation_error:{type(exc).__name__}']}
+            guard_errors.extend(new_validation['errors'])
+        if set(new_validation.get('errors') or []) - set(validations[index].get('errors') or []):
+            guard_errors.append('backfill_introduced_validation_errors')
+        guard_errors.extend(i['reason'] for i in protocol_issues)
+        audit_validation = {**new_validation, 'valid': not guard_errors and new_validation.get('valid', False),
+                            'errors': [*new_validation.get('errors', []), *guard_errors]}
+        cid = record_candidate(state, plan_obj, 'backfill', raw_revised, revised, audit_validation, issues=protocol_issues)
+        if guard_errors:
             continue
-        old_errors = set(validations[index].get("errors") or [])
-        new_errors = set(new_validation.get("errors") or [])
-        if new_errors - old_errors:
-            logger.info(
-                "Citation backfill rejected: new validation errors %s",
-                sorted(new_errors - old_errors),
-            )
-            continue
+        state['selected_candidate_id'] = cid
 
         outputs[index] = revised
         validations[index] = new_validation
@@ -2225,7 +2216,7 @@ def _assemble_answer(state: "ResearchAgentState") -> str:
                     for index, reference in enumerate(references, 1)
                 )
             return warning_banner + draft + reference_block
-        
+
         # 原有硬拦截逻辑
         if quality_gate.get("phase") == "pre_generation" and state.get("review"):
             return str(state["review"])

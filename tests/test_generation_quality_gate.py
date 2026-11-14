@@ -708,8 +708,9 @@ def test_writer_normalizes_evidence_id_to_paper_id():
 
     text = write_deliverable(plan, state, llm=EvidenceIdLLM())
 
-    assert "[p1:e001]" not in text
-    assert "[p1]" in text
+    normalized = "\n".join(c.get("normalized_text", "") for c in state["writer_candidates"] if not c["stage"].endswith(":received"))
+    assert "[p1:e001]" not in normalized
+    assert "[p1]" in normalized
 
 
 def test_writer_normalizes_evidence_span_id_without_claim_mirror():
@@ -736,8 +737,9 @@ def test_writer_normalizes_evidence_span_id_without_claim_mirror():
 
     text = write_deliverable(plan, state, llm=EvidenceSpanLLM())
 
-    assert "[p1:e001]" not in text
-    assert "[p1]" in text
+    normalized = "\n".join(c.get("normalized_text", "") for c in state["writer_candidates"] if not c["stage"].endswith(":received"))
+    assert "[p1:e001]" not in normalized
+    assert "[p1]" in normalized
 
 
 def test_validator_rejects_invented_user_research_objective():
@@ -1555,6 +1557,11 @@ def test_research_status_plan_generically_merges_overfragmented_themes():
 
 def test_two_part_request_has_exact_heading_hierarchy_and_no_diagnostics():
     cards = [_card(index) for index in range(1, 13)]
+    for card in cards:
+        claim = card['field_claims']['research_problem'][0]
+        card['evidence_spans'] = [{'evidence_id': claim['evidence_id'], 'text': claim['claim'],
+            'source_type': 'abstract', 'char_start': 0, 'char_end': len(claim['claim'])}]
+
     taxonomy = {
         "organizing_principle": "自动识别到教育分析的任务链",
         "themes": [
@@ -1836,6 +1843,11 @@ def test_two_part_status_allocation_can_complete_global_authorized_union():
 
 def test_sparse_citation_plan_is_completed_and_executed_by_fallback():
     cards = [_card(index) for index in range(1, 49)]
+    for card in cards:
+        claim = card['field_claims']['research_problem'][0]
+        card['evidence_spans'] = [{'evidence_id': claim['evidence_id'], 'text': claim['claim'],
+            'source_type': 'abstract', 'char_start': 0, 'char_end': len(claim['claim'])}]
+
     state = {
         "topic": "课堂行为分析",
         "canonical_topic": "课堂行为分析",

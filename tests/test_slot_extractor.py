@@ -214,10 +214,10 @@ class TestExtractSlots:
         assert slots.end_year == 2025
         assert slots.max_papers == 10
         assert slots.required_reference_count == 10
-        # 显式要求的余量比例为 0.80：实测端到端成品率约 0.556，
+        # 显式要求的余量比例为 1.0：实测端到端成品率约 0.556，
         # ceil(10*0.80)=8 → 10+8=18。
-        assert slots.retrieval_target == 18
-        assert slots.generation_limit == 18
+        assert slots.retrieval_target == 20
+        assert slots.generation_limit == 20
         assert slots.language == "zh"
 
     def test_llm_null_max_papers_keeps_default(self):
@@ -250,8 +250,8 @@ class TestExtractSlots:
         assert (slots.start_year, slots.end_year) == (2022, 2026)
         assert slots.max_papers == 45
         assert slots.required_reference_count == 45
-        assert slots.retrieval_target == 81
-        assert slots.generation_limit == 81
+        assert slots.retrieval_target == 85
+        assert slots.generation_limit == 85
         # 本测试的意图是用户参数压过默认值；派生目标必须高于显式引用要求，
         # 否则候选池等于要求本身，任何筛选损耗都会直接变成引用缺口。
         assert slots.retrieval_target > slots.required_reference_count
@@ -267,7 +267,7 @@ class TestExtractSlots:
 
         assert slots.max_papers == 50
         assert slots.required_reference_count == 50
-        # ceil(50*0.80)=40 正好触到余量上限 min(40, ...)，50+40=90。
+        # ceil(50*1.0)=50 被余量上限 min(40, ...) 限到40，50+40=90。
         assert slots.retrieval_target == 90
         assert slots.generation_limit == 90
         # "不少于 50 篇"是下限而非上限：目标必须严格超过它。

@@ -159,6 +159,9 @@ class GenerationRecoveryHistoryEntry(BaseModel):
     progress_after: RecoveryProgressVector | None = None
     input_fingerprint: str = ""
     verification_fingerprint_before: str = ""
+    repair_basis_fingerprint: str = ""
+    base_draft_version: int = 0
+    repair_targets: list[dict[str, Any]] = Field(default_factory=list)
     outcome: str = "started"
     stop_reason: str = ""
 

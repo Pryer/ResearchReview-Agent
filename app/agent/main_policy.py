@@ -19,12 +19,13 @@ class AgentDecisionError(ValueError):
 
 
 class MainAgentPolicy:
-    def __init__(self, llm, *, correction_attempts: int = 1,
+    def __init__(self, llm, *, correction_attempts: int | None = None,
                  system_prompt: str = MAIN_AGENT_SYSTEM_PROMPT,
                  tools: list[dict] | None = None, argument_validator=validate_arguments,
                  operation: str = "main_agent_decision", delegation_messages: bool = True) -> None:
         self.llm = llm
-        self.correction_attempts = max(0, int(correction_attempts))
+        from app.core.config import get_settings
+        self.correction_attempts = max(0, int(correction_attempts if correction_attempts is not None else get_settings().agent_decision_repair_attempts - 1))
         # WHY: 工具目录仅暴露协议，不授予执行权；合法动作始终由本轮状态与 Controller 检查。
         self.tools = copy.deepcopy(tools if tools is not None else tool_schemas(sorted(ACTION_REGISTRY)))
         self.delegation_messages = delegation_messages
@@ -80,6 +81,7 @@ class MainAgentPolicy:
         ) and not trajectory.data.get("native_tools_disabled", False)
         last_error = ""
         for attempt in range(self.correction_attempts + 1):
+            repair_context = None
             messages = trajectory.request(
                 context,
                 system=self.native_system if native_enabled else self.system,
@@ -125,7 +127,9 @@ class MainAgentPolicy:
                     message = arguments.pop("delegation_message", None)
                     if message is not None:
                         if not isinstance(message, str) or not message.strip() or len(message) > 600:
-                            raise ValueError("delegation_message must contain 1 to 600 characters")
+                            raise ValueError("delegation_message must contain 1 to 600 characters; "
+                                + f"actual_length={len(message) if isinstance(message,str) else 'not_string'}. "
+                                + "Use 1-3 short sentences for the objective; pass evidence via context_selection, not long pasted content.")
                         # WHY: 通信元数据不进入执行参数，避免扩大专业动作的输入输出契约。
                         decision = decision.model_copy(update={"arguments": arguments, "reason": message})
                 trajectory.proposed(decision, assistant_message=(raw.get("assistant_message")
@@ -157,10 +161,20 @@ class MainAgentPolicy:
                 trajectory.data["native_tools_disabled"] = True
                 last_error = "原生工具协议不可用，请按 JSON 动作契约返回。"
             except (ValidationError, ValueError, TypeError) as exc:
+                from app.agent.delegation_context import ContextSelectionError
                 last_error = str(exc)
-            trajectory.observe({"status": "rejected", "error": last_error})
+                if isinstance(exc, ContextSelectionError):
+                    repair_context = exc.repair_context()
+            feedback = {"status": "rejected", "error": last_error}
+            correction = {"decision_error": last_error, "allowed_actions": list(allowed_actions)}
+            if not self.delegation_messages:
+                correction["completed_operations"] = list(context.state.delegation.get("completed_operations") or [])
+            if repair_context is not None:
+                feedback["context_selection_error"] = repair_context
+                correction["context_selection_error"] = repair_context
+            trajectory.observe(feedback)
             trajectory.data["messages"].append(
-                {"role": "user", "content": encode({"decision_error": last_error})}
+                {"role": "user", "content": encode(correction)}
             )
             if attempt >= self.correction_attempts:
                 break

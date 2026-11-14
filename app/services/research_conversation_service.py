@@ -84,6 +84,11 @@ _HARD_EXECUTION_STOP_CODES = {
 
 
 def _has_hard_execution_stop(result: dict[str, Any]) -> bool:
+    private = result.get("research_state") or {}
+    # WHY: 新协议的恢复决策已在Main循环内完成；会话结算不能在Main终止后另起恢复队列。
+    # 旧会话继续兼容原恢复入口；用户显式再次恢复仍正常进入新的Main回合。
+    if private.get("check_protocol_version") and private.get("result_status") in {"blocked", "failed", "cancelled"}:
+        return True
     """判断结果是否因预算/截止/失权等硬性执行停止而终止。"""
     candidates: list[Any] = list(result.get("errors") or [])
     candidates.extend((result.get("research_state") or {}).get("errors") or [])
@@ -235,6 +240,12 @@ class ResearchConversationService:
         # trusted_state 只由服务内部的会话恢复路径提供；外部请求仍经过
         # AgentRequest 的公开字段白名单校验。
         initial_state = dict(trusted_state if trusted_state is not None else (request.state or {}))
+        if request.delivery_mode is not None:
+            initial_state["delivery_mode"] = request.delivery_mode
+            if initial_state.get("effective_config"):
+                # Existing tasks require the idle CAS revision API, not request-side overrides.
+                if initial_state["effective_config"]["values"].get("review_delivery_mode") != request.delivery_mode:
+                    raise ValueError("请先显式修订已保存任务的交付配置")
         if request.best_effort_on_failure is not None:
             initial_state["best_effort_on_failure"] = request.best_effort_on_failure
             initial_state["best_effort_policy_source"] = "request"
@@ -531,6 +542,9 @@ class ResearchConversationService:
                 grounding_query=grounding_query,
             ).model_dump(mode="json")
             editable["semantic_frame_source_query"] = semantic_query
+            if not editable["research_semantic_frame"].get("clarification_needed"):
+                # WHY: 已回答的问题不能通过research_plan中的旧副本重新变成阻断事项。
+                editable["clarification"] = {"needed": False}
             editable.pop("autonomous_verified_fingerprint", None)
             # WHY: 保留研究目标和已有证据，用户的新约束进入五字段后重新决策，
             # 不把澄清文本当成新主题，也不自动降低原有显式要求。
@@ -1574,6 +1588,8 @@ class ResearchConversationService:
         history: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
         """诊断写作缺口，并在共享预算内执行无需用户改约束的恢复动作。"""
+        if _has_hard_execution_stop(result):
+            return None
         from app.agent.generation_recovery import decide_generation_recovery
         from app.core.config import get_settings
         from app.schemas.recovery_schema import RecoveryAction, RecoveryStatus

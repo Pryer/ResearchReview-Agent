@@ -1,6 +1,7 @@
 """Agent 工作流串联测试。"""
 
 from __future__ import annotations
+from tests.agent_decision_fakes import completed_verifier, accept_check_kwargs
 
 import json
 
@@ -1650,10 +1651,10 @@ def test_regeneration_clears_stale_readiness_and_section_diagnostics_before_writ
         state["review"] = "## 研究现状\n\n重新生成的正文。"
 
     monkeypatch.setattr("app.agent.graph._generate_deliverables_or_block", fake_generate)
-    monkeypatch.setattr("app.agent.graph._verify_generated_draft", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.agent.graph._verify_generated_draft", completed_verifier(lambda *args, **kwargs: None))
     monkeypatch.setattr(
         "app.agent.graph.final_answer_node",
-        lambda state: state.update({"answer": state.get("review", "")}),
+        accept_check_kwargs(lambda state: state.update({"answer": state.get("review", "")})),
     )
 
     state = {
@@ -1711,10 +1712,10 @@ def test_regeneration_refreshes_existing_evidence_without_expanding_candidate_po
         "app.agent.graph._generate_deliverables_or_block",
         lambda state, should_cancel=None: state.update({"review": "## 研究背景\n\n刷新后的正文。"}),
     )
-    monkeypatch.setattr("app.agent.graph._verify_generated_draft", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.agent.graph._verify_generated_draft", completed_verifier(lambda *args, **kwargs: None))
     monkeypatch.setattr(
         "app.agent.graph.final_answer_node",
-        lambda state: state.update({"answer": state.get("review", "")}),
+        accept_check_kwargs(lambda state: state.update({"answer": state.get("review", "")})),
     )
     state = {
         "intent": "generate_review",
@@ -1775,12 +1776,12 @@ def test_selected_best_effort_generation_cannot_be_skipped_by_main_agent(monkeyp
     monkeypatch.setattr("app.agent.graph._generate_deliverables_or_block", lambda current, **kw: current.update(
         review="有限证据的草稿。",
     ))
-    monkeypatch.setattr("app.agent.graph._verify_generated_draft", lambda current, **kw: current.update(
+    monkeypatch.setattr("app.agent.graph._verify_generated_draft", completed_verifier(lambda current, **kw: current.update(
         quality_gate={"passed": False, "partial_success": True, "draft_released": True},
-    ))
-    monkeypatch.setattr("app.agent.graph.final_answer_node", lambda current: current.update(
+    )))
+    monkeypatch.setattr("app.agent.graph.final_answer_node", accept_check_kwargs(lambda current: current.update(
         answer=current.get("review", ""),
-    ))
+    )))
     state = {
         "intent": "generate_review", "topic": "测试主题", "core_deliverables": [],
         "paper_details": [_paper(paper_id="p1")],
@@ -1795,7 +1796,7 @@ def test_selected_best_effort_generation_cannot_be_skipped_by_main_agent(monkeyp
     assert result["status"] == "partial"
     assert result["body"] == "有限证据的草稿。"
     assert [item["action"] for item in result["research_state"]["main_agent_decisions"]] == [
-        "plan_claims", "generate_deliverables", "validate_result",
+        "plan_claims", "generate_deliverables", "validate_result", "request_finish",
     ]
     assert result["quality_gate"]["passed"] is False
 
@@ -1819,19 +1820,19 @@ def test_selected_taxonomy_repair_runs_clustering_before_claims_and_writing(monk
 
     def write(current, **kwargs):
         calls.append("write")
-        current["review"] = "重新分类后的正文。"
+        current["review"] = "重新分类后的正文，已有研究基于当前任务主题组织相关文献，围绕研究问题与方法展开分析，并将不同证据的适用范围保留在各自论述中。"
 
     monkeypatch.setattr("app.agent.graph.cluster_node", cluster)
     monkeypatch.setattr("app.agent.graph.claim_plan_node", claims)
     monkeypatch.setattr("app.agent.graph._run_claim_evidence_gate", lambda current: None)
     monkeypatch.setattr("app.agent.graph.global_evidence_gate_node", lambda current: None)
     monkeypatch.setattr("app.agent.graph._generate_deliverables_or_block", write)
-    monkeypatch.setattr("app.agent.graph._verify_generated_draft", lambda current, **kw: current.update(
+    monkeypatch.setattr("app.agent.graph._verify_generated_draft", completed_verifier(lambda current, **kw: current.update(
         quality_gate={"passed": True, "draft_released": True},
-    ))
-    monkeypatch.setattr("app.agent.graph.final_answer_node", lambda current: current.update(
+    )))
+    monkeypatch.setattr("app.agent.graph.final_answer_node", accept_check_kwargs(lambda current: current.update(
         answer=current.get("review", ""),
-    ))
+    )))
     state = {
         "intent": "generate_review", "topic": "测试主题", "core_deliverables": [],
         "paper_details": [_paper(paper_id="p1")],
@@ -1846,7 +1847,7 @@ def test_selected_taxonomy_repair_runs_clustering_before_claims_and_writing(monk
 
     assert calls == ["cluster", "claims", "write"]
     assert result["status"] == "success"
-    assert result["body"] == "重新分类后的正文。"
+    assert result["body"] == "重新分类后的正文，已有研究基于当前任务主题组织相关文献，围绕研究问题与方法展开分析，并将不同证据的适用范围保留在各自论述中。"
     assert [item["action"] for item in result["research_state"]["main_agent_decisions"]] == [
         "cluster_papers", "plan_claims", "generate_deliverables", "validate_result", "request_finish",
     ]
@@ -1878,8 +1879,8 @@ def test_verification_only_recovery_preserves_draft_and_skips_writer(monkeypatch
     monkeypatch.setattr(
         "app.agent.graph._generate_deliverables_or_block", unexpected_generate
     )
-    monkeypatch.setattr("app.agent.graph._verify_generated_draft", fake_verify)
-    monkeypatch.setattr("app.agent.graph.final_answer_node", fake_final)
+    monkeypatch.setattr("app.agent.graph._verify_generated_draft", completed_verifier(fake_verify))
+    monkeypatch.setattr("app.agent.graph.final_answer_node", accept_check_kwargs(fake_final))
     state = {
         "review": "## 研究现状\n\n保留的当前正文[p1]。",
         "body": "## 研究现状\n\n保留的当前正文[p1]。",
@@ -1949,7 +1950,7 @@ def test_conservative_regeneration_reuses_routes_and_claim_plan(monkeypatch):
         "generate_deliverables",
         ("report_blocked", {"reason": "测试证据仍不足"}),
     ))
-    monkeypatch.setattr("app.agent.graph._verify_generated_draft", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.agent.graph._verify_generated_draft", completed_verifier(lambda *args, **kwargs: None))
 
     def unexpected(*args, **kwargs):
         raise AssertionError("same-evidence local rewrite must reuse this stage")
@@ -1964,7 +1965,7 @@ def test_conservative_regeneration_reuses_routes_and_claim_plan(monkeypatch):
     monkeypatch.setattr("app.agent.graph._generate_deliverables_or_block", fake_generate)
     monkeypatch.setattr(
         "app.agent.graph.final_answer_node",
-        lambda state: state.update({"answer": state.get("review", "")}),
+        accept_check_kwargs(lambda state: state.update({"answer": state.get("review", "")})),
     )
     state = {
         "intent": "generate_review",
@@ -2020,10 +2021,10 @@ def test_local_regeneration_only_reuses_verification_for_unchanged_authorization
         verification_kwargs.append(kwargs)
         current["quality_gate"] = {"passed": True, "draft_released": True}
 
-    monkeypatch.setattr("app.agent.graph._verify_generated_draft", verify)
-    monkeypatch.setattr("app.agent.graph.final_answer_node", lambda current: current.update(
+    monkeypatch.setattr("app.agent.graph._verify_generated_draft", completed_verifier(verify))
+    monkeypatch.setattr("app.agent.graph.final_answer_node", accept_check_kwargs(lambda current: current.update(
         answer=current.get("review", ""),
-    ))
+    )))
     state = {
         "intent": "generate_review", "topic": "测试主题", "core_deliverables": [],
         "paper_details": [_paper(paper_id="p1")],
@@ -2073,11 +2074,11 @@ def _record_post_writing_chain(monkeypatch) -> list[str]:
     )
     monkeypatch.setattr(
         "app.agent.graph.verify_claims_node",
-        lambda state, llm=None, **kwargs: calls.append("verify_claims"),
+        accept_check_kwargs(lambda state, llm=None, **kwargs: calls.append("verify_claims")),
     )
     monkeypatch.setattr(
         "app.agent.graph.citation_check_node",
-        lambda state, llm=None: calls.append("citation_check"),
+        accept_check_kwargs(lambda state, llm=None: calls.append("citation_check")),
     )
     monkeypatch.setattr(
         "app.agent.graph._check_claim_citation_consistency",
@@ -2128,11 +2129,11 @@ def test_post_writing_chain_forwards_local_verification_targets(monkeypatch):
 
     received: dict = {}
     monkeypatch.setattr("app.agent.graph._claim_alignment_check", lambda state: None)
-    monkeypatch.setattr("app.agent.graph.citation_check_node", lambda state, llm=None: None)
+    monkeypatch.setattr("app.agent.graph.citation_check_node", accept_check_kwargs(lambda state, llm=None: None))
     monkeypatch.setattr("app.agent.graph._check_claim_citation_consistency", lambda state: None)
     monkeypatch.setattr(
         "app.agent.graph.verify_claims_node",
-        lambda state, llm=None, **kwargs: received.update(kwargs),
+        accept_check_kwargs(lambda state, llm=None, **kwargs: received.update(kwargs)),
     )
 
     _verify_generated_draft(

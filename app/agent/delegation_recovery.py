@@ -20,8 +20,12 @@ def search_once(state, *, search, rank, should_cancel=None):
     if kind == "route" and (decision.get("action") not in {"TARGETED_SEARCH", "QUERY_FILTER_REVISION"}
                              or not decision.get("queries")):
         raise ValueError("route search requires queries diagnosed by Analysis and selected by Main")
-    consume("recovery")
-    state["recovery_action_count"] = recovery_action_count(state) + 1
+    active = state.get("active_quality_recovery") or {}
+    # WHY: Main已通过统一恢复账本预留本轮时不重复扣费；普通路线恢复保留原计数。
+    reserved = active.get("origin") == "main" and active.get("action") == "TARGETED_SEARCH"
+    if not reserved:
+        consume("recovery")
+        state["recovery_action_count"] = recovery_action_count(state) + 1
     pending = {
         "kind": kind, "decision": dict(decision),
         "before_card_ids": [str(card.get("paper_id")) for card in state.get("paper_cards") or []],
@@ -29,6 +33,10 @@ def search_once(state, *, search, rank, should_cancel=None):
         "core_before": _route_core_counts(state),
     }
     if kind == "citation":
+        if decision.get("queries"):
+            state["keywords"]=list(dict.fromkeys([*decision["queries"],*(state.get("keywords") or [])]))
+            state.setdefault("search_branches",[]).append({"branch_type":"citation_gap_recovery",
+                "queries":list(decision["queries"]),"constraint_level":"targeted_recovery"})
         state["citation_gap_repair_attempted"] = True
         state["_citation_gap_repair_previous_cited"] = int(state.get("unique_cited_paper_count") or 0)
         state["citation_shortfall_count"] = max(0, int(state.get("required_reference_count") or 0)
@@ -72,6 +80,18 @@ def settle_after_analysis(state):
     settings = get_settings()
     _refresh_evidence_snapshot(state)
     diagnose_evidence_gaps_node(state, llm=None)
+    if pending["kind"] == "quality":
+        new_cards = [c for c in state.get("paper_cards") or []
+                     if str(c.get("paper_id")) not in pending["before_card_ids"]
+                     and c.get("quality_status") != "invalid" and c.get("evidence_spans")]
+        state["evidence_recovery_status"] = (RecoveryStatus.RECOVERABLE.value if new_cards
+                                             else RecoveryStatus.EXHAUSTED.value)
+        _append_recovery_history(state, round=int(state.get("recovery_round") or 0),
+            action=RecoveryAction.TARGETED_SEARCH, status=RecoveryStatus(state["evidence_recovery_status"]),
+            affected_route_ids=[], queries=pending["decision"].get("queries") or [],
+            new_evidence=len(new_cards), new_relevant_evidence=len(new_cards),
+            coverage_before=0, coverage_after=0, coverage_gain=0,
+            query_novelty=0, stop_reason="" if new_cards else "补检索没有新增可用内容证据")
     if pending["kind"] == "route":
         decision = pending["decision"]
         validation = state.get("route_validation_report") or {}
