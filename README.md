@@ -1,563 +1,182 @@
-# ResearchReview-Agent 📚
+<div align="center">
 
-> 面向多学科研究主题的检索、证据结构化与引用可验证综述智能体
+# ResearchReview-Agent
 
-**中文 README** | [English README](README.en.md)
+**从一个研究问题，到一份有据可查的文献综述。**
 
-根据用户自然语言指令识别研究约束与主题歧义，自动检索开放论文、生成结构化论文卡片、按当前证据归纳研究脉络，最终生成带可验证引用的学术综述。
+多源论文检索 · 结构化证据 · 多 Agent 协作 · 引用核验
 
----
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi&logoColor=white)
+![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B?logo=streamlit&logoColor=white)
 
-## ✨ 核心能力
+**中文** | [English](README.en.md)
 
-按「**1 条工程底座 + 3 个业务模块**」组织：底座提供长任务运行、状态恢复和受控执行能力，
-三个模块是业务数据流（发现 → 检索抽取 → 生成质检）。
+[快速开始](#快速开始) · [使用示例](#使用示例) · [工作原理](#工作原理) · [文档](#文档)
 
-### ▍工程底座（跨模块）
+</div>
 
-| 能力 | 说明 |
-|------|------|
-| Agent 编排模型 | 统一主从调度：主 Agent 每轮选一个任务；Search / Analysis / Writing / Check 各自独立 ReAct 循环，同一委派内连续对话，跨委派按角色摘要与依赖增量继承，通过结构化消息完成委派、汇报与协助请求 |
-| 受控执行边界 | Controller 按动作投影输入，校验角色工具权限、输出白名单、类型、身份与版本后才提交；建议动作不等于授权执行 |
-| 上下文工程 | Stable Prefix + 追加式 ReAct Trajectory + 动态 Agent Status Bar；Token 水位触发的有界 Compaction（含滞回阈值）、Artifact 归档与历史观察回查 |
-| 会话记忆检索 | Append-only Event Log + Cursor 增量摘要；主控按任务做中英文词项检索、有界注入，并记录采用反馈与后续结果 |
-| 长任务运行时 | 线程池 Job + 步骤级 Checkpoint；长任务异步执行，可查询步骤与进度，并在节点边界协作式取消 |
-| 持久化与并发 | 条件 UPDATE + 版本号实现乐观并发；会话租约保护提交、防止旧执行覆盖新状态；检查点恢复保留证据、显式约束与累计预算 |
-| 重启恢复边界 | queued 任务重新入队、cancel_requested 兑现取消、**running 任务标记 failed**（不承诺续跑，避免重复副作用） |
-| 缓存与用量 | 稳定前缀与追加式轨迹提升缓存命中；统计真实缓存用量，Token 预算触发分层压缩 |
+ResearchReview-Agent 是一个面向学术文献综述的 AI Agent。输入研究主题、时间范围和写作要求，它会检索论文、整理证据、归纳研究脉络，并生成带参考文献的研究背景、研究现状、相关工作或叙述性综述初稿。
 
-### ▍模块一：文献发现与知识入库
+你可以在对话中澄清方向、调整论文集合、继续研究；也可以回查正文中的主张对应哪些论文和原文片段。
 
-| 能力 | 说明 |
-|------|------|
-| 研究请求理解 | LLM 开放语义解析 + 规则校验，抽取主题、年份、篇数、范围与四类交付物 |
-| 多轮研究会话 | 保存澄清、论文集合、生成版本与修订历史；支持按序号/标题排除论文 |
-| 多源检索 | 默认 arXiv + Semantic Scholar + OpenAlex + Crossref；CNKI 为 Selenium 网页适配器、**默认关闭**、需显式授权启用 |
-| 论文排序 | 相关性 + 质量综合打分，自动去重；记录 `citation_count_by_source` 避免跨源口径混淆 |
-| 失败诊断 | 区分"真空结果"与"检索失败"，避免误判关键词不合适 |
-| PDF 解析 | PyMuPDF 逐页解析，保留页码、解析证据指纹与 parser profile；记录空文本页、低文本页等诊断 |
-| 切块与入库校验 | 切块后校验论文身份、块唯一编号与 `[start,end)` 原文区间回读；重复页、改写文本、错位均拒绝持久化 |
-| 向量索引 | **论文内 chunk 级**索引：默认 pgvector，可显式选择 NumPy；按来源 revision 与 active 快照隔离，复用向量缓存 |
+## 你可以用它做什么
 
-> ⚠️ **边界说明**：`POST /api/library/rebuild_index` 目前是占位实现，仅返回卡片数量，
-> 尚未实现库级向量索引。真实的向量检索能力在 **chunk 层**（`app/tools/chunk_retriever.py`）。
-> 本轮未实现 OCR、表格结构恢复或替换解析器。
+| 场景 | 输入示例 | 交付内容 |
+| --- | --- | --- |
+| 了解一个研究方向 | “梳理检索增强生成的主要研究路线” | 研究现状与路线归纳 |
+| 撰写研究背景 | “介绍少样本动作识别的问题背景与研究动机” | 研究背景与参考文献 |
+| 整理相关工作 | 提供自己的研究问题、方法和创新点 | 围绕本文工作的相关工作章节 |
+| 起草文献综述 | 指定主题、年份、语言和引用篇数 | 综述初稿与参考文献 |
 
-### ▍模块二：分层混合检索与结构化证据抽取
+## 核心特性
 
-| 能力 | 说明 |
-|------|------|
-| 两层检索 | 第一层按论文排序；第二层在单篇论文范围内按七类字段执行 BM25 + Dense 混合召回 |
-| 融合与重排 | Family-aware RRF（同一 Query Family 内先取该论文最优排名，避免查询改写数量直接放大权重）+ 可选 Reranker 重排 |
-| 来源容错 | **按 Provider 粒度**的令牌桶限流、`Retry-After` 解析、指数退避抖动、源级冷却与三态熔断；单一数据源故障不影响其余来源 |
-| 结构化抽取 | PaperCard 抽取研究问题、方法、数据、指标与局限 |
-| 文献矩阵 | 保存作者、完整题名、DOI、文献类型、证据等级、研究设计、样本规模、模态、结果与局限 |
-| 证据计数 | 显式区分「候选论文数」与「合格证据数」，数量不足时报告实际篇数而非凑数 |
+- **多源发现论文** — 联合检索 arXiv、Semantic Scholar、OpenAlex 和 Crossref，合并去重并复核元数据。
+- **两层混合检索** — 在论文层筛选相关文献，在全文层检索字段证据；结合 BM25、向量召回、RRF 融合与 Reranker 重排。
+- **把论文变成证据** — 解析 PDF，提取研究问题、方法、数据、结果与局限，保留页码和原文位置。
+- **分工协作的研究 Agent** — Main 规划任务，Search、Analysis、Writing 和 Check 分别完成检索、分析、写作与核验，根据反馈继续补证或修订。
+- **逐句回查引用** — 将正文主张关联到证据，检查引用身份、语义支持、数字及研究约束。
+- **持续研究与修订** — 支持多轮澄清、论文排除、检查点恢复和增量生成，复用已有研究成果。
+- **看得见的研究过程** — Streamlit 界面展示任务进度与核验结果，HTML 运行报告记录决策、工具步骤和模型用量。
 
-### ▍模块三：证据驱动生成与质量控制
+## 快速开始
 
-| 能力 | 说明 |
-|------|------|
-| 四类交付物 | 研究背景、研究现状、论文相关工作、叙述性综述初稿 |
-| 文献聚类 | 从论文证据归纳理论、实证、方法、应用等研究脉络 |
-| Claim–Evidence | 写作时按句输出证据引用；先做引用存在性校验，再做语义支持判定 |
-| 质量门禁 | 多级门禁，对证据不足执行补检索、修复或阻断交付；区分**硬约束**（引用不存在、违反用户显式年份/数量限制）与**启发式质量阈值** |
-| 增量重生成 | 编辑论文集合后只重做聚类、写作与引用验证，不重复检索与详情补全 |
-| 引用与标识分离 | 主张验证阶段用 DOI / S2 / OpenAlex / arXiv ID 追踪证据；正文统一渲染为顺序编码或作者—年份引用，完整元数据进入参考文献表 |
-| 真实运行反查 | 通过真实 Provider 端到端运行反查出年份漏解析、「最多 N 篇」被误作最低引用数、纯检索被误判写作、子 Agent 汇报动作不合法、相邻题名混入等契约缺陷，逐一修复并补回归 |
+### 1. 获取项目并安装依赖
 
-### 关于 CNKI
-
-CNKI 是 **Selenium 网页适配器，不是官方 API**，默认 `CNKI_ENABLED=false`。
-请求参数和历史会话中的来源列表均不能覆盖禁用状态，直接客户端和浏览器创建入口也会检查。
-仅在确认适用的自动化访问授权后由部署方显式启用，并把 `cnki` 加入所需来源；
-适配器不隐藏浏览器自动化身份，不绕过访问限制。
-
-### 关于时间范围
-
-相对时间按滚动年份边界近似。例如系统在 2026 年处理"近三年"时，检索年份元数据为
-2023—2026 年，当前年度只纳入检索时已正式出版或在线公开的记录。用户明确给出的时间范围
-不会为凑足篇数而自动向前扩展；数量不足时系统会报告实际篇数。
-
----
-
-## 当前架构
-
-Main 负责规划与委派；Search、Analysis、Writing 和 Check 分别处理检索、证据分析、写作与独立核验。Controller 校验权限、状态版本和发布条件，核验失败后可在预算内补证或修订。具体实现见 [架构介绍](ARCHITECTURE.md) 和 [Check 与反馈闭环](docs/check-agent-and-feedback.md)。
-
-研究执行采用统一的主从调度：主 Agent 每轮选择一个任务，Search、Analysis、Writing、Check
-各自通过独立 ReAct 循环执行本次授权动作并向主控汇报；动作权限、预算、
-取消、证据版本与质量门禁由确定性代码裁决。历史会话（含未记录模式或标记为
-`legacy` 的旧状态）在恢复入口统一规范为这套调度；原研究目标、显式约束、论文
-与证据卡、恢复历史与预算消耗全部保留，只重算与旧调度绑定的派生结果。
-主 Agent 和子 Agent 的请求由 Stable Prefix、ReAct Trajectory 和最新 Agent Status Bar
-组成。状态栏沿用 `goal`、`state`、`key_evidence`、`decisions`、`open_questions`
-五字段载荷；完整论文、证据和历史保存在权威状态与数据库资料中。
-
-```text
-用户请求 → 需求解析 → 构建五字段 → 主 Agent 委派任务
-                                      ↓
-                         Search / Analysis / Writing / Check 独立上下文
-                                      ↓
-                         子 Agent 决策 → Controller 校验执行
-                              ↑              ↓
-                              └── 观察与检查点 ┘
-                                      ↓
-                    汇报结果 / 请求协助 → 主控决策与回复 → 下一轮
-
-申请交付 → 确定性质量门禁 → 完成 / 明确降级 / 拒绝交付
-```
-
-会话服务将任务结果、资料引用、预算和检查点原子提交；取消、失效或越权结果不能
-随后覆盖研究状态。直接调用 graph 的脚本仍是内存执行模式。缓存优化保留完整
-证据核验，不代表已经测得固定节费比例。模块说明见 [ARCHITECTURE.md](ARCHITECTURE.md)，
-事务与恢复边界见 [执行、恢复与缓存说明](docs/agent-runtime-and-cache.md)。
-主控消息在同一 Context Epoch 内追加用户要求、动作、执行观察和末尾状态栏；
-窗口预算接近阈值或工作记忆超限时归档完整历史，保留最新有效约束与有界观察摘要后
-开始新 Epoch；旧原生调用及 `reasoning_content` 不跨 Epoch 重放，同一 Epoch 内
-仍保留 Provider 必需的调用与思考协议字段。工作记忆默认最多 8 条、8000 字符，
-还会按实际输入预算缩减；当前门禁和证据由最新状态栏提供。
-可用 `recall_context` 按证据 ID 或来源引用回查自身归档观察。回查只提供历史信息，
-不授予当前证据权限；达到扫描或结果上限时会明确标记未完整扫描。
-Main Agent 可用 `search_research_memory(query, kind, limit)` 查询本会话的研究发现、
-有效决定、未决问题及失败经验，结果进入 `state.research_memory`，默认最多 3 条、
-1600 JSON 字符。LLM 选择查询，服务端按中英文词项匹配；旧摘要仅召回研究发现，
-失效决定和已解决问题不会复活。后续 `memory_feedback` 区分采用、无关和过期，
-事件记录关联后续动作结果；未反馈仅代表已呈现。当前没有跨会话或向量记忆检索。
-压缩优先保留最多 2 条尚未被同动作成功观察覆盖的失败记录，仍受总工作记忆预算限制。
-`AGENT_CONTEXT_WINDOW_TOKENS` 应设为主备模型可用窗口的较小值，默认 65536；
-输入采用保守估算，实际用量来自服务商 usage。轨迹压缩需要会话 Artifact Store，
-详细配置及边界见 [上下文架构](docs/agent-context-architecture.md#react-epochs-and-context-capacity)。
-
-四个子 Agent 的角色规则、追加式交互轨迹、预算视图和压缩 Epoch 分别保存，跨委派
-复用，并随会话检查点恢复。主控通过任务目标、参数和证据引用下达任务，子 Agent
-通过结构化进展、完成、协助请求和阻断消息反馈。它们按需持续决策到汇报或执行边界，
-当前采用同步委派，不启动后台常驻线程或并行写入共享研究状态。
-每次委派默认最多 12 轮决策，连续 3 次无进展时返回阻断报告；总 Token、动作、检索、
-截止时间和取消仍共用会话账本。当前拒绝向活跃子循环叠加新委派，恢复必须显式续接
-已有委派；未开放同角色并发。`status=completed` 只代表执行生命周期结束，
-`outcome` 和 `delegation_status` 分别报告业务结果与完成/协助/阻断通信状态；
-主控会显式消费这些状态，子任务完成不能替代最终质量门禁。
-核验失败时，Main依据逐条主张和证据缺口决定改写、补检索或重新分析；新增论文必须先提取证据和更新授权。
-新候选必须独立核验，残稿不能标记可用。常规显式引用任务默认按约2倍保留合格候选，首批证据池约1.5倍，
-大额任务仍受既有绝对余量与执行预算约束。详见[质量反馈与恢复闭环](docs/main-quality-feedback-loop.md)。
-
----
-
-## 🚀 快速开始
-
-### 1. 创建 conda 环境（推荐）
+需要 Python 3.11；推荐使用 Conda：
 
 ```bash
+git clone https://github.com/Pryer/ResearchReview-Agent.git
+cd ResearchReview-Agent
 conda env create -f environment.yml
 conda activate rragent
 ```
 
-如果环境已存在，只需更新依赖：
+已有 Python 环境也可以直接安装：
 
 ```bash
-conda activate rragent
 python -m pip install -r requirements.txt
-python -m pip install pytest==7.4.0
 ```
 
-### 2. 配置环境变量
+### 2. 配置模型与存储
+
+将 `.env.example` 复制为 `.env`，填写以下配置：
+
+| 配置组 | 需要填写的内容 |
+| --- | --- |
+| 对话与写作模型 | `LLM_PROVIDER`、`LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`，支持 OpenAI 兼容接口 |
+| 检索模型 | `DASHSCOPE_API_KEY`、`RETRIEVAL_EMBEDDING_URL`、`RETRIEVAL_RERANK_URL`，使用百炼原生端点 |
+| 向量存储 | 默认 PostgreSQL + pgvector，填写独立的 `CARD_VECTOR_DATABASE_URL` |
+
+业务数据默认保存到 SQLite，全文向量索引使用独立存储。首次使用 pgvector 时，先创建数据库并安装 vector 扩展，再初始化项目表：
 
 ```bash
-copy .env.example .env
-# 编辑 .env，填入 LLM_API_KEY 等配置
-```
-
-可在启动完整服务前验证 OpenAI 兼容接口配置：
-
-```bash
+python scripts/manage_vectorstore.py migrate
+python scripts/check_rag_runtime.py
 python scripts/check_llm_api.py --target primary
 ```
 
-升级已有部署后需重启服务加载新代码，启动建表会添加执行与历史归档表。
-也可先运行 `python scripts/migrate_agent_runtime.py`；该迁移幂等，保留已有研究数据。
+数据库部署见 [Windows Conda + pgvector](docs/windows-conda-pgvector.md)；后端选项及迁移见 [检索与存储配置](docs/hierarchical-rag-migration.md)。完整配置项见 [.env.example](.env.example)。
 
-### 3. 启动 API 服务
+### 3. 启动服务
+
+在一个终端启动 API：
 
 ```bash
-conda activate rragent
 python run_api.py
 ```
 
-访问 http://127.0.0.1:8000/docs 查看 Swagger UI。
-
-### 4. 启动前端（可选）
+在另一个终端激活相同环境并启动界面：
 
 ```bash
 conda activate rragent
 python run_chat_frontend.py
 ```
 
-访问 http://127.0.0.1:8501 使用前端。
+按终端提示打开 Streamlit 界面，输入研究需求即可开始。API 默认端口为 `8000`，前端默认端口为 `8501`，交互式 API 文档位于后端的 `/docs` 路径。
 
-### pip 安装方式（备选）
+## 使用示例
 
-```bash
-pip install -r requirements.txt
+### 在界面中发起研究
+
+```text
+调研 2020—2023 年检索增强生成在开放域问答中的应用，
+生成中文研究现状，按研究方法组织，最终引用至少 5 篇不同论文。
 ```
 
----
+Agent 会解析研究范围、检索和筛选论文、整理证据，并生成候选正文。你可以在界面查看论文与引用核验结果，再提出修订要求，例如：
 
-## 📡 API 使用示例
-
-### 后台任务、取消与增量修订
-
-前端默认使用后台任务接口，提交后会立即获得 `job_id`：
-
-```bash
-curl -X POST http://localhost:8000/api/reviews/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"session_id":"demo-001","user_query":"调研近三年某主题论文并生成综述"}'
+```text
+删除第 2 篇论文，重点比较不同检索器的作用，重新生成研究现状。
 ```
 
-使用 `GET /api/reviews/jobs/{job_id}` 查询状态，或调用
-`POST /api/reviews/jobs/{job_id}/cancel` 请求取消。取消为节点边界协作式取消：
-正在执行的外部 API/LLM 请求仍受客户端超时约束；取消先落库后，迟到研究结果不能
-提交，但已经发生的模型消耗仍结算。
+### 通过 API 提交任务
 
-完成后可以按稳定 ID 排除论文并增量重生成：
-
-```bash
-curl -X POST http://localhost:8000/api/reviews/jobs/revise \
-  -H "Content-Type: application/json" \
-  -d '{"session_id":"demo-001","excluded_paper_ids":["doi:example"],"instruction":"该论文与主题不直接相关"}'
-```
-
-也可只传自然语言指令，例如“删除第 2、5 篇后重新生成”。会话记忆可通过
-`GET /api/reviews/sessions/{session_id}` 查询。
-
-### 从已提交检查点恢复
-
-中断会话可向 `POST /api/reviews/jobs` 提交以下 JSON：
+向 `POST /api/reviews/jobs` 提交 JSON：
 
 ```json
 {
-  "session_id": "demo-001",
-  "user_query": "继续上次研究",
-  "resume_from_checkpoint": true
+  "session_id": "rag-review-demo",
+  "user_query": "调研2020—2023年检索增强生成在开放域问答中的应用，生成中文研究现状，引用至少5篇不同论文。",
+  "delivery_mode": "draft_first"
 }
 ```
 
-该入口适用于具有已提交检查点的 `running/failed/cancelled/blocked` 会话；已有活动
-任务需先结束，崩溃租约需到期后才能接管。恢复保留原目标、年份、篇数要求和累计
-预算，不自动提高额度或重放未决请求。待澄清会话仍提交 `clarification_answer`，
-已完成会话使用修订入口。历史在保留最近 50 条展示记录前归档，摘要按事件游标增量更新。
+接口返回任务标识后，通过 `GET /api/reviews/jobs/{job_id}` 查询进度和结果。
 
-### 自然语言 Agent 请求
+| 操作 | 接口 |
+| --- | --- |
+| 发起研究或继续会话 | `POST /api/reviews/jobs` |
+| 查询任务进度 | `GET /api/reviews/jobs/{job_id}` |
+| 取消任务 | `POST /api/reviews/jobs/{job_id}/cancel` |
+| 修改论文集合并重新生成 | `POST /api/reviews/jobs/revise` |
+| 读取研究会话 | `GET /api/reviews/sessions/{session_id}` |
 
-Streamlit 会自动创建 `session_id`。直接调用 API 时，传入稳定的 `session_id` 即可启用主题澄清与续跑：
+默认 `draft_first` 支持先交付带待完善项的草稿，再继续优化；选择 `strict` 可要求通过正式质量门禁后交付。结果会同时给出交付状态与原始要求的满足情况。
+
+更多输入模板见 [examples/](examples/README.md)，包括相关工作、主题澄清与检查点恢复。
+
+## 工作原理
+
+```mermaid
+flowchart TD
+    U[研究需求] --> M[Main：理解范围与规划任务]
+    M --> S[Search：检索、排序与详情获取]
+    S --> A[Analysis：证据抽取与主张规划]
+    A --> W[Writing：生成候选正文]
+    W --> C[Check：核验主张与引用]
+    C --> F{质量反馈}
+    F -->|补证或修订| M
+    F -->|申请交付| D[Controller：校验版本与发布条件]
+    D --> O[正文、参考文献与核验结果]
+```
+
+Main 每轮选择一个研究任务，专业 Agent 在各自上下文中执行并汇报；Controller 管理动作权限、预算、取消和状态提交。论文、原文证据、可写主张和正文引用逐层关联，质量反馈决定下一步研究动作。
+
+完整模块与数据流见 [架构介绍](ARCHITECTURE.md)。
+
+## 文档
+
+| 我想了解… | 阅读入口 |
+| --- | --- |
+| 系统结构与一次请求的完整路径 | [架构介绍](ARCHITECTURE.md) |
+| 前端操作和多轮研究 | [界面指南](docs/CHAT_FRONTEND_GUIDE.md) · [多轮会话](docs/multi_turn_research.md) |
+| 检索、模型和向量库配置 | [分层检索配置](docs/hierarchical-rag-migration.md) · [.env.example](.env.example) |
+| 论文证据与逐句引用核验 | [证据模型](docs/evidence-model.md) · [主张核验](docs/evidence_verification.md) |
+| Agent 的上下文与记忆 | [上下文设计](docs/agent-context-architecture.md) |
+| 任务恢复、缓存与预算 | [运行机制](docs/agent-runtime-and-cache.md) |
+| 草稿交付与质量反馈 | [交付策略](docs/draft-delivery-and-incremental-retrieval.md) · [Check Agent](docs/check-agent-and-feedback.md) |
+| 导出研究执行过程 | [HTML 运行报告](docs/execution-reports.md) |
+| 版本变化 | [更新记录](CHANGELOG.md) |
+
+CNKI 可通过 Selenium 适配器接入，由部署方在具备访问授权后显式启用；配置见 [.env.example](.env.example)。
+
+## 开发与贡献
 
 ```bash
-curl -X POST http://localhost:8000/api/reviews/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"session_id":"demo-001","user_query":"调研近三年课堂行为分析论文，引用不少于40篇，并生成研究背景和研究现状"}'
+python -m pytest -q
 ```
 
-轮询任务后若结果为 `status=needs_clarification`，使用同一会话提交自由文本回答：
+代码位于 `app/`，测试位于 `tests/`，标准请求位于 `examples/`。开发约定见 [AGENTS.md](AGENTS.md)。
 
-```bash
-curl -X POST http://localhost:8000/api/reviews/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"session_id":"demo-001","user_query":"偏向技术识别与教育解释的交叉研究","clarification_answer":"偏向技术识别与教育解释的交叉研究"}'
-```
-
-#### 生成叙述性综述初稿
-```bash
-curl -X POST http://localhost:8000/api/reviews/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"user_query": "帮我调研近五年课堂行为识别相关论文，并生成中文文献综述，引用不少于10篇。"}'
-```
-
-#### 生成相关工作章节
-```bash
-curl -X POST http://localhost:8000/api/reviews/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "user_query": "生成少样本动作识别的相关工作章节",
-    "state": {
-      "our_work": {
-        "research_problem": "低样本条件下的动作类别泛化",
-        "method_name": "TempFSL",
-        "method_summary": "时序原型网络结合跨域迁移",
-        "innovations": ["动态时间规整模块", "跨域自适应策略"]
-      }
-    }
-  }'
-```
-
-### 结构化检索
-
-```bash
-curl -X POST http://localhost:8000/api/papers/search \
-  -H "Content-Type: application/json" \
-  -d '{"query": "vision transformer", "start_year": 2021, "end_year": 2025, "max_results": 20}'
-```
-
----
-
-## 🧪 运行测试
-
-```bash
-conda activate rragent
-pytest
-```
-
-2026-10-20 的工程整改、真实任务尝试和独立 SQLite 压测见
-[项目验收记录](docs/validation/2026-10-20-project-acceptance.md)。
-真实服务结果与 Mock 回归分开记录；待澄清、阻断和失败不计为完整研究交付成功。
-
-2026-10-18 研究记忆检索闭环完成后的本地全量回归为 **1628 项通过**，
-本次新增 18 项检索、反馈、失效与权限边界测试；相关定向回归 170 项通过。
-此前新增的 19 项有界压缩、归档回查和结果消费测试继续通过。
-此前独立子循环改造新增的 23 项测试继续通过。外部学术 API、CNKI 和
-LLM 在这些回归中使用 Mock；本轮未执行真实服务全链路，也未测量成本或性能收益。
-
-历史真实服务验收：2026-09-22 的全量回归为 1224 项通过；真实备用 LLM → CNKI
-检索 3 篇 → 提交 → 数据库重开恢复已通过；“至少 40 篇完整综述”场景因剩余预算
-不足以预留下一请求而阻断，尚未完成交付验收。详见[验收记录](docs/validation/2026-09-22-runtime-cache.md)。
-
----
-
-## 📁 项目结构
-
-```
-ResearchReview-Agent/
-├── app/
-│   ├── agent/        # 意图识别、槽位抽取、规划、路由、节点、图编排
-│   │   ├── prompt_templates/  # 写作 Prompt 契约（review/related_work/introduction）
-│   │   ├── graph.py           # 四类交付物的主工作流入口（run/continue/regenerate）
-│   │   ├── main_loop.py / main_policy.py # 五字段决策循环与原生工具/JSON 动作策略
-│   │   ├── controller.py / action_contracts.py # 动作授权、输入投影、补丁与版本校验
-│   │   ├── context_builder.py # 五字段状态摘要与主控可见的子 Agent 汇报
-│   │   ├── react_context.py   # 按角色隔离的追加式轨迹、观察和 Epoch 压缩
-│   │   ├── subagents/loop.py  # Search/Analysis/Writing/Check 独立循环与主从通信
-│   │   ├── execution_budget.py # 跨主决策、专业任务和重试共享预算
-│   │   ├── nodes/             # 按阶段分组的节点包：planning/retrieval/extraction/synthesis/verification
-│   │   ├── retrieval_loop.py  # ReAct 检索精化循环
-│   │   ├── recovery_loop.py   # 路线证据恢复状态机
-│   │   ├── intent.py          # 兼容意图识别；能力边界由 Guard 控制
-│   │   └── state.py           # 状态定义（含新字段）
-│   ├── api/          # FastAPI 路由
-│   ├── clients/      # arXiv / Semantic Scholar / OpenAlex / Crossref / CNKI 客户端
-│   ├── core/         # 配置、日志、异常
-│   ├── database/     # SQLAlchemy；runtime_repository 管理租约、CAS、任务/请求和快照
-│   ├── frontend/     # Streamlit 前端
-│   ├── schemas/      # Pydantic 数据模型（含 SourceDiagnostic）
-│   ├── services/     # 会话/任务、执行作用域、资料存取、增量历史与 LLM 服务
-│   ├── tools/        # 检索、排序、PDF、聚类、写作分发、引用工具
-│   │   ├── write_deliverable.py     # 四类交付物统一写作分发
-│   │   ├── verify_claims.py         # 句子级 Claim–Evidence 校验
-│   │   └── fetch_metadata.py        # 元数据补全（支持按源记录引用量）
-│   ├── deliverables/ # 四类交付物规格与渲染器（背景/现状/相关工作/叙述性综述）
-│   ├── prompt/       # 提示词与懒加载目录（prompt_catalog.py）
-│   ├── utils/        # 文本清洗、去重、文件工具
-│   └── main.py       # FastAPI 实例：路由注册、CORS、lifespan 建表与任务恢复
-├── tests/            # pytest 测试
-├── data/             # 运行时产生的 PDF / 解析结果 / 综述 / 评估包
-├── environment.yml   # conda 环境配置
-├── run_api.py            # API 启动入口
-├── run_chat_frontend.py  # Streamlit 前端启动入口
-└── requirements.txt  # 依赖清单
-```
-
----
-
-## 🔧 配置说明
-
-编辑 `.env` 文件：
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `LLM_PROVIDER` | LLM 提供商 | `deepseek` |
-| `LLM_API_KEY` | API 密钥 | 必填 |
-| `LLM_BASE_URL` | API 地址 | DeepSeek |
-| `LLM_MODEL` | 模型名称 | `deepseek-v4-flash` |
-| `LLM_THINKING_ENABLED` | DeepSeek V4 思考模式；关闭时显式发送 `thinking.type=disabled` | `false` |
-| `LLM_REASONING_MODE` | `static` 遵守全局思考开关，写作不额外开启；`auto` 按操作选择思考模式，适用于普通补全和主 Agent 工具决策 | `static` |
-| `LLM_THINKING_EFFORT` | 最终写作开启思考时的推理强度 | `low` |
-| `LLM_THINKING_MAX_TOKENS` | 最终思考写作的单次输出预算 | `32768` |
-| `LLM_MAX_TOKENS` | 最终成文输出预算 | `8192` |
-| `LLM_CONTROL_PLANE_MAX_TOKENS` | 语义解析、筛选、聚类和验证等结构化任务预算 | `4096` |
-| `LLM_NATIVE_TOOLS_ENABLED` | 主 Agent 使用原生工具调用；关闭后使用受校验的 JSON 动作 | `true` |
-| `LLM_FAILOVER_TOTAL_TIMEOUT` | 单个逻辑请求跨主/备用模型的总超时（秒） | `180` |
-| `AGENT_MAIN_MAX_ROUNDS` | 单次主 Agent 循环最大决策轮数 | `24` |
-| `AGENT_SUBAGENT_MAX_ROUNDS` | 单次子 Agent 委派的最大决策轮数，检查点恢复不重置 | `12` |
-| `AGENT_SUBAGENT_NO_PROGRESS_LIMIT` | 子 Agent 连续无实质进展的动作上限 | `3` |
-| `AGENT_CONTEXT_MEMORY_ITEMS` | 压缩后的观察/决策工作记忆条数上限 | `8` |
-| `AGENT_CONTEXT_MEMORY_CHARS` | 压缩后的工作记忆 JSON 字符上限；实际窗口不足时进一步缩减 | `8000` |
-| `AGENT_CONTEXT_FAILURE_ITEMS` | 工作摘要优先保留的未恢复失败记录上限，仍受总预算限制 | `2` |
-| `RESEARCH_MEMORY_CONTEXT_CHARS` | 检索结果 JSON 字符上限，另受单次工具反馈上限的一半约束 | `1600` |
-| `AGENT_EXECUTION_ACTION_BUDGET` | 会话累计专业动作预留上限 | `64` |
-| `AGENT_MAIN_TOKEN_BUDGET` | 主决策、解析、专业任务、重试及备用共享累计 token 上限 | `10000000` |
-| `AGENT_MODEL_REQUEST_LIMIT` | LLM、Embedding、Reranker总尝试上限；恢复沿用已用次数及更严格的已存上限，0为不额外限制；E2E runner默认1024 | `1024` |
-| `AGENT_RETRIEVAL_BUDGET` | 累计检索轮次上限 | `64` |
-| `CARD_EXTRACTION_CHUNK_CHARS` | 全文抽取每块字符上限，优先页及章节边界 | `6000` |
-| `CARD_EXTRACTION_MAX_CHUNKS` | 单篇最多块抽取调用次数，未读块记录为覆盖不全 | `8` |
-| `CARD_CHUNK_RETRIEVAL_MODE` | 业务仅支持 `hybrid`：字段级混合检索并结合章节覆盖 | `hybrid` |
-| `CARD_CHUNK_TOP_K` | 每字段检索返回块数；实际抽取仍受每篇调用上限约束 | `5` |
-| `CARD_CHUNK_INDEX_LIMIT` | 单篇参与第二层混合检索的最大块数 | `128` |
-| `CARD_CHUNK_RERANK_WINDOW` / `CARD_CHUNK_ENABLE_RERANK` | 每字段重排窗口及开关 | `12` / `true` |
-| `CARD_VECTOR_BACKEND` / `CARD_VECTOR_DATABASE_URL` | 默认独立持久化后端及 DSN；NumPy 可显式用于本地检索，不替换业务库 | `pgvector` / 空 |
-| `CARD_VECTOR_INDEX_MAX_CHUNKS` | 持久化索引的计划块数上限，截断单独记录 | `128` |
-| `CARD_VECTOR_DB_FAILURE_POLICY` | 仅支持 `fail`，向量库不可用时停止 | `fail` |
-| `CARD_VECTOR_TENANT` | 受信任部署配置的索引隔离作用域，不等同于用户认证 | `local` |
-| `RETRIEVAL_RANKING_MODE` | 业务入口仅支持 `hybrid`，旧规则/影子 profile 恢复时迁移 | `hybrid` |
-| `PAPER_SCREENING_ABSTRACT_CHARS` | 逐篇语义筛选的摘要字符上限；超长保留首尾并标记省略 | `4000` |
-| `PAPER_SCREENING_BATCH_ABSTRACT_CHARS` | 单批摘要总字符预算；按本批篇数均分，另受逐篇上限约束 | `16000` |
-| `DASHSCOPE_API_KEY` | hybrid 使用的独立百炼密钥 | 空 |
-| `RETRIEVAL_EMBEDDING_MODEL` / `RETRIEVAL_RERANK_MODEL` | 专用向量及相关性重排模型 | `qwen3.7-text-embedding` / `qwen3.7-text-rerank` |
-| `RETRIEVAL_EMBEDDING_URL` / `RETRIEVAL_RERANK_URL` | 百炼工作空间原生 HTTPS 端点 | 空 |
-| `AGENT_EXECUTION_DEADLINE_SECONDS` | 当前执行期限及执行租约时长（秒） | `1800` |
-| `DATABASE_URL` | 数据库地址 | SQLite |
-| `SEMANTIC_SCHOLAR_API_KEY` | S2 可选密钥 | 空 |
-| `APP_API_KEY` | 共享部署时保护业务接口的可选密钥 | 空（仅建议本地） |
-| `CORS_ALLOWED_ORIGINS` | 允许访问API的前端来源，逗号分隔 | 本机8501端口 |
-| `RECOVERY_TOTAL_ACTION_BUDGET` | 路线补证、结构修复、引用重分配和章节重写共享的任务级动作预算 | `6` |
-| `ENABLE_REFERENCE_COVERAGE_BEST_EFFORT_RELEASE` | 仅剩篇数缺口且已授权论文和最终有效引用达到比例时，允许生成并发布明确标注的部分完成草稿 | `true` |
-| `REFERENCE_COVERAGE_BEST_EFFORT_RATIO` | 部分完成草稿的最低有效引用覆盖率；原始篇数要求不会被改写 | `0.85` |
-| `ENABLE_RECOVERY_EXHAUSTED_BEST_EFFORT_GENERATION` | 有界恢复耗尽后，是否基于当前可用证据执行一次最终草稿生成并以 `partial` 发布 | `true` |
-| `ROUTE_SECTION_MIN_PLAIN_CHARS` | 正式研究路线小节的最低正文字符数；章节引用下限仍由 WritingPlan 单独给出 | `80` |
-
-安装执行 `python -m pip install -r requirements.txt`（已包含检索和向量库驱动），并在本地 `.env` 中配置密钥与两个端点。注意真实环境变量的优先级高于 `.env`：若终端里残留旧的 `DASHSCOPE_API_KEY`（如曾 `$env:DASHSCOPE_API_KEY=...` 赋值），请求会带旧密钥并返回 `403 Endpoint.AccessDenied`；启动前用 `Remove-Item Env:DASHSCOPE_API_KEY -ErrorAction SilentlyContinue` 清除，或重开终端/重启服务进程。候选论文使用标题、摘要和关键词构建 BM25 与 dense 检索视图，再用 RRF 融合和专用 reranker 排序。分数只决定筛选顺序；现有 LLM 逐篇确认研究范围和交付物资格，详情变化时重新核验。向量与专用重排分数缓存在 `data/retrieval_cache/`，可重建。业务中的 `rules` 和 `hybrid_shadow` 分支已移除；规则评分工具仅用于离线对照与硬过滤。
-
-写作门禁失败后，系统会依据实际缺口在预算内自动重算状态、重建主张授权、
-调整引用或只重写失败章节。只有缺少访问条件、用户材料，或必须改变显式范围/
-篇数约束时才请求用户决定；“仅用现有证据”会禁止自动补检索。
-语义主张核验未完成时，系统会保留正文并只重试核验，不重新检索或整篇改写；
-报告会分别显示证据不支持数量与尚未完成核验数量。
-例如要求 40 篇时，至少 34 篇去重、相关、可核验且获主张授权的论文可进入正文写作；
-最终正文也须实际有效引用至少 34 篇，并通过其他质量检查，才以 `partial` 发布。
-40 篇仍是正式完成要求；不必等恢复预算耗尽才发布这份部分完成草稿。
-有界恢复耗尽且仍有可归属证据时，默认再生成一次明确标注限制的 `partial`
-草稿；显式篇数要求低于上述 85% 时不会自动生成或发布。API 调用方可在 `AgentRequest` 顶层传入
-`"best_effort_on_failure": false` 保持严格阻断；该开关不会降低原始篇数、
-时间或主题要求。blocked 会话可直接输入“生成可用草稿”复用已保存证据。
-
----
-
-## 分层 RAG 启动与旧路径迁移
-
-论文排序默认 Hybrid，全文内容经字段级 Chunk Hybrid 选择后由 LLM 抽取；规则抽卡及其异常回退已删除。
-默认使用独立 pgvector。配置模型端点/密钥和 CARD_VECTOR_DATABASE_URL，完成显式迁移后，先执行
-`python scripts/check_rag_runtime.py`；检查不消耗模型 Token。数据库连接、迁移或维度不满足时停止，
-不会把 sections 或规则抽卡记为完整链路成功。此检查只证明配置/数据库就绪，不验证 Provider 可用性或模型准确率。
-
-旧配置需要将 RETRIEVAL_RANKING_MODE、CARD_CHUNK_RETRIEVAL_MODE 改为 hybrid，
-CARD_VECTOR_DB_FAILURE_POLICY 改为 fail；ENABLE_LLM_CARD_EXTRACTION 已删除。旧会话原始证据、
-约束和预算保留，旧规则排序的派生授权失效。完整步骤、删除范围与验收边界见
-[分层 RAG 迁移说明](docs/hierarchical-rag-migration.md)。修改本地配置后需重启服务加载。
-
-Windows 也可直接使用 Conda 安装原生 PostgreSQL＋pgvector，无需 Docker。
-rragent 环境的安装组合、启动/停止及已完成的原生数据库验证见
-[Windows Conda 部署](docs/windows-conda-pgvector.md)。
-
-单篇卡片 API 复用下载、解析、LLM 抽取和保存流程；卡片入库保留逐块覆盖记录。
-PDF 解析新增有序 `section_spans`，保留同名章节及页内字符区间，旧 `sections` 字典继续兼容。
-摘要预算、省略策略与迁移说明见 [RAG 输入与单篇卡片修复](docs/rag-input-correctness.md)。
-
-真实验收入口 `scripts/run_real_e2e.py` 默认仅预检；真实执行须显式传入 `--execute`、
-Token 预算和时限。每次运行隔离 SQLite、向量租户与缓存，导出检索、来源回读及人工审查表。
-启动失败同样留档，预检通过不代表模型已执行。使用与指标口径见 [真实 E2E 审查契约](docs/real-e2e-audit.md)。
-
-2026-10-30 在 rragent 中完成真实 Embedding/Reranker、语义准入及原生pgvector块检索评测。
-历史标签口径、实际结果、预算和待人工标注事项见 [Provider检索评测](docs/validation/2026-10-30-provider-retrieval.md)。
-复现入口为 `scripts/run_provider_retrieval_evaluation.py`，必须显式指定总Token、请求和时限上限。
-
-## 📋 实现路线图
-
-- [x] 阶段 1：项目骨架 ✅
-- [x] 阶段 2：意图识别和槽位抽取（规则 + LLM 双路径完成）✅
-- [x] 阶段 3：论文检索（五源客户端完成，支持失败诊断）✅
-- [x] 阶段 4：论文解析和 PaperCard ✅
-- [x] 阶段 5：综述生成 ✅
-- [x] 阶段 6：Agent 串联 + Streamlit 联调 ✅
-- [x] **阶段 7：四类交付物写作能力（背景、现状、相关工作、叙述性综述）✅**
-- [x] **阶段 8：引用量按源记录与失败诊断 ✅**
-- [x] **阶段 9：Evidence Card 与句子级 Claim–Evidence 引用验证 ✅**
-
-## 📚 文档与案例
-
-- [AGENTS.md](AGENTS.md)：Coding Agent 必须遵守的规则、验证要求和完成标准。
-- [ARCHITECTURE.md](ARCHITECTURE.md)：当前控制循环、模块目录与运行边界。
-- [docs/architecture.md](docs/architecture.md)：系统分层、模块边界和运行组件。
-- [docs/agent-context-architecture.md](docs/agent-context-architecture.md)：五字段、专业 Agent 与上下文边界。
-- [docs/agent-runtime-and-cache.md](docs/agent-runtime-and-cache.md)：动作契约、数据库提交、预算、恢复和缓存机制。
-- [docs/retrieval-failure-policy.md](docs/retrieval-failure-policy.md)：限流、重试、部分成功与检索取消边界。
-- [docs/research-workflow.md](docs/research-workflow.md)：Agent 工作流、阶段契约和分支保证。
-- [docs/evidence-model.md](docs/evidence-model.md)：PaperMetadata、Evidence、Claim、Citation 的关系。
-- [docs/knowledge-engineering.md](docs/knowledge-engineering.md)：三模块工作流、可选 pgvector、来源版本、迁移回滚与数据库验收边界。
-- [docs/quality-gates.md](docs/quality-gates.md)：能力、路线、主张、交付物和生成质量门禁。
-- [docs/lessons-learned.md](docs/lessons-learned.md)：历史缺陷、根因和防回归经验。
-- [CHANGELOG.md](CHANGELOG.md)：公开变更摘要与验证边界；详细开发流水仅本地保存。
-- [examples/](examples/)：不依赖真实外部服务的标准请求案例。
-
-### 可验证综述生成
-
-当前 Agent 会在论文详情获取后生成带原文位置的 Evidence Card，并在综述生成后逐句检查：
-
-- 事实性主张是否有引用；
-- 引用论文是否存在；
-- 证据片段是否支持主张；
-- 数字、数据集与强措辞是否得到证据支持；
-- 验证失败时给出降级措辞或补充证据建议。
-
-Agent API 的 `claim_verification` 字段提供完整报告，Streamlit 的“引用验证”页可查看
-原句、证据片段、章节/页码和修改建议。设计与 QLoRA 数据导出说明见
-[`docs/evidence_verification.md`](docs/evidence_verification.md)。
-
-历史卡片的抽取字段不能代替原文证据；字段主张在进入规划与写作前会重新检查独立来源和逐字支持。
-UI 片段保留 360 字符，语义核验使用完整的已选证据。
-`CLAIM_VERIFICATION_MAX_CONTEXT_CHARS` 默认限制每条原子主张的去重原文为 12000 字符；
-超限明确报告 `insufficient_context` 并阻断该主张通过，不静默截断。
-迁移、缓存失效与验证边界见 [证据正确性修复](docs/evidence-correctness.md)。
-
-### 当前实现状态
-
-**新增写作能力：**
-- ✅ 相关工作章节生成（经 `write_deliverable` → `deliverables/renderers/related_work_renderer.py`）
-- ✅ 研究背景、研究现状和叙述性综述生成（经 `deliverables/renderers/`）
-- ✅ 支持 `claim_evidence_map` 逐句核验（可选）
-
-**数据质量提升：**
-- ✅ `citation_count_by_source` 按数据源分别记录引用量
-- ✅ `SourceDiagnostic` 区分真空结果与检索失败
-
-**意图识别增强：**
-- ✅ 相关工作与背景类请求统一路由到四类核心交付物
-- ✅ 关键词优先级调整（"related work" 不再误判为 search_papers）
-
-> 注：早期版本的独立工具 `generate_review.py` / `generate_related_work.py` /
-> `generate_introduction.py` 已在后续重构中删除，四类交付物统一走
-> `write_deliverable.py` 与 `app/deliverables/` 渲染器单一写作路径。
-
----
-
-## 📜 合规约束
-
-本 Agent 遵守以下原则：
-
-1. 只检索公开论文元数据
-2. 只下载开放获取 PDF，不绕过付费墙
-3. 不编造论文、作者、年份、引用量
-4. 综述引用必须来自已检索到的论文
-5. 证据来源明确标注（abstract / full_text）
-
-
-## 可用草稿交付与增量处理（2026-11-10）
-
-新任务默认采用 `draft_first` 策略，在满足草稿发布条件时可先交付明确标记的草稿；旧任务及显式 `strict` 任务继续使用正式门禁。已发布版本可在后续优化期间阅读和下载，配置快照贯穿恢复。默认 Main 最多 96 轮、总模型请求 1024 次、检索模型子预算 512 次，每篇最多抽取 8 块；这些限制可配置。正式交付仍须通过当前版本的独立核验与质量门禁。
-
-配置、草稿等级、补检索与缓存依赖见[实现说明](docs/draft-delivery-and-incremental-retrieval.md)。
-
-历史验证（2026-11-11）：离线测试 2037 项通过、17 项跳过；原生 pgvector 集成测试另行通过 17 项。一次真实任务交付了引用 5 篇的 `partial` 草稿，未满足正式要求，也未经过独立人工验收；另一项 strict 任务被阻断。上述结果只代表当次运行，详见[验证报告](docs/validation/2026-11-11-draft-delivery.md)。
-
-## 自动运行报告（2026-11-11）
-
-每次任务结束后默认生成可离线阅读的HTML时间线，包含Main每轮上下文、专业Agent输入/角色记忆、工具步骤和返回结果。前端任务消息提供报告下载；默认保存在`data/execution_reports/<report_id>/report.html`。E2E目录另存`execution_report.html`与ZIP包。重启服务后新任务生效；配置与接口见[自动运行报告](docs/execution-reports.md)。
-
-报告相对路径按本仓库根目录解析；历史导出工具为 `scripts/export_execution_report.py`。运行报告可能包含任务上下文，分享前应检查内容。
+欢迎通过 [Issues](https://github.com/Pryer/ResearchReview-Agent/issues) 提交问题、使用反馈和功能建议，也欢迎提交 Pull Request。复现问题时，请附上运行环境、复现步骤和脱敏后的错误信息。
