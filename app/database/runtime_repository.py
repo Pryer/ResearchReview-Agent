@@ -78,7 +78,7 @@ class ResearchRuntimeRepository:
         self.db.add(Event(session_id=self.session_id, event_key=key,
                           event_type=kind, payload_json=dumps(payload)))
 
-    def acquire(self, initial_state, ledger):
+    def acquire(self, initial_state, ledger, *, new_research=False):
         with self.transaction():
             row = self._row()
             if row is None:
@@ -113,6 +113,10 @@ class ResearchRuntimeRepository:
                 self.event("interrupted:" + attempt.attempt_id, "attempt_uncertain", {"attempt_id": attempt.attempt_id})
             self.db.execute(update(Task).where(Task.session_id == self.session_id, Task.status == "running").values(status="interrupted"))
             ledger.update(saved)
+            if new_research:
+                from app.agent.execution_budget import reset_research_counters
+                # WHY: 先结算原任务未决消耗，再在Owner领取事务内建立新任务计数边界。
+                reset_research_counters(ledger)
             row.budget_json = dumps(ledger)
             self.event("acquire:" + self.owner, "execution_started", {"version": self.version})
         self._start_heartbeat()
@@ -183,7 +187,7 @@ class ResearchRuntimeRepository:
                 raise AgentExecutionCancelled("persisted cancellation requested")
             return row
 
-    def snapshot(self, state, *, task=None, result=None, ledger=None):
+    def snapshot(self, state, *, task=None, result=None, ledger=None, failed_task=None):
         """提交检查点、任务结果、资料引用与事件；CAS 失败则全部回滚。"""
         from app.services.research_artifact_service import ResearchArtifactService
         with self.transaction():
@@ -201,6 +205,16 @@ class ResearchRuntimeRepository:
                 ).values(status="completed", result_json=dumps(result.model_dump(mode="json"))))
                 if changed.rowcount != 1:
                     raise RuntimeConflict("task is no longer active")
+            if failed_task is not None:
+                task_id, status = failed_task
+                changed = self.db.execute(update(Task).where(
+                    Task.task_id == task_id, Task.session_id == self.session_id,
+                    Task.status == "running", Task.expected_version == self.version,
+                ).values(status=status, result_json=dumps(next((r for r in reversed(
+                    state.get("agent_task_results") or []) if r.get("task_id") == task_id), {}))))
+                if changed.rowcount != 1:
+                    raise RuntimeConflict("failed task is no longer active")
+                self.event("terminal:" + task_id, "task_" + status, {"task_id": task_id})
             # 研究快照外置重数据；任务补丁及提示词不进入运行日志。
             private = {k: v for k, v in state.items() if k not in {
                 "main_agent_context", "main_context_snapshot", "_runtime_version",
@@ -235,13 +249,24 @@ class ResearchRuntimeRepository:
             row.budget_json = dumps(ledger)
             self.event("task:" + task.task_id, "task_started", {"operation": task.operation})
 
-    def fail_task(self, task_id, status, ledger):
+    def completed_task(self, idempotency_key):
+        """按数据库唯一键读取历史结果，避免hydrate整个历史列表。"""
+        row = self.db.scalar(select(Task).where(
+            Task.session_id == self.session_id, Task.idempotency_key == idempotency_key,
+            Task.status == "completed"))
+        return json.loads(row.result_json) if row is not None else None
+
+    def fail_task(self, task_id, status, ledger, *, audit_state=None, result=None):
+        if audit_state is not None:
+            # WHY: 只接收Controller未合并失败补丁的父状态；审计与失败状态同一CAS提交。
+            return self.snapshot(audit_state, ledger=ledger, failed_task=(task_id, status))
         with self.transaction():
             row = self._owned_row_for_write()
             if row is None:
                 return
             changed = self.db.execute(update(Task).where(Task.task_id == task_id,
-                Task.session_id == self.session_id, Task.status == "running").values(status=status))
+                Task.session_id == self.session_id, Task.status == "running").values(
+                    status=status, result_json=dumps(result or {})))
             if changed.rowcount != 1:
                 return
             row.budget_json = dumps(ledger)

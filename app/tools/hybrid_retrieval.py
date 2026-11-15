@@ -24,24 +24,32 @@ def tokenize(text: str) -> list[str]:
     return tokens
 
 
+class LexicalIndex:
+    """一次冻结语料建索引，多查询共用；不跨调用缓存，避免原文变更后的旧排名复活。"""
+
+    def __init__(self, texts: Sequence[str]):
+        try:
+            from rank_bm25 import BM25Okapi
+        except ImportError as exc:
+            raise RuntimeError("hybrid 检索需要 rank-bm25；请安装 requirements-retrieval.txt") from exc
+        self.corpus = [tokenize(text) for text in texts]
+        self.index = BM25Okapi(self.corpus) if any(self.corpus) else None
+        self.terms = [set(words) for words in self.corpus]
+
+    def rank(self, query: str, limit: int) -> list[tuple[int, float]]:
+        terms = tokenize(query)
+        if not terms or self.index is None:
+            return []
+        # WHY: 分数可为零/负，仍按原逻辑只保留真实词项交集和稳定并列顺序。
+        scores = self.index.get_scores(terms)
+        query_terms = set(terms)
+        matches = [(i, float(scores[i])) for i, words in enumerate(self.terms) if query_terms.intersection(words)]
+        matches.sort(key=lambda item: (-item[1], item[0]))
+        return matches[:limit]
+
+
 def lexical_rank(texts: Sequence[str], query: str, limit: int) -> list[tuple[int, float]]:
-    try:
-        from rank_bm25 import BM25Okapi
-    except ImportError as exc:
-        raise RuntimeError("hybrid 检索需要 rank-bm25；请安装 requirements-retrieval.txt") from exc
-    corpus = [tokenize(text) for text in texts]
-    terms = tokenize(query)
-    if not terms or not any(corpus):
-        return []
-    # WHY: 单文档/高频术语可能导致 BM25 原始分数为零或负数；只有真实词项交集才是词法命中。
-    scores = BM25Okapi(corpus).get_scores(terms)
-    query_terms = set(terms)
-    matches = [
-        (index, float(scores[index])) for index, words in enumerate(corpus)
-        if query_terms.intersection(words)
-    ]
-    matches.sort(key=lambda item: (-item[1], item[0]))
-    return matches[:limit]
+    return LexicalIndex(texts).rank(query, limit)
 
 
 def dense_rank(vectors: Sequence[Sequence[float]], query_vector: Sequence[float], limit: int) -> list[tuple[int, float]]:

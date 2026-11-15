@@ -29,6 +29,100 @@ def state():
             "research_plan": {"task_graph": []}, "agent_orchestration_mode": "autonomous"}
 
 
+def test_screening_cache_externalizes_and_hydrates_legacy_and_new_state(db):
+    from app.services.research_artifact_service import ResearchArtifactService
+    service = ResearchArtifactService(db)
+    cache = {str(i): {'decision': 'include', 'note': 'data' * 80} for i in range(200)}
+    stored = service.externalize_state('s', {'retrieval_screening_cache': cache})
+    assert 'retrieval_screening_cache' not in stored
+    assert stored['artifact_manifest']['retrieval_screening_cache']['shape'] == 'json_object'
+    assert len(stored['artifact_manifest']['retrieval_screening_cache']['items']) > 1
+    assert service.hydrate_state('s', stored)['retrieval_screening_cache'] == cache
+    assert service.hydrate_state('s', {'retrieval_screening_cache': cache})['retrieval_screening_cache'] == cache
+
+
+def test_new_research_resets_work_counters_after_reconciling_paid_attempts(db):
+    old = ResearchRuntimeRepository(db, 's')
+    ledger = {'decision_rounds': 96, 'retrieval_used': 64, 'recovery_used': 10,
+              'actions_reserved': 64, 'llm_tokens': 100, 'llm_requests': 3, 'tokens_reserved': 20}
+    old.acquire({}, ledger)
+    db.add(ResearchAttemptModel(attempt_id='interrupted', session_id='s', reserved_tokens=20, status='running'))
+    db.commit()
+    old.release(ledger)
+    new = ResearchRuntimeRepository(db, 's')
+    current = {}
+    try:
+        new.acquire({}, current, new_research=True)
+        assert current['decision_rounds'] == current['retrieval_used'] == current['recovery_used'] == 0
+        assert current['llm_tokens'] == 120 and current['llm_requests'] == 3
+        assert current['tokens_reserved'] == 0
+        assert current['prior_task_usage']['decision_rounds'] == 96
+        assert current['research_generation'] == 1
+    finally:
+        new.release(current)
+
+
+def test_failed_writer_audit_survives_database_reopen_without_child_checkpoint(db):
+    from tests.test_context_writer_repair import state as writer_state, plan
+    from app.services.writer_support import record_candidate, read_candidate
+    current = writer_state()
+    current.update(session_id="s", writing_plans=[plan().model_dump(mode="json")])
+    def fail(working):
+        record_candidate(working, plan(), "initial", "audit body", "audit body", {"valid": False})
+        working['review'] = 'failed business patch'
+        raise ValueError('writer failed')
+    with budget_scope(current):
+        with durable_scope(db, "s", current, current['agent_execution_budget']):
+            with pytest.raises(ValueError, match='writer failed'):
+                AgentController().execute(role=AgentRole.WRITING, operation='generate_deliverables',
+                    objective='audit crash window', state=current, handler=fail)
+    with Session(db.bind) as reopened:
+        restored = ResearchRuntimeRepository(reopened, 's').restore()
+        assert read_candidate(restored, restored['writer_candidates'][0]['candidate_id'])['raw_text'] == 'audit body'
+        assert restored.get('review') != 'failed business patch'
+        row = reopened.scalar(select(ResearchTaskModel))
+        assert row.status == 'failed'
+        assert json.loads(row.result_json)['status'] == 'failed'
+
+
+def test_failure_audit_and_status_roll_back_together(db, monkeypatch):
+    from app.services.research_artifact_service import ResearchArtifactService
+    runtime = ResearchRuntimeRepository(db, 's')
+    runtime.acquire(state(), {})
+    t = task()
+    runtime.begin_task(t, {})
+    def broken(*args):
+        raise ValueError('storage failed')
+    monkeypatch.setattr(ResearchArtifactService, 'externalize_state', broken)
+    with pytest.raises(ValueError, match='storage failed'):
+        runtime.fail_task(t.task_id, 'failed', {}, audit_state={'writer_candidates': []})
+    assert db.get(ResearchTaskModel, t.task_id).status == 'running'
+    assert db.scalar(select(func.count()).select_from(ResearchCheckpointModel)) == 0
+    assert db.get(ResearchRuntimeModel, 's').version == runtime.version
+
+
+def test_recent_task_history_is_bounded_and_full_results_remain_queryable(db):
+    current = state()
+    ids = []
+    with budget_scope(current):
+        with durable_scope(db, 's', current, current['agent_execution_budget']) as runtime:
+            for index in range(20):
+                result = AgentController().execute(role=AgentRole.SEARCH, operation='search_and_rank',
+                    objective=f'search {index}', state=current,
+                    handler=lambda working: working.update(candidate_papers=[{'paper_id': 'p'}]))
+                ids.append(result.idempotency_key)
+            assert len(current['agent_task_results']) == 16
+            assert runtime.completed_task(ids[0])['idempotency_key'] == ids[0]
+            assert runtime.completed_task('absent') is None
+            assert len(runtime.restore()['agent_task_results']) == 16
+            def must_not_run(working):
+                pytest.fail('evicted completed operation must load from the indexed task table')
+            cached = AgentController().execute(role=AgentRole.SEARCH, operation='search_and_rank',
+                objective='search 1', state=current, handler=must_not_run)
+            assert cached.idempotency_key == ids[1]
+    assert db.scalar(select(func.count()).select_from(ResearchTaskModel)) == 20
+
+
 def task(key="one"):
     return AgentTask(role=AgentRole.SEARCH, operation="search_and_rank", objective="search",
         source_state_version="1", source_state_fingerprint="fp", idempotency_key=key)
@@ -320,7 +414,8 @@ def test_explicit_resume_uses_committed_state_and_keeps_budget_and_constraints(d
     repo.save("s", "failed", "original topic", {"editable_research_state": {"topic": "old"}})
     db.commit()
     runtime = ResearchRuntimeRepository(db, "s")
-    ledger = {"llm_tokens": 456, "actions_reserved": 3}
+    ledger = {"llm_tokens": 456, "actions_reserved": 3, "decision_rounds": 12,
+              "retrieval_used": 5, "recovery_used": 2}
     runtime.acquire({}, ledger)
     runtime.snapshot({**state(), "required_reference_count": 40, "start_year": 2024, "end_year": 2026,
                       "paper_cards": [{"paper_id": "p1"}], "user_operation_sequence": 2}, ledger=ledger)
@@ -339,6 +434,9 @@ def test_explicit_resume_uses_committed_state_and_keeps_budget_and_constraints(d
     assert seen["required_reference_count"] == 40
     assert (seen["start_year"], seen["end_year"]) == (2024, 2026)
     assert seen["budget"]["llm_tokens"] == 456
+    assert seen["budget"]["decision_rounds"] == 12
+    assert seen["budget"]["retrieval_used"] == 5
+    assert seen["budget"]["recovery_used"] == 2
     assert seen["user_operation_sequence"] == 3
 
 

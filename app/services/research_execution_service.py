@@ -30,6 +30,15 @@ def with_artifact_store(fn):
             budget_state["delivery_mode"]=runtime_state.get("delivery_mode", "strict")
         if row:
             budget_state["agent_execution_budget"]=json.loads(row.budget_json)
+        # WHY: 澄清/恢复/修订继承原任务；已结束会话中的新研究重新计工作轮次，费用与请求额度仍累计。
+        new_research = bool(fn.__name__ == "handle" and saved
+            and saved.get("status") in {"completed", "partial", "failed", "cancelled"}
+            and not getattr(request, "resume_from_checkpoint", False)
+            and not getattr(request, "clarification_answer", None))
+        if new_research:
+            # WHY: 外层先建立新截止时间；其余工作计数由acquire读取权威账本后只重置一次。
+            budget_state.setdefault("agent_execution_budget", {})["elapsed_seconds"] = 0
+            budget_state.pop("recovery_action_count", None)
         from app.agent.runtime_config import initialize_delivery
         requested=getattr(request,"delivery_mode",None)
         if requested:
@@ -53,7 +62,7 @@ def with_artifact_store(fn):
                 from app.services.durable_execution_service import durable_scope
                 from app.services.research_memory_service import ResearchMemoryService
                 with durable_scope(self.db, str(request.session_id), budget_state,
-                                   budget_state["agent_execution_budget"]) as runtime:
+                                   budget_state["agent_execution_budget"], new_research=new_research) as runtime:
                     memory = ResearchMemoryService(self.db)
                     importing = not memory.legacy_imported(str(request.session_id))
                     memory.import_legacy_history(str(request.session_id), saved_state)

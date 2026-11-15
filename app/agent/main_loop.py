@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
+from contextvars import ContextVar
+from contextlib import contextmanager
 from collections import deque
 from collections.abc import Callable
 from typing import Any
@@ -24,7 +27,7 @@ from app.agent.execution_budget import (
 from app.agent.execution import AgentCancelledError
 from app.core.exceptions import LLMInvocationError
 from app.agent.main_policy import AgentDecisionError, MainAgentPolicy
-from app.agent.react_context import ContextBudgetExceeded, ReActContext, execute_context_recall
+from app.agent.react_context import ContextBudgetExceeded, ReActContext, execute_context_recall, observe_terminal
 from app.schemas.agent_decision_schema import AgentDecision
 from app.core.config import get_settings
 from app.database.runtime_repository import RuntimeConflict
@@ -32,12 +35,43 @@ from app.database.runtime_repository import RuntimeConflict
 
 TERMINAL_STATUSES = {"completed", "partial", "blocked", "failed", "cancelled", "waiting_user"}
 
+_PROGRESS_CACHE = ContextVar("progress_digest_cache", default=None)
+
+
+@contextmanager
+def progress_cache_scope():
+    if _PROGRESS_CACHE.get() is not None:
+        yield
+        return
+    token = _PROGRESS_CACHE.set({})
+    try:
+        yield
+    finally:
+        _PROGRESS_CACHE.reset(token)
+
 
 def _progress_fingerprint(state: dict[str, Any]) -> str:
     from app.agent.evidence_invalidation import _detail_signature
-    def stable_items(value: Any) -> list[str]:
-        # WHY: 排名或列表顺序抖动不代表证据集合变化；保留每项内容以识别真正的补证。
-        return sorted(json.dumps(item, ensure_ascii=False, sort_keys=True, default=str) for item in (value or []))
+    def stable_items(name: str) -> list[str]:
+        value = state.get(name) or []
+        cache = _PROGRESS_CACHE.get()
+        previous = cache.get(name, []) if cache is not None else []
+        current, hashes = [], []
+        for index, item in enumerate(value):
+            # WHY: 运行内缓存用独立快照比较，原地修改嵌套Span也会失效；不能仅信任版本号或对象身份。
+            if index < len(previous) and previous[index][0] == item:
+                saved, digest = previous[index]
+            else:
+                digest = hashlib.sha256(json.dumps(item, ensure_ascii=False, sort_keys=True,
+                    default=str).encode("utf-8")).hexdigest()
+                saved = copy.deepcopy(item) if cache is not None else None
+            hashes.append(digest)
+            if len(value) <= 512:
+                current.append((saved, digest))
+        if cache is not None:
+            cache[name] = current
+        # WHY: 内容摘要排序保留集合语义，避免再次JSON转义整段证据原文；缓存不进入持久化状态。
+        return sorted(hashes)
 
     payload = {
         "scope": state.get("selected_scope") or {},
@@ -52,10 +86,10 @@ def _progress_fingerprint(state: dict[str, Any]) -> str:
         }, ensure_ascii=False, sort_keys=True) for paper in admitted_ranked_papers(state)})
         if (state.get("retrieval_profile") or {}).get("mode") == "hybrid" else [],
         "details": sorted(_detail_signature(p) for p in state.get("paper_details") or []),
-        "cards": stable_items(state.get("paper_cards")),
-        "routes": stable_items(state.get("validated_routes")),
+        "cards": stable_items("paper_cards"),
+        "routes": stable_items("validated_routes"),
         "taxonomy": state.get("dynamic_taxonomy") or {},
-        "claims": stable_items(state.get("claim_plans")),
+        "claims": stable_items("claim_plans"),
         "gaps": state.get("evidence_gap_report") or {},
         "review": state.get("review") or "",
         "published_version": state.get("published_draft_version"),
@@ -66,9 +100,17 @@ def _progress_fingerprint(state: dict[str, Any]) -> str:
                          for key in ("valid", "supported", "unsupported", "unverified", "support_rate")},
         "valid_citations": state.get("unique_valid_cited_paper_count") or 0,
     }
-    return hashlib.sha256(
+    cache = _PROGRESS_CACHE.get()
+    cached = cache.get("final_payload") if cache is not None else None
+    if cached is not None and cached[0] == payload:
+        return cached[1]
+    digest = hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()[:20]
+    if cache is not None:
+        # WHY: 只复用实际内容相等的进展载荷；独立快照能发现原地质量/范围修改，不持久化最新指纹。
+        cache["final_payload"] = (copy.deepcopy(payload), digest)
+    return digest
 
 
 class MainAgentLoop:
@@ -83,11 +125,11 @@ class MainAgentLoop:
         self, state, *, handlers, finish_validator, should_cancel=None,
     ) -> str:
         try:
-            with budget_scope(state, should_cancel):
+            with budget_scope(state, should_cancel), progress_cache_scope():
                 status = self._run(state, handlers=handlers, finish_validator=finish_validator,
                                    should_cancel=should_cancel)
                 if (state.get("main_agent_trajectory") or {}).get("pending"):
-                    ReActContext(state).observe({"status": status, "error": str((state.get("errors") or [{}])[-1].get("code") or "")})
+                    observe_terminal(state, {"status": status, "error": str((state.get("errors") or [{}])[-1].get("code") or "")})
                 return status
         except (AgentBudgetExceeded, ContextBudgetExceeded, AgentExecutionStale, AgentCancelledError, AgentDecisionError, LLMInvocationError, RuntimeConflict) as exc:
             # WHY: AgentExecutionStale 继承 AgentCancelledError 以复用取消
@@ -105,7 +147,7 @@ class MainAgentLoop:
                 state["generation_blocked"] = True
             state.setdefault("errors", []).append({"code": type(exc).__name__, "message": str(exc)})
             if (state.get("main_agent_trajectory") or {}).get("pending"):
-                ReActContext(state).observe({"status": status, "error": type(exc).__name__})
+                observe_terminal(state, {"status": status, "error": type(exc).__name__})
             return status
 
     def _run(

@@ -25,10 +25,10 @@ def task_scope(task_id):
 
 
 @contextmanager
-def durable_scope(db, session_id, state, ledger):
+def durable_scope(db, session_id, state, ledger, *, new_research=False):
     from app.core.config import get_settings
     runtime = ResearchRuntimeRepository(db, session_id, ttl=get_settings().agent_execution_deadline_seconds)
-    runtime.acquire(state, ledger)
+    runtime.acquire(state, ledger, new_research=new_research)
     token = _RUNTIME.set(runtime)
     try:
         yield runtime

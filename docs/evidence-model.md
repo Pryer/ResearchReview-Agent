@@ -67,10 +67,37 @@ banner alone is not a release.
 - A citation count is a property of a paper/source, not the user's requested number
   of references. Source counts are stored separately in citation_count_by_source
   and must not be added together.
+- Claim strength counts conservative source groups rather than paper IDs. DOI
+  aliases identify the same paper; author/dataset dependencies are then combined
+  transitively. Distinct DOIs alone do not demonstrate independence.
+- The normalized last author is a grouping proxy, not verified team identity.
+  Within that group, an unknown dataset prevents treating its papers as independent
+  experiments. Unknown authors do not add independent groups; an entirely unknown
+  set supports at most a single-source grade. Metadata remains unchanged, and the
+  number of unique references cited by the review is counted separately.
+- Source-strength policy changes invalidate old Check and draft fingerprints.
+  Check reevaluates bound sources without editing the claim plan and blocks an
+  overstated grade; Analysis must reauthorize it before release.
 
 Evidence provenance must survive extraction, clustering, writing, repair, and
 serialization. When evidence is insufficient, weaken/remove the claim, retrieve
 more evidence within bounds, or report the limitation.
+
+## Claim Wording Refinement
+
+Optional wording refinement sends at most the first 12 claims in a route. Input and
+output carry stable `claim_id` values; response order does not determine evidence
+binding. The entire response must match the submitted count and exact ID set,
+without duplicates, and contain nonempty text before any update is applied.
+Unsubmitted claims and all evidence/type/strength fields remain unchanged.
+
+Each proposed text must preserve the ordered sequence of numeric tokens, including
+repetitions, signs, decimal values, exponents and percentages. A numeric change
+keeps that claim's original text while other valid edits may proceed. Invalid batch
+structure or identity keeps the entire batch unchanged and emits a diagnostic;
+cancellation, budget and ownership errors still propagate. This is a lexical
+guard, not proof of semantic equivalence: entailment and authorization gates still
+evaluate the resulting claims.
 
 ## Independent Source and Verification Context
 

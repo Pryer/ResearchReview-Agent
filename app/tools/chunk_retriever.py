@@ -13,7 +13,7 @@ from app.prompt.paper_card import FIELD_RETRIEVAL_QUERIES
 from app.schemas.chunk_schema import ChunkHit, ChunkRetrievalReport
 from app.schemas.retrieval_schema import RetrievalQuery, fingerprint
 from app.services.retrieval_ranking_service import VectorCache, _rerank_cached
-from app.tools.hybrid_retrieval import lexical_rank, fuse_rankings
+from app.tools.hybrid_retrieval import fuse_rankings, LexicalIndex
 from app.tools.chunk_pdf import section_family
 from app.schemas.vector_schema import ChunkVectorIndex, IndexCoverage, VectorIntegrityError, VectorStoreUnavailable
 
@@ -117,6 +117,7 @@ def retrieve_chunks(paper_id, chunks, *, settings, topic="", should_cancel=None,
         return report
     by_id = {chunk["chunk_id"]: chunk for chunk in chunks}
     texts = [by_id[i]["text"] for i in ids]
+    lexical_index = LexicalIndex(texts)
     query_texts = [f"{text}\n研究主题：{topic[:500]}" for text in FIELD_RETRIEVAL_QUERIES.values()]
     dense = [[] for _ in query_texts]
     client = embedding_client or EmbeddingClient(settings)
@@ -151,7 +152,7 @@ def retrieve_chunks(paper_id, chunks, *, settings, topic="", should_cancel=None,
     for position, (field, text) in enumerate(zip(FIELD_RETRIEVAL_QUERIES, query_texts)):
         _check(should_cancel)
         query = RetrievalQuery(text=text, role="field", family=field, source="paper_chunk")
-        lex = lexical_rank(texts, text, settings.card_chunk_rerank_window)
+        lex = lexical_index.rank(text, settings.card_chunk_rerank_window)
         fused = fuse_rankings(len(texts), [query], [lex], [dense[position]], rrf_k=settings.retrieval_rrf_k)
         window = fused[:settings.card_chunk_rerank_window]
         scores = {}

@@ -54,6 +54,30 @@ def test_late_results_and_limitations_survive_candidate_sampling():
     assert card.sample_size is None
 
 
+@pytest.mark.parametrize('bad_response', ['not JSON', '{"method": "wrong type"}'])
+def test_one_malformed_chunk_does_not_skip_remaining_selected_chunks(bad_response):
+    class OnceMalformed(Model):
+        def complete(self, prompt, **kwargs):
+            if not self.calls:
+                self.calls.append(prompt)
+                return bad_response
+            return super().complete(prompt, **kwargs)
+    model = OnceMalformed()
+    card = extract_paper_card(PAPER, parsed('Methods\n' + METHOD, 'Results\n' + RESULT), model)
+    assert len(model.calls) == 2
+    assert any(r.status == 'failed' for r in card.extraction_coverage.chunks)
+    assert any(r.status == 'processed' for r in card.extraction_coverage.chunks)
+    assert not any(r.reason == 'provider_failure' for r in card.extraction_coverage.chunks)
+    assert card.method == METHOD or card.results == RESULT
+
+
+def test_provider_failure_still_stops_remaining_chunks():
+    model = Model(TimeoutError('provider unavailable'))
+    card = extract_paper_card(PAPER, parsed('Methods\n' + METHOD, 'Results\n' + RESULT), model)
+    assert len(model.calls) == 1
+    assert any(r.reason == 'provider_failure' for r in card.extraction_coverage.chunks)
+
+
 @pytest.mark.parametrize("page_mode", [True, False])
 def test_chunk_offsets_overlap_and_all_text_coverage(page_mode):
     text = "Methods\n" + ("Long paragraph with Chinese 内容。\n" * 90) + "\nResults\n" + RESULT

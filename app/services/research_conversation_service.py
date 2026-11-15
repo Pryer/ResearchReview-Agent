@@ -264,6 +264,10 @@ class ResearchConversationService:
         # 避免把上一主题的论文池混入新主题。
         existing_session = self.repo.get(session_id)
         existing_state = (existing_session or {}).get("state") or {}
+        if trusted_state is None:
+            # WHY: 继承序号基线，统一由research_budget递增一次；同主题新研究也不能复用旧幂等结果。
+            prior = existing_state.get("editable_research_state") or existing_state
+            initial_state["user_operation_sequence"] = int(prior.get("user_operation_sequence") or 0)
         if "retrieval_profile" not in initial_state:
             from app.core.config import get_settings
 

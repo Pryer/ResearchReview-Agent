@@ -33,7 +33,7 @@ Refine the scope through conversation, edit the paper collection, and continue y
 
 - **Find papers across sources** — Search arXiv, Semantic Scholar, OpenAlex, and Crossref; deduplicate results and verify metadata.
 - **Retrieve at two levels** — Rank papers, then retrieve field-specific evidence from their text using BM25, dense retrieval, RRF, and reranking.
-- **Turn papers into evidence** — Parse PDFs and extract research questions, methods, data, findings, and limitations with page and source-text locations.
+- **Turn papers into evidence** — Parse PDFs and extract research questions, methods, data, findings, and limitations with page and source-text locations. PyMuPDF extracts text page by page; matched papers are indexed or reused on demand before field-level retrieval and evidence-card extraction.
 - **Coordinate specialist agents** — Main plans the research; Search, Analysis, Writing, and Check handle retrieval, evidence analysis, drafting, and verification, then use feedback to guide the next step.
 - **Trace claims and citations** — Link draft claims to evidence and check citation identity, semantic support, numbers, and research constraints.
 - **Continue and revise research** — Clarify the scope, exclude papers, resume from checkpoints, and regenerate using existing work.
@@ -156,6 +156,12 @@ flowchart TD
 Main selects one research task per turn. Specialist agents execute in their own contexts and report back. The Controller manages action permissions, budgets, cancellation, and state commits. Papers, source passages, authorized claims, and citations are linked through the workflow, while quality feedback guides subsequent research.
 
 See [the architecture guide](ARCHITECTURE.md) for modules and data flow.
+
+## Evaluation
+
+Across three topics and 480 frozen candidates with mixed-source relevance labels, RRF + reranking achieved **94.91% Precision@72**, compared with **87.04%** for Dense (**+7.87 percentage points**). Recall@120 was 95.43% and 95.70%, respectively.
+
+In 12 controlled verification cases, all 8 citation/numeric faults were detected and all 4 unchanged controls were accepted. Deterministic checks and the semantic-model-assisted run produced identical classifications. See [the benchmark report](docs/benchmarks.md) for methodology, reproduction, and cache replay results.
 
 ## Documentation
 

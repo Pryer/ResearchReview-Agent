@@ -25,6 +25,22 @@ def _state() -> dict:
     }
 
 
+def test_post_execution_cancel_preserves_nested_parent_research_state():
+    from app.agent.execution_budget import AgentExecutionCancelled
+    state = _state()
+    state['candidate_papers'] = [{'paper_id': 'p', 'metadata': {'title': 'original'}}]
+    finished = False
+    def handler(working):
+        nonlocal finished
+        assert working['candidate_papers'] is not state['candidate_papers']
+        working['candidate_papers'][0]['metadata']['title'] = 'failed mutation'
+        finished = True
+    with pytest.raises(AgentExecutionCancelled):
+        AgentController().execute(role=AgentRole.SEARCH, operation='search_and_rank', objective='cancel',
+            state=state, handler=handler, should_cancel=lambda: finished)
+    assert state['candidate_papers'][0]['metadata']['title'] == 'original'
+
+
 def test_controller_runs_search_task_and_updates_plan_status():
     state = _state()
 

@@ -65,11 +65,13 @@ def _role_llm(llm, role: str):
 
 def _draft_fingerprint(state):
     from app.agent.context_builder import _stable_hash
+    from app.agent.claim_plan import CLAIM_SUPPORT_POLICY_VERSION
     from app.services.evidence_support import EVIDENCE_POLICY_VERSION
     from app.tools.verify_claims import _ENTAILMENT_VERIFIER_VERSION
     from app.services.rag_runtime import RAG_PIPELINE_VERSION
     # WHY: 调度状态在任务提交时改变，不属于正文验证输入；证据和授权改变则必须重验。
     return _stable_hash({"evidence_policy": EVIDENCE_POLICY_VERSION,
+                         "claim_support_policy": CLAIM_SUPPORT_POLICY_VERSION,
                          "pipeline_version": RAG_PIPELINE_VERSION,
                          "verifier_version": _ENTAILMENT_VERIFIER_VERSION,
                          "context_limit": get_settings().claim_verification_max_context_chars,
@@ -1237,7 +1239,7 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
             "state_schema_version",
             "delivery_mode", "effective_config", "publication_reviews", "published_versions", "delivery_status", "published_artifact_ref",
             "published_draft_version", "verification_status", "requirements_satisfied", "delivery_metrics",
-            "finalization_phase", "finalization_reason", "search_query_ledger", "extraction_cache",
+            "finalization_phase", "finalization_reason", "search_query_ledger", "extraction_cache", "retrieval_screening_cache",
             "main_agent_context", "main_context_snapshot",
             "main_context_artifact_ref", "context_snapshot_version",
             "agent_task_results",

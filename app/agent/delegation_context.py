@@ -5,7 +5,7 @@ import copy
 
 from app.agent.action_contracts import CONTRACTS
 from app.agent.action_registry import ACTION_REGISTRY
-from app.agent.context_builder import build_main_agent_context
+from app.agent.context_builder import build_main_agent_context, _goal, _gate_status, _budget_remaining, _failure_reasons
 from app.schemas.agent_decision_schema import ContextSelection
 from app.schemas.context_schema import KeyEvidence, DecisionRecord, OpenQuestion
 
@@ -56,9 +56,8 @@ def validate_planning(decision, context):
 
 def context_packet(state, decision, *, decision_context=None):
     # WHY: 新plan入账会替换展示的计划ID；选择应按决策时已见快照校验，不在同一委派内换视图。
-    current = build_main_agent_context(state)
-    context = decision_context if decision_context is not None else current
-    if context.goal != current.goal:
+    context = decision_context if decision_context is not None else build_main_agent_context(state)
+    if context.goal != _goal(state):
         raise ValueError("delegation goal changed after context selection")
     validate_planning(decision, context)
     if decision.context_selection is None:
@@ -92,16 +91,19 @@ def subagent_context(state, role, active, available):
     for key in ("agent_context_usage", "agent_context_last_usage"):
         projected[key] = copy.deepcopy(session.get(key) or {})
     context = build_main_agent_context(projected)
-    authoritative = build_main_agent_context(state)
     # WHY: 模型只能裁剪补充材料，不能省略硬约束、最新门禁、失败信息或剩余预算。
-    context.goal = authoritative.goal
-    context.state.gate_status = authoritative.state.gate_status
-    context.state.failure_reasons = authoritative.state.failure_reasons
-    context.state.budget_remaining = authoritative.state.budget_remaining
+    context.goal = _goal(state)
+    context.state.gate_status = _gate_status(state)
+    context.state.failure_reasons = _failure_reasons(state)
+    context.state.budget_remaining = _budget_remaining(state)
+    context.state.remaining_action_budget = context.state.budget_remaining['recovery']
     packet = active.get("context_packet")
     if packet is not None:
         # 历史摘要只作任务说明；最新状态与当前操作产物仍由代码构造，不能当作新授权。
         selection = ContextSelection.model_validate(packet["selection"])
+        # WHY: 新包已有决策时摘要；仅旧检查点缺少材料时才补建完整权威视图。
+        authoritative = (build_main_agent_context(state) if any(key not in packet for key in
+            ("key_evidence", "decisions", "open_questions")) else None)
         # WHY: 摘要是本次委派选中的历史材料，不授予当前证据权限；旧检查点无快照时保持原投影。
         context.key_evidence = ([KeyEvidence.model_validate(item) for item in packet["key_evidence"]]
                                 if "key_evidence" in packet else

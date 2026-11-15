@@ -48,6 +48,14 @@ _PLAN_OPERATIONS = {
 }
 
 
+def _record_result(state, raw, *, durable=False):
+    history = state.setdefault("agent_task_results", [])
+    history.append(raw)
+    if durable:
+        # WHY: 完整结果在research_tasks按幂等键保存；上下文只需近期结果，纯内存模式保留旧行为。
+        del history[:-16]
+
+
 def _update_plan_status(state: dict[str, Any], operation: str, status: str) -> None:
     plan = state.get("research_plan")
     if not isinstance(plan, dict):
@@ -169,7 +177,11 @@ class AgentController:
             "constraints": constraints or {},
             "source": source_fingerprint,
         }, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:32]
-        for raw in reversed(state.get("agent_task_results") or []):
+        from app.services.durable_execution_service import active_runtime, active_task_id, task_scope
+        # WHY: 有界复合动作的内层 Controller 不另起数据库提交；由外层一次提交。
+        runtime = active_runtime() if not active_task_id() else None
+        stored_result = runtime.completed_task(idempotency_key) if runtime else None
+        for raw in ([stored_result] if stored_result else reversed(state.get("agent_task_results") or [])):
             if raw.get("idempotency_key") == idempotency_key and raw.get("status") == "completed":
                 check_execution()
                 if should_cancel and should_cancel():
@@ -214,10 +226,7 @@ class AgentController:
         agent = _AGENTS[role]()
         from app.agent.evidence_invalidation import evidence_snapshot, invalidate_changed_evidence
         evidence_before = evidence_snapshot(state, operation) if invalidate_evidence else None
-        from app.services.durable_execution_service import active_runtime, active_task_id, task_scope
         from app.database.runtime_repository import RuntimeConflict
-        # WHY: 有界复合动作的内层 Controller 不另起数据库提交；由外层一次提交。
-        runtime = active_runtime() if not active_task_id() else None
         if runtime:
             runtime.begin_task(task, state.get("agent_execution_budget") or {})
         try:
@@ -253,7 +262,7 @@ class AgentController:
                     "blocked" if result.outcome.value == "blocked" else "completed")
                 candidate["agent_execution_status"] = "completed"
                 result.output_state_fingerprint = context_source_fingerprint(candidate)
-                candidate.setdefault("agent_task_results", []).append(result.model_dump(mode="json"))
+                _record_result(candidate, result.model_dump(mode="json"), durable=True)
                 # WHY: 观察与研究提交进入同一检查点，恢复后不会留下未配对调用或重复执行。
                 from app.agent.react_context import record_tool_observation
                 record_tool_observation(candidate, result.model_dump(mode="json"))
@@ -269,12 +278,11 @@ class AgentController:
                 return result
         except StaleAgentResult:
             if runtime:
-                runtime.fail_task(task.task_id, "stale", state.get("agent_execution_budget") or {})
+                runtime.fail_task(task.task_id, "stale", state.get("agent_execution_budget") or {},
+                                  result=result.model_dump(mode="json"))
             _update_plan_status(state, operation, "invalidated")
             state["agent_execution_status"] = "stale"
-            state.setdefault("agent_task_results", []).append(
-                result.model_dump(mode="json")
-            )
+            _record_result(state, result.model_dump(mode="json"), durable=bool(runtime))
             refresh_main_agent_context(state)
             return result
         except (AgentBudgetExceeded, AgentExecutionCancelled) as exc:
@@ -292,9 +300,6 @@ class AgentController:
             refresh_main_agent_context(state)
             raise
         except Exception as exc:
-            if runtime:
-                runtime.fail_task(task.task_id, "stale" if isinstance(exc, RuntimeConflict) else "failed",
-                                  state.get("agent_execution_budget") or {})
             _update_plan_status(state, operation, "failed")
             state["agent_execution_status"] = "failed"
             from app.agent.execution_budget import is_control_exception
@@ -306,7 +311,15 @@ class AgentController:
             raw = getattr(exc, "agent_task_result", None)
             if raw:
                 raw["output_state_fingerprint"] = context_source_fingerprint(state)
-                state.setdefault("agent_task_results", []).append(raw)
+                _record_result(state, raw, durable=bool(runtime))
+            if runtime:
+                if role == AgentRole.WRITING and not is_control_exception(exc) and audit:
+                    # WHY: 父状态未合并失败工具补丁；仅失败审计立即落盘，恢复无需等待子循环收尾。
+                    runtime.fail_task(task.task_id, "failed", state.get("agent_execution_budget") or {},
+                                      audit_state=state)
+                else:
+                    runtime.fail_task(task.task_id, "stale" if isinstance(exc, RuntimeConflict) else "failed",
+                                      state.get("agent_execution_budget") or {}, result=raw)
             refresh_main_agent_context(state)
             raise
         plan_status = {
@@ -320,7 +333,7 @@ class AgentController:
         _update_plan_status(state, operation, plan_status)
         state["agent_execution_status"] = "completed"
         result.output_state_fingerprint = context_source_fingerprint(state)
-        state.setdefault("agent_task_results", []).append(result.model_dump(mode="json"))
+        _record_result(state, result.model_dump(mode="json"))
         refresh_main_agent_context(state)
         return result
 

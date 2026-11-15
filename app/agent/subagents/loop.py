@@ -10,7 +10,7 @@ from app.agent.action_registry import (
 from app.agent.context_builder import _goal, _stable_hash, context_source_fingerprint
 from app.agent.execution_budget import check_execution, AgentExecutionCancelled
 from app.agent.main_policy import MainAgentPolicy, AgentDecisionError
-from app.agent.react_context import ReActContext, execute_context_recall
+from app.agent.react_context import ReActContext, execute_context_recall, observe_terminal
 from app.agent.sidecar import ActionSidecar
 from app.agent.delegation_context import context_packet, subagent_context
 from app.core.config import get_settings
@@ -96,7 +96,7 @@ class SubagentLoop:
             role = state.get("active_subagent")
             if role:
                 # WHY: 控制异常必须原样上抛；只补齐内存中的失败观察，不在取消/失权后提交。
-                ReActContext(state, namespace=role).observe({"status": "failed", "error": type(exc).__name__})
+                observe_terminal(state, {"status": "failed", "error": type(exc).__name__}, namespace=role)
             raise
 
     def _run(self, state, *, decision, handlers, should_cancel,

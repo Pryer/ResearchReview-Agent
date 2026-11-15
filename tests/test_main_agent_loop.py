@@ -7,6 +7,54 @@ from app.agent.main_loop import MainAgentLoop, _progress_fingerprint
 from tests.test_main_delegation_context import agent_artifacts
 
 
+def test_progress_digest_cache_detects_nested_mutation_and_ignores_reordering():
+    from app.agent.main_loop import progress_cache_scope
+    from unittest.mock import patch
+    import app.agent.main_loop as module
+    state = {'paper_cards': [{'paper_id': 'p', 'spans': [{'text': 'original'}]},
+                             {'paper_id': 'q', 'spans': []}]}
+    original = module.json.dumps
+    serialized = []
+    def counted(value, *args, **kwargs):
+        if isinstance(value, dict) and 'spans' in value:
+            serialized.append(value['paper_id'])
+        return original(value, *args, **kwargs)
+    with progress_cache_scope(), patch.object(module.json, 'dumps', counted):
+        first = _progress_fingerprint(state)
+        assert _progress_fingerprint(state) == first
+        assert serialized == ['p', 'q']
+        state['paper_cards'][0]['spans'][0]['text'] = 'changed'
+        changed = _progress_fingerprint(state)
+        assert changed != first
+        assert serialized == ['p', 'q', 'p']
+        state['paper_cards'].reverse()
+        assert _progress_fingerprint(state) == changed
+        state['quality_gate'] = {'passed': True}
+        assert _progress_fingerprint(state) != changed
+    assert not any('cache' in key for key in state)
+
+
+def test_equal_progress_payload_reuses_final_digest_but_nested_quality_invalidates():
+    from app.agent.main_loop import progress_cache_scope
+    from unittest.mock import patch
+    import app.agent.main_loop as module
+    current = {'quality_gate': {'details': {'passed': False}}}
+    original = module.json.dumps
+    encoded = []
+    def counted(value, *args, **kwargs):
+        if isinstance(value, dict) and 'valid_citations' in value:
+            encoded.append(True)
+        return original(value, *args, **kwargs)
+    with progress_cache_scope(), patch.object(module.json, 'dumps', counted):
+        initial = _progress_fingerprint(current)
+        assert _progress_fingerprint(current) == initial
+        assert _progress_fingerprint(current) == initial
+        assert len(encoded) == 1
+        current['quality_gate']['details']['passed'] = True
+        assert _progress_fingerprint(current) != initial
+        assert len(encoded) == 2
+
+
 class NativeDecisionLLM:
     native_tools_enabled = True
 

@@ -15,7 +15,7 @@ from app.clients.embedding_client import EmbeddingClient
 from app.clients.reranker_client import RerankerClient
 from app.clients.retrieval_http import RetrievalProviderError
 from app.schemas.retrieval_schema import RetrievalDocument, RetrievalQuery, fingerprint
-from app.tools.hybrid_retrieval import dense_rank, fuse_rankings, lexical_rank
+from app.tools.hybrid_retrieval import dense_rank, fuse_rankings, LexicalIndex
 from app.tools.language_router import detect_paper_language
 from app.utils.deduplicate import deduplicate_papers
 
@@ -322,7 +322,8 @@ def rank_candidates(state, *, settings, include_rerank=False, should_cancel=None
         return [], {"candidate_count": len(papers), "deterministic_exclusions": exclusions,
                     "stop_reason": "no_query_or_text"}
     texts = [doc.text for _, doc in searchable]
-    lex = [lexical_rank(texts, query.text, settings.retrieval_bm25_top_k) for query in queries]
+    lexical_index = LexicalIndex(texts)
+    lex = [lexical_index.rank(query.text, settings.retrieval_bm25_top_k) for query in queries]
     dense = [[] for _ in queries]
     degraded = []
     embed = embedding_client or EmbeddingClient(settings)

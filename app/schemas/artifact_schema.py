@@ -39,6 +39,7 @@ ARTIFACT_TYPES = {
 STATE_ARTIFACT_FIELDS = {
     "published_versions": "published_delivery", "extraction_cache": "execution_cache",
     "search_query_ledger": "execution_cache",
+    "retrieval_screening_cache": "execution_cache",
     "candidate_papers": "raw_search_result", "ranked_papers": "raw_search_result",
     "paper_details": "paper_metadata", "paper_cards": "paper_card",
     "claim_plans": "claim_plan", "writing_plans": "writing_plan",

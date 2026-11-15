@@ -257,6 +257,11 @@ def llm_rerank_papers(
             if cache_keys and cache_keys[item["paper_id"]] in screening_cache
         }
         screening_cache_hits += len(scores_map)
+        if screening_cache is not None:
+            for paper_id in scores_map:
+                key = cache_keys[paper_id]
+                # WHY: 命中刷新访问顺序，热点准入不应被FIFO驱逐后重复付费判定。
+                screening_cache[key] = screening_cache.pop(key)
         pending_items = [item for item in items_payload if item["paper_id"] not in scores_map]
         if pending_items:
             prompt = build_paper_screening_prompt(

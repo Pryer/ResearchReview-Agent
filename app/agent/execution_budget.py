@@ -88,6 +88,16 @@ def active_budget():
     return _ACTIVE.get()
 
 
+def reset_research_counters(ledger):
+    """新研究任务边界重置工作计数；会话Token/请求与未决预留始终累计。"""
+    totals = ledger.setdefault("prior_task_usage", {})
+    for name in ("decision_rounds", "retrieval_used", "recovery_used", "actions_reserved", "actions_committed", "elapsed_seconds"):
+        totals[name] = totals.get(name, 0) + (ledger.get(name) or 0)
+        ledger[name] = 0
+    ledger["research_generation"] = int(ledger.get("research_generation") or 0) + 1
+    ledger.pop("finalization_reserve", None)
+
+
 @contextmanager
 def budget_scope(state, should_cancel=None):
     from app.core.config import get_settings
@@ -253,9 +263,13 @@ def budgeted_create(client, *, on_response=None, operation="", **kwargs):
     ledger = current["ledger"]
     # WHY: 账本限制总 token，缓存命中不能抵扣；未知服务商 tokenizer 时保留字节上界。
     # 输出预留必须覆盖实际请求允许的完整上限，不能用平均输出比例冒充硬预算。
+    # WHY: 去掉JSON容器的展示空白，不改消息正文；仍使用字节上界，不把中英字符比例当硬上界。
     prompt_bound = len(json.dumps({k: kwargs[k] for k in ("messages", "tools") if k in kwargs},
-                                  ensure_ascii=False).encode("utf-8")) + 128
-    reservation = prompt_bound + int(kwargs.get("max_tokens") or 4096)
+                                  ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 128
+    output_bound = int(kwargs.get("max_tokens") or 4096)
+    reservation = prompt_bound + output_bound
+    reservation_details = {'input_upper_bound': prompt_bound, 'output_limit': output_bound,
+                           'reported_input_tokens': None, 'estimate_method': 'compact_json_utf8_upper_bound'}
     with _LOCK:
         _check_model_request_budget(current)
         _guard_finalization(current, requests=1, tokens=reservation)
@@ -276,6 +290,7 @@ def budgeted_create(client, *, on_response=None, operation="", **kwargs):
             raise AgentBudgetExceeded("token reservation exceeds remaining budget")
         ledger["tokens_reserved"] = reserved + reservation
         ledger["llm_requests"] = int(ledger.get("llm_requests") or 0) + 1
+        ledger['last_token_reservation'] = reservation_details
     kwargs["timeout"] = min(float(kwargs.get("timeout") or 60), max(.001, current["deadline"] - time.monotonic()))
     cost = reservation
     estimated = True
@@ -303,6 +318,8 @@ def budgeted_create(client, *, on_response=None, operation="", **kwargs):
             cost = int(getattr(usage, "total_tokens", 0) or
                        (int(getattr(usage, "prompt_tokens", 0) or 0) + int(getattr(usage, "completion_tokens", 0) or 0)))
             estimated = False
+            # WHY: 并行/嵌套请求各自关联预留与usage，迟到响应不能改写较新请求的诊断。
+            reservation_details['reported_input_tokens'] = getattr(usage, 'prompt_tokens', None)
             for field in ("prompt_tokens", "completion_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
                 value = getattr(usage, field, None)
                 if value is not None:

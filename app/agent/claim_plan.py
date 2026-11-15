@@ -20,6 +20,8 @@ from app.services.evidence_support import authorized_field_claim, independent_sp
 
 logger = get_logger(__name__)
 
+CLAIM_SUPPORT_POLICY_VERSION = "independent-source-groups-v2"
+
 # 证据数量 → 语言强度映射（established 需要额外门禁，不只是 count）
 _SUPPORT_LEVEL_MAP = {
     "single":      {"min": 1, "max": 1, "language": "一项研究/有研究尝试", "verbs": ["报告", "提出", "尝试"]},
@@ -1034,10 +1036,6 @@ def validate_claim_support(
                 status = "SUPPORTED"
                 reason = f"matched {best_claim_id} (sim={best_similarity:.2f})"
                 supported_count += 1
-        elif best_similarity >= similarity_threshold and best_claim_id:
-            status = "SUPPORTED"
-            reason = f"matched {best_claim_id} (sim={best_similarity:.2f})"
-            supported_count += 1
         elif has_citations:
             status = "UNSUPPORTED"
             reason = f"no claim match (best={best_claim_id or 'none'} sim={best_similarity:.2f})"
@@ -1387,8 +1385,8 @@ def _determine_support_level(
         return "single"  # 不满足该类型最低要求 → 降级
 
     # 检查独立性（如果提供了 paper_ids）
-    independent_count = evidence_count
-    if paper_ids and card_map:
+    independent_count = min(1, evidence_count)
+    if paper_ids is not None and card_map is not None:
         independent_count = _count_independent_sources(paper_ids, card_map)
 
     # 确定基础级别
@@ -1419,29 +1417,65 @@ def _count_independent_sources(
     paper_ids: list[str],
     card_map: dict[str, dict[str, Any]],
 ) -> int:
-    """计算独立证据来源数量（去除同团队/同数据集重复）。"""
-    if not paper_ids or not card_map:
-        return len(paper_ids)
-
-    # 分组依据：相同 last author + 相同 dataset → 算一组
-    groups: dict[str, set[str]] = {}
-    for pid in paper_ids:
+    """基于已有元数据保守分组，不将缺失信息视为独立性证明。"""
+    from app.tools.generate_citation import normalize_doi
+    ids = list(dict.fromkeys(paper_ids))
+    parents = {pid: pid for pid in ids}
+    def root(pid):
+        while parents[pid] != pid:
+            parents[pid] = parents[parents[pid]]
+            pid = parents[pid]
+        return pid
+    def join(a, b):
+        parents[root(a)] = root(b)
+    dois, teams, known = {}, {}, set()
+    for pid in ids:
         card = card_map.get(pid, {})
         authors = card.get("authors") or []
-        last_author = str(authors[-1]).strip() if authors else ""
-        dataset = str(card.get("dataset") or "").strip()
-        doi = str(card.get("doi") or "").strip().lower()
-
-        # DOI 相同的论文必然是同组
+        last_author = " ".join(str(authors[-1]).casefold().split()) if authors else ""
+        dataset = " ".join(str(card.get("dataset") or "").casefold().split())
+        doi = normalize_doi(card.get("doi"))
         if doi:
-            groups.setdefault(f"doi:{doi}", set()).add(pid)
-        elif last_author and dataset:
-            key = f"{last_author}:{dataset}"
-            groups.setdefault(key, set()).add(pid)
-        else:
-            groups.setdefault(pid, set()).add(pid)
+            if doi in dois:
+                join(pid, dois[doi])
+            dois[doi] = pid
+        if last_author:
+            known.add(pid)
+            teams.setdefault(last_author, []).append((pid, dataset))
+    for members in teams.values():
+        # WHY: DOI只去重论文身份，不能短路作者/数据依赖；同末位作者缺数据时不据此升级独立性。
+        groups = {}
+        dataset_known = all(d for _, d in members)
+        for pid, dataset in members:
+            key = dataset if dataset_known else "unknown_dataset"
+            if key in groups:
+                join(pid, groups[key])
+            groups[key] = pid
+    # WHY: 作者未知的额外论文不增加已知独立组；仅有未知来源时最多按单源处理，论文引用数不受影响。
+    return len({root(pid) for pid in known}) if known else min(1, len(ids))
 
-    return len(groups)
+
+def claim_source_strength_violations(claim_plans, paper_cards):
+    """只读核验旧计划的来源强度；降级与重新授权仍由 Analysis 完成。"""
+    cards = {str(card.get("paper_id")): card for card in paper_cards if card.get("paper_id")}
+    owners = {str(span["evidence_id"]): pid for pid, card in cards.items()
+              for span in independent_spans(card)}
+    order = {"single": 0, "moderate": 1, "strong": 2, "established": 3}
+    violations = []
+    for plan in claim_plans:
+        for claim in plan.get("claims") or []:
+            # WHY: 无绑定的历史适配器由原证据完整性检查处理，这里仅核验实际来源的独立性。
+            bound = list(dict.fromkeys(eid for eid in claim.get("evidence_ids") or [] if eid in owners))
+            ids = list(dict.fromkeys(owners[eid] for eid in bound))
+            if not ids:
+                continue
+            expected = _determine_support_level(len(bound), str(claim.get("claim_type") or "finding"), ids, cards)
+            current = str(claim.get("support_level") or "single")
+            if order.get(current, 0) > order[expected]:
+                violations.append({"claim_id": str(claim.get("claim_id") or ""),
+                    "evidence_ids": list(claim.get("evidence_ids") or []),
+                    "reason": f"当前来源独立性仅支持 {expected}，计划仍授权 {current}；需重新分析并授权"})
+    return violations
 
 
 def _count_unique_teams(
@@ -1453,10 +1487,10 @@ def _count_unique_teams(
     for pid in paper_ids:
         card = card_map.get(pid, {})
         authors = card.get("authors") or []
-        last = str(authors[-1]).strip().casefold() if authors else ""
+        last = " ".join(str(authors[-1]).casefold().split()) if authors else ""
         if last:
             last_authors.add(last)
-    return max(1, len(last_authors))
+    return len(last_authors)
 
 
 def _has_survey_support(
@@ -1523,44 +1557,55 @@ def _llm_refine_claims(
     llm,
 ) -> list[dict[str, Any]]:
     """用 LLM 优化主张表述，使其更学术化、更精确。不改变证据绑定。"""
-    claims_json = json.dumps([
-        {"text": c["claim_text"], "type": c["claim_type"], "level": c["support_level"]}
-        for c in claims[:12]
-    ], ensure_ascii=False)
+    from app.prompt.claim_refinement import CLAIM_REFINEMENT_PROMPT
 
-    prompt = f"""你是学术编辑。请优化以下研究路线的论证主张表述，使其更精确、更学术化。
-
-路线：{route_name}
-研究问题：{research_question}
-
-当前主张：
-{claims_json}
-
-要求：
-1. 保持每条主张的证据强度不变（single/modrate/strong/established）
-2. 不允许将 single-evidence 主张升级为趋势判断
-3. 不允许添加原文没有的新事实
-4. 返回优化后的主张列表
-
-严格返回 JSON：
-{{"refined_claims": [{{"claim_text": "...", "claim_type": "...", "support_level": "..."}}]}}
-"""
+    batch = claims[:12]
+    if not batch:
+        return claims
     try:
+        by_id = {c.get("claim_id"): c for c in batch}
+        if len(by_id) != len(batch) or any(not isinstance(cid, str) or not cid.strip() for cid in by_id):
+            raise ValueError("invalid_refinement_input_ids")
+        claims_json = json.dumps([
+            {"claim_id": c["claim_id"], "claim_text": c["claim_text"],
+             "claim_type": c["claim_type"], "support_level": c["support_level"]}
+            for c in batch
+        ], ensure_ascii=False)
+        prompt = CLAIM_REFINEMENT_PROMPT.format(route_name=route_name,
+            research_question=research_question, claims_json=claims_json)
         response = llm.complete(prompt, response_format="json_object", temperature=0.0)
         from app.core.json_utils import parse_json_object
         data = parse_json_object(response if isinstance(response, str) else str(response))
-        refined = data.get("refined_claims") or []
-        if len(refined) == len(claims):
-            for i, ref in enumerate(refined):
-                if str(ref.get("claim_text") or "").strip():
-                    claims[i]["claim_text"] = str(ref["claim_text"]).strip()
+        refined = data.get("refined_claims")
+        if not isinstance(refined, list) or len(refined) != len(batch):
+            raise ValueError("refinement_batch_count_mismatch")
+        if any(not isinstance(ref, dict) or not isinstance(ref.get("claim_id"), str)
+               or not isinstance(ref.get("claim_text"), str) or not ref["claim_text"].strip()
+               for ref in refined):
+            raise ValueError("invalid_refinement_response")
+        ids = [ref["claim_id"] for ref in refined]
+        if len(set(ids)) != len(ids) or set(ids) != set(by_id):
+            raise ValueError("refinement_id_mismatch")
+        # WHY: 润色不能改变数值的次数/顺序；符号、指数和百分比也属于值，不能只比较数字集合。
+        number = re.compile(r"[+\-−]?(?:(?:\d{1,3}(?:[,，]\d{3})+|\d+)(?:\.\d+)?|\.\d+)(?:[eE][+\-−]?\d+)?(?:\s*[%％])?")
+        updates = []
+        for ref in refined:
+            original = by_id[ref["claim_id"]]
+            text = ref["claim_text"].strip()
+            if number.findall(text) != number.findall(original["claim_text"]):
+                logger.warning("LLM claim refinement rejected: numeric_tokens_changed")
+                continue
+            updates.append((original, text))
+        # WHY: 先校验完整批次的身份与结构再写入；尾部未发送的主张及全部证据/授权字段保持原样。
+        for original, text in updates:
+            original["claim_text"] = text
     except Exception as exc:
         # WHY: 停止信号（预算/取消/失权）必须传播；表述优化失败可降级保留原主张。
         from app.agent.execution_budget import is_control_exception
 
         if is_control_exception(exc):
             raise
-        logger.debug("LLM claim refinement skipped: %s", exc)
+        logger.warning("LLM claim refinement skipped: %s", type(exc).__name__)
 
     return claims
 

@@ -37,6 +37,28 @@ def encode(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def status_projection(status, observations):
+    from app.agent.context_builder import _clean_text
+    result = copy.deepcopy(status)
+    def summary(item):
+        return {"action": str(item.get("operation") or item.get("action") or ""),
+                "status": str(item.get("status") or "unknown"), "outcome": item.get("outcome"),
+                "findings": [_clean_text(f, 200) for f in (item.get("findings") or [])[:3]],
+                "error": _clean_text(item.get("error"), 180),
+                "evidence_refs": [str(ref) for ref in (item.get("evidence_refs") or [])[:3]]}
+    covered = {encode(summary(item)) for item in observations}
+    # WHY: 以压缩后实际保留的观察去重；未保留的反馈仍在状态栏中，权威五字段不被改写。
+    result['state']['recent_trajectory'] = [item for item in result['state'].get('recent_trajectory', [])
+        if 'findings' not in item or encode(summary(item)) not in covered]
+    # WHY: 仅模型投影省略同义别名；原schema/旧快照继续可读，不移除研究状态和恢复预算。
+    view = result['state']
+    if view.get('status') == view.get('research_status'):
+        view.pop('status', None)
+    if view.get('remaining_action_budget') == view.get('budget_remaining', {}).get('recovery'):
+        view.pop('remaining_action_budget', None)
+    return result
+
+
 def estimate_tokens(messages: list[dict], tools: list[dict]) -> int:
     # WHY: 不混用不同厂商的 tokenizer；UTF-8 字节上界加消息开销是保守估算，
     # 实际 usage 单独记录。窗口必须配置为主备模型可用窗口的较小值。
@@ -118,9 +140,8 @@ class ReActContext:
         if self.data.get("pending"):
             raise ContextBudgetExceeded("unresolved_tool_call_in_checkpoint")
         goal = context.goal.model_dump(mode="json")
-        if not self.data["goals"] or self.data["goals"][-1] != goal:
-            self.data["goals"].append(copy.deepcopy(goal))
-            self.data["messages"].append({"role": "user", "content": encode({"goal": goal})})
+        goal_changed = not self.data["goals"] or self.data["goals"][-1] != goal
+        goal_message = {"role": "user", "content": encode({"goal": goal})}
         status = context.model_dump(mode="json")
         status["state"]["allowed_actions"] = list(allowed_actions)
         if self.namespace is None:
@@ -144,8 +165,14 @@ class ReActContext:
         )
         status_message = {"role": "user", "content": encode(status)}
 
+        candidate = self.data
+        compacted = False
         def build():
-            return [prefix, *copy.deepcopy(self.data["messages"]), copy.deepcopy(status_message)]
+            nonlocal status_message
+            status_message = {"role": "user", "content": encode(status_projection(status, candidate['memory']))}
+            additions = [goal_message] if goal_changed and not compacted else []
+            return [prefix, *copy.deepcopy(candidate["messages"]),
+                    *copy.deepcopy(additions), copy.deepcopy(status_message)]
 
         messages = build()
         before = estimate_tokens(messages, tools)
@@ -157,25 +184,35 @@ class ReActContext:
         memory_over = (len(self.data["memory"]) > settings.agent_context_memory_items
                        or len(encode(self.data["memory"])) > settings.agent_context_memory_chars)
         if (due or before + reserve > window or memory_over) and self.data["memory"]:
-            self._compact(status, input_budget=window - reserve, system=system, tools=tools)
+            # WHY: 新目标不属于旧Epoch；压缩及容量检查失败时不能留下半写入轨迹。
+            candidate = copy.deepcopy(self.data)
+            self._compact(status, input_budget=window - reserve, system=system, tools=tools, data=candidate)
+            compacted = True
             messages = build()
         estimate = estimate_tokens(messages, tools)
-        self.container["agent_context_usage"] = {
+        usage = {
             "estimated_input_tokens": estimate,
             "estimate_method": "utf8_upper_bound",
             "output_reserve_tokens": reserve,
             "window_tokens": window,
             "before_compaction_tokens": before,
-            "epoch": self.data["epoch"],
+            "epoch": candidate["epoch"],
         }
         if estimate + reserve > window:
             raise ContextBudgetExceeded("context_window_exceeded_after_compaction")
+        if compacted:
+            self.data.clear()
+            self.data.update(candidate)
+        elif goal_changed:
+            self.data["goals"].append(copy.deepcopy(goal))
+            self.data["messages"].append(goal_message)
+        self.container["agent_context_usage"] = usage
         self.data["messages"].append(status_message)
         return messages
 
     def _compact(self, status: dict, *, input_budget: int | None = None,
-                 system: str = "", tools: list[dict] | None = None) -> None:
-        data = self.data
+                 system: str = "", tools: list[dict] | None = None, data: dict | None = None) -> None:
+        data = self.data if data is None else data
         if data.get("pending"):
             raise ContextBudgetExceeded("cannot_compact_pending_tool_call")
         refs = archive_payload(
@@ -265,7 +302,7 @@ class ReActContext:
             },
         }
 
-    def observe(self, payload: dict) -> None:
+    def observe(self, payload: dict, *, archive: bool = True) -> None:
         pending = self.data.get("pending")
         if not pending:
             return
@@ -275,7 +312,7 @@ class ReActContext:
         # WHY: 小观察也要保存完整载荷；工作摘要被裁剪后，原始字段仍可审计回查。
         from app.services.research_execution_service import artifact_store
 
-        if artifact_store() is not None and self.state.get("session_id"):
+        if archive and artifact_store() is not None and self.state.get("session_id"):
             refs = archive_payload(self.state, "tool_observation", payload, scope_id=self.data["scope_id"],
                                    observation_sequence=self.data["observation_count"] + 1, operation=pending["action"])
         feedback = {
@@ -320,8 +357,18 @@ class ReActContext:
         self.data["memory"].append({**feedback, "sequence": self.data["observation_count"],
                                     "decision": copy.deepcopy(pending["decision"])})
         self.data.pop("pending")
-        from app.services.research_memory_retrieval import record_failure
-        record_failure(self.state, self, self.data["memory"][-1])
+        if archive:
+            from app.services.research_memory_retrieval import record_failure
+            record_failure(self.state, self, self.data["memory"][-1])
+
+
+def observe_terminal(state: dict, payload: dict, *, namespace: str | None = None) -> None:
+    """停止后的最佳努力内存配对，不允许诊断错误替换原始停止原因。"""
+    try:
+        ReActContext(state, namespace=namespace).observe(payload, archive=False)
+    except Exception as exc:
+        # WHY: 归档与失败记忆都不可写库；损坏的轨迹或容量错误也不能掩盖原始异常。
+        state.setdefault("errors", []).append({"code": "terminal_observation_failed", "message": type(exc).__name__})
 
 
 def execute_context_recall(trajectory: ReActContext, arguments: dict) -> dict:

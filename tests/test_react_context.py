@@ -207,13 +207,106 @@ def test_threshold_compaction_archives_history_and_keeps_constraints_refs_and_pa
 
 def test_compaction_cannot_drop_hard_requirements_to_fit(store, monkeypatch):
     current, trajectory = populated_trajectory()
+    before = copy.deepcopy(trajectory.data)
     context = build_main_agent_context(current)
     context.goal.request += "必须保留的要求" * 5000
     monkeypatch.setattr(get_settings(), "agent_context_window_tokens", 12000)
     with pytest.raises(ContextBudgetExceeded, match="exceeded_after_compaction"):
         trajectory.request(context, system="fixed", tools=[], allowed_actions=[])
-    assert trajectory.data["goals"][-1]["request"] == context.goal.request
-    assert trajectory.data["archive_refs"]
+    assert trajectory.data == before
+    assert context.goal.request.endswith("必须保留的要求" * 5000)
+
+
+def test_new_goal_is_not_archived_into_previous_epoch(store, monkeypatch):
+    current, trajectory = populated_trajectory()
+    old = copy.deepcopy(trajectory.data)
+    context = build_main_agent_context(current)
+    context.goal.request += '新增用户要求'
+    monkeypatch.setattr(get_settings(), 'agent_context_window_tokens', 24000)
+    trajectory.request(context, system='fixed', tools=[], allowed_actions=[])
+    archived = read_archive(store, trajectory.data['archive_refs'])
+    assert archived['goals'] == old['goals']
+    assert archived['messages'] == old['messages']
+    assert trajectory.data['goals'] == [context.goal.model_dump(mode='json')]
+    assert encode(trajectory.data['messages']).count('新增用户要求') == 2  # goal + status
+
+
+@pytest.mark.parametrize('window', [10, 12000])
+def test_failed_request_without_memory_does_not_append_goal_or_status(monkeypatch, window):
+    current = state()
+    trajectory = ReActContext(current)
+    before = copy.deepcopy(trajectory.data)
+    context = build_main_agent_context(current)
+    context.goal.request += 'huge goal ' * 10000
+    monkeypatch.setattr(get_settings(), 'agent_context_window_tokens', window)
+    with pytest.raises(ContextBudgetExceeded):
+        trajectory.request(context, system='fixed', tools=[], allowed_actions=[])
+    assert trajectory.data == before
+
+
+@pytest.mark.parametrize('namespace', [None, 'search'])
+def test_terminal_observation_never_calls_store_or_failure_memory(store, monkeypatch, namespace):
+    from app.agent.react_context import observe_terminal
+    current = state()
+    trajectory = ReActContext(current, namespace=namespace)
+    trajectory.proposed(AgentDecision(action='search_and_rank', reason='test'))
+    def forbidden(*args, **kwargs):
+        pytest.fail('terminal observation attempted persistence')
+    monkeypatch.setattr(store, 'persist_payload', forbidden)
+    monkeypatch.setattr('app.services.research_memory_retrieval.record_failure', forbidden)
+    observe_terminal(current, {'status': 'cancelled', 'error': 'AgentCancelledError'}, namespace=namespace)
+    assert not trajectory.data.get('pending')
+    assert trajectory.data['memory'][-1]['artifact_refs'] == []
+
+
+@pytest.mark.parametrize('error_name', ['AgentCancelledError', 'AgentExecutionStale', 'RuntimeConflict', 'ContextBudgetExceeded'])
+def test_stop_cleanup_preserves_subagent_exception_and_main_status(store, monkeypatch, error_name):
+    from app.agent.execution import AgentCancelledError
+    from app.agent.execution_budget import AgentExecutionStale
+    from app.database.runtime_repository import RuntimeConflict
+    from app.agent.subagents.loop import SubagentLoop
+    errors = {e.__name__: e for e in (AgentCancelledError, AgentExecutionStale, RuntimeConflict, ContextBudgetExceeded)}
+    original = errors[error_name]('original stop')
+    def stopped(*args, **kwargs):
+        raise original
+    def broken_archive(*args, **kwargs):
+        raise OSError('database unavailable')
+    monkeypatch.setattr(store, 'persist_payload', broken_archive)
+    current = state()
+    current['active_subagent'] = 'search'
+    child = ReActContext(current, namespace='search')
+    child.proposed(AgentDecision(action='search_and_rank', reason='test'))
+    loop = SubagentLoop(None, None)
+    monkeypatch.setattr(loop, '_run', stopped)
+    with pytest.raises(type(original)) as caught:
+        loop.run(current, handlers={})
+    assert caught.value is original
+    main = ReActContext(current)
+    main.proposed(AgentDecision(action='search_and_rank', reason='test'))
+    root = MainAgentLoop(None)
+    monkeypatch.setattr(root, '_run', stopped)
+    expected = 'cancelled' if error_name == 'AgentCancelledError' else 'blocked' if error_name == 'ContextBudgetExceeded' else 'failed'
+    assert root.run(current, handlers={}, finish_validator=lambda s: False) == expected
+    assert current['errors'][-1]['code'] == error_name
+
+
+def test_broken_terminal_memory_cleanup_cannot_replace_original_exception(monkeypatch):
+    from app.agent.subagents.loop import SubagentLoop
+    from app.agent.execution_budget import AgentExecutionStale
+    current = state()
+    current['active_subagent'] = 'search'
+    original = AgentExecutionStale('lost lease')
+    def stopped(*args, **kwargs):
+        raise original
+    def broken(*args, **kwargs):
+        raise ContextBudgetExceeded('broken memory')
+    loop = SubagentLoop(None, None)
+    monkeypatch.setattr(loop, '_run', stopped)
+    monkeypatch.setattr(ReActContext, 'observe', broken)
+    with pytest.raises(AgentExecutionStale) as caught:
+        loop.run(current, handlers={})
+    assert caught.value is original
+    assert current['errors'][-1]['code'] == 'terminal_observation_failed'
 
 
 def test_loop_blocks_before_model_call_for_invalid_window(monkeypatch):

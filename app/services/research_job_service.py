@@ -7,7 +7,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from sqlalchemy import update
+from sqlalchemy import update, select
 from sqlalchemy.orm import Session
 
 from app.agent.graph import AgentCancelledError
@@ -160,6 +160,7 @@ class ResearchJobService:
         summary = {"requeued": 0, "interrupted": 0, "cancelled": 0}
         requeue_ids: list[str] = []
         with SessionLocal() as db:
+            from app.database.models import ResearchJobModel, ResearchSessionModel
             repo = ResearchJobRepository(db)
             jobs = repo.list_by_statuses({"queued", "running", "cancel_requested"})
             for job in jobs:
@@ -183,6 +184,18 @@ class ResearchJobService:
                         error="任务因应用重启中断，请重新提交",
                     )
                     summary["interrupted"] += 1
+                if job['status'] != 'queued':
+                    row = db.get(ResearchJobModel, job['job_id'])
+                    # WHY: 旧Job不能覆盖新任务或已结束会话；时间相同的多Job也视为归属不明确，不猜测先后。
+                    newer = select(ResearchJobModel.job_id).where(
+                        ResearchJobModel.session_id == row.session_id,
+                        ResearchJobModel.job_id != row.job_id,
+                        ResearchJobModel.created_at >= row.created_at,
+                    ).exists()
+                    db.execute(update(ResearchSessionModel).where(
+                        ResearchSessionModel.session_id == row.session_id,
+                        ResearchSessionModel.status == 'running', ~newer,
+                    ).values(status='cancelled' if job['status'] == 'cancel_requested' else 'failed'))
             db.commit()
             for recovered in jobs:
                 if recovered['status']!='queued':_finish_job_report(db,repo.get(recovered['job_id']),None)

@@ -5,6 +5,7 @@ from app.schemas.check_schema import CheckReport, ResultIssue, SuggestedAction
 
 def check_input_fingerprint(state):
     from app.agent.context_builder import _stable_hash
+    from app.agent.claim_plan import CLAIM_SUPPORT_POLICY_VERSION
     from app.services.evidence_support import EVIDENCE_POLICY_VERSION
     from app.tools.verify_claims import _ENTAILMENT_VERIFIER_VERSION
     from app.services.rag_runtime import RAG_PIPELINE_VERSION
@@ -19,7 +20,8 @@ def check_input_fingerprint(state):
     settings = get_settings()
     from app.core.config import get_review_threshold_policy
     return _stable_hash({"inputs": {k: state.get(k) for k in keys},
-        "policy": EVIDENCE_POLICY_VERSION, "verifier": _ENTAILMENT_VERIFIER_VERSION,
+        "policy": EVIDENCE_POLICY_VERSION, "claim_support_policy": CLAIM_SUPPORT_POLICY_VERSION,
+        "verifier": _ENTAILMENT_VERIFIER_VERSION,
         "pipeline": RAG_PIPELINE_VERSION, "thresholds": get_review_threshold_policy().snapshot(),
         "verification_enabled": settings.enable_claim_verification,
         "context_limit": settings.claim_verification_max_context_chars,
@@ -34,6 +36,7 @@ def check_is_current(state):
 
 def build_check_report(state, fingerprint, *, failure=""):
     from app.core.config import get_settings
+    from app.agent.claim_plan import claim_source_strength_violations
     verification = state.get("claim_verification") or {}
     gate = state.get("quality_gate") or {}
     incomplete = bool(failure or not gate or not str(state.get("review") or "").strip()
@@ -43,6 +46,14 @@ def build_check_report(state, fingerprint, *, failure=""):
                           or (int(verification.get("factual_claims") or 0) > 0
                               and float(verification.get("verification_coverage", 1.0)) < 1.0))))
     issues = []
+    strength_issues = claim_source_strength_violations(state.get("claim_plans") or [], state.get("paper_cards") or [])
+    if strength_issues:
+        issues.extend(ResultIssue(code="claim_source_independence_overstated", **item) for item in strength_issues)
+        # WHY: 恢复旧计划也须遵守现行来源分组；Check只阻断放行，不改Analysis的授权字段。
+        gate = {**gate, "passed": False, "draft_released": False, "blocking_issues": [
+            *list(gate.get("blocking_issues") or []),
+            {"code": "claim_evidence_quality_not_met", "message": "主张语言强度超过当前独立来源支持，需重新分析"}]}
+        state["quality_gate"] = gate
     if incomplete:
         issues.append(ResultIssue(code="check_execution_incomplete", reason=failure or "部分必需核验尚未完成"))
     for item in gate.get("blocking_issues") or []:

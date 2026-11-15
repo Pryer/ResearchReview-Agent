@@ -24,6 +24,21 @@ def compact_main_context(context: MainAgentContext, *, max_chars: int) -> MainAg
         compacted.state.quality_feedback["section_targets"].pop()
     while _size(compacted) > max_chars and compacted.state.research_memory:
         compacted.state.research_memory.pop()
+    # WHY: 历史通信先于证据裁剪；每个角色最新的未解决协助/阻断仍需保留。
+    messages = compacted.state.agent_messages
+    latest = {item.get("sender"): item for item in messages}
+    while _size(compacted) > max_chars and len(messages) > 2:
+        removable = next((i for i, item in enumerate(messages) if not (
+            item is latest.get(item.get("sender")) and item.get("kind") in {"needs_help", "blocked"}
+        )), None)
+        if removable is None:
+            break
+        messages.pop(removable)
+    recent = compacted.state.recent_trajectory
+    while _size(compacted) > max_chars and len(recent) > 3:
+        recent.pop(0)
+    while _size(compacted) > max_chars and len(compacted.state.failure_reasons) > 3:
+        compacted.state.failure_reasons.pop(0)
     while _size(compacted) > max_chars and len(compacted.key_evidence) > 3:
         compacted.key_evidence.pop()
     while _size(compacted) > max_chars and len(compacted.decisions) > 2:

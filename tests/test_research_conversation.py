@@ -708,6 +708,46 @@ def test_new_turn_reuses_one_session_and_preserves_conversation_history():
     )
 
 
+def test_new_completed_session_research_gets_fresh_rounds_but_keeps_paid_usage():
+    from app.agent.execution_budget import budget_scope
+    db = _db_session()
+    seen = []
+    def runner(query, db=None, initial_state=None):
+        with budget_scope(initial_state):
+            ledger = initial_state['agent_execution_budget']
+            seen.append(dict(ledger))
+            ledger.update(decision_rounds=96, retrieval_used=64, recovery_used=10,
+                          actions_reserved=64, llm_tokens=123, llm_requests=9, elapsed_seconds=99999)
+            return {'answer': 'done', 'intent': 'generate_review', 'topic': query,
+                    'steps': [], 'references': [], 'paper_cards': [], 'clusters': [], 'errors': [],
+                    'research_state': initial_state}
+    service = ResearchConversationService(db, llm=ClearTopicLLM(), agent_runner=runner)
+    service.handle(AgentRequest(user_query='基于YOLO的课堂行为识别论文', session_id='fresh-budget'))
+    service.handle(AgentRequest(user_query='继续调研师生互动序列分析', session_id='fresh-budget'))
+    assert len(seen) == 2
+    assert seen[1]['decision_rounds'] == seen[1]['retrieval_used'] == seen[1]['recovery_used'] == 0
+    assert seen[1]['actions_reserved'] == 0
+    assert seen[1]['llm_tokens'] == 123 and seen[1]['llm_requests'] == 9
+    assert seen[1]['research_generation'] == 1
+    assert seen[1]['prior_task_usage']['decision_rounds'] == 96
+
+
+def test_fresh_same_topic_increments_operation_sequence_exactly_once():
+    from app.agent.execution_budget import research_budget
+    db = _db_session()
+    seen = []
+    @research_budget
+    def runner(query, initial_state=None):
+        seen.append(initial_state['user_operation_sequence'])
+        return {'answer': 'done', 'intent': 'generate_review', 'topic': query,
+                'steps': [], 'references': [], 'paper_cards': [], 'clusters': [], 'errors': [],
+                'research_state': initial_state}
+    service = ResearchConversationService(db, llm=ClearTopicLLM(), agent_runner=runner)
+    for _ in range(2):
+        service.handle(AgentRequest(user_query='基于YOLO的课堂行为识别论文', session_id='same-topic'))
+    assert seen == [1, 2]
+
+
 def test_clarification_methods_are_preserved_in_resumed_semantic_frame():
     db = _db_session()
     calls = []

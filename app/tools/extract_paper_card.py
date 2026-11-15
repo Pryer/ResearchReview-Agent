@@ -29,6 +29,10 @@ from app.schemas.paper_schema import (
 logger = get_logger(__name__)
 
 
+class InvalidChunkResponse(ValueError):
+    """单块格式无效，不代表后续块的Provider不可用。"""
+
+
 def _coerce_publication_status(value: Any) -> PublicationStatus:
     """把检索层出版状态归一为枚举；无法确认时保持 unknown。"""
     text = str(getattr(value, "value", value) or "").strip().lower()
@@ -158,7 +162,10 @@ def extract_from_full_text(
                     response = llm.complete(CHUNK_FIELD_EXTRACTION_PROMPT.format(
                         title=paper.get("title", ""), text=chunk["text"]), response_format="json")
                     check_execution()
-                    data = _safe_parse_json(response)
+                    try:
+                        data = _safe_parse_json(response)
+                    except ValueError as exc:
+                        raise InvalidChunkResponse("invalid chunk extraction JSON") from exc
                 else:
                     cache_hits+=1
                     reason="reused_cache"
@@ -166,7 +173,7 @@ def extract_from_full_text(
                         or any(not isinstance(data[name], list)
                                or any(not isinstance(q, str) for q in data[name])
                                for name in fields if name in data)):
-                    raise ValueError("invalid chunk extraction response")
+                    raise InvalidChunkResponse("invalid chunk extraction response")
                 response_cache.put(cache_key,data)
             except Exception as exc:
                 if isinstance(exc, InterruptedError) or is_control_exception(exc):
@@ -174,7 +181,8 @@ def extract_from_full_text(
                 response_cache.put(response_cache.key(chunk),error=type(exc).__name__)
                 logger.warning("Chunk extraction failed: %s chunk=%s error=%s",
                                paper.get("paper_id"), chunk["chunk_id"], type(exc).__name__)
-                status, reason, stopped = "failed", type(exc).__name__, True
+                # WHY: 格式错误只影响当前块；服务故障仍停止，控制异常在上方原样透传。
+                status, reason, stopped = "failed", type(exc).__name__, not isinstance(exc, InvalidChunkResponse)
                 data = {}
             for field in fields:
                 quotes = data.get(field, [])

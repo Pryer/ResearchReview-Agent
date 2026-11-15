@@ -314,6 +314,21 @@ def test_screening_cache_reuses_only_unchanged_material():
     assert llm.calls == 2
 
 
+def test_recent_screening_hit_is_not_evicted_as_oldest_entry():
+    state = {'topic': 'classroom interaction'}
+    paper = {'paper_id': 'p1', 'title': 'School interaction', 'abstract': 'Observations', '_rank_score': .8}
+    model = _FakeLLM(True)
+    screen_candidates(state, [paper.copy()], model, target=1)
+    cache = state['retrieval_screening_cache']
+    hot_key = next(iter(cache))
+    cache.update({f'cold-{i}': {} for i in range(1023)})
+    screen_candidates(state, [paper.copy()], model, target=1)
+    screen_candidates(state, [{**paper, 'abstract': 'changed source'}], model, target=1)
+    assert len(cache) == 1024
+    assert hot_key in cache and 'cold-0' not in cache
+    assert model.calls == 2
+
+
 def test_embedding_and_rerank_cache_reuse_on_same_pool(tmp_path):
     settings = _settings(tmp_path)
     state = {"topic": "classroom interaction", "candidate_papers": [

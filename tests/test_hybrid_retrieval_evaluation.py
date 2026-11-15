@@ -35,14 +35,24 @@ def test_single_channel_ablation_keeps_hits_outside_fusion_window(monkeypatch, t
         "language_branch_min_zh": 0, "language_branch_min_en": 0,
         "retrieval_cache_dir": str(tmp_path),
     })
-    state = {"topic": "retrieval", "candidate_papers": [
+    state = {"topic": "retrieval", "keywords": ["evidence retrieval"], "candidate_papers": [
         {"paper_id": "a", "doi": "10.1/a", "title": "Retrieval A", "year": 2024},
         {"paper_id": "b", "doi": "10.1/b", "title": "Retrieval B", "year": 2024},
     ]}
-    monkeypatch.setattr(ranking, "lexical_rank", lambda *a, **k: [(0, 1.0)])
+    indices = []
+    class Lexical:
+        def __init__(self, texts):
+            indices.append(self)
+            self.queries = []
+        def rank(self, query, limit):
+            self.queries.append(query)
+            return [(0, 1.0)]
+    monkeypatch.setattr(ranking, "LexicalIndex", Lexical)
     monkeypatch.setattr(ranking, "dense_rank", lambda *a, **k: [(1, 0.9)])
     monkeypatch.setattr(ranking, "_embed_cached", lambda client, cache, settings, texts, *a: ([[1.0]] * len(texts), len(texts)))
     papers, report = ranking.rank_candidates(state, settings=settings, include_channel_rankings=True)
+    assert len(indices) == 1
+    assert len(indices[0].queries) == 2
     assert len(papers) == 1
     assert report["channel_rankings"]["bm25"] == ["a"]
     assert report["channel_rankings"]["dense"] == ["b"]
