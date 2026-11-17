@@ -72,6 +72,14 @@ class ResearchArtifactService:
         version: int = 1,
         identity: str = "",
     ) -> str:
+        from app.services.tool_execution import artifact_tool_context, execute_tool
+        context = artifact_tool_context()
+        if context is not None:
+            from app.services.durable_execution_service import active_runtime
+            arguments = dict(session_id=session_id, artifact_type=artifact_type, payload=payload,
+                             provenance=provenance, version=version, identity=identity)
+            return execute_tool('artifact_write', lambda: active_runtime().persist_tool_artifact(context, arguments),
+                                arguments=arguments, boundary='ResearchArtifactService.persist_payload')
         spec = ARTIFACT_TYPES.get(artifact_type)
         if spec is None:
             raise ValueError(f"unregistered artifact type: {artifact_type}")
@@ -107,6 +115,15 @@ class ResearchArtifactService:
         role: str = "service",
         expected_version: int | None = None,
     ) -> dict | None:
+        from app.services.tool_execution import artifact_tool_context, execute_tool
+        context = artifact_tool_context()
+        if context is not None:
+            from app.services.durable_execution_service import active_runtime
+            arguments = dict(session_id=session_id, artifact_ref=artifact_ref,
+                             allowed_types=allowed_types, expected_version=expected_version)
+            # WHY: 不信任调用方传入的role/state授权；Repository使用实际Grant和冻结资源清单。
+            return execute_tool('artifact_read', lambda: active_runtime().read_tool_artifact(context, arguments),
+                                arguments=arguments, boundary='ResearchArtifactService.resolve')
         ref = str(artifact_ref)
         if ref.startswith("artifact://"):
             result = self.repo.get(session_id, ref.removeprefix("artifact://"))

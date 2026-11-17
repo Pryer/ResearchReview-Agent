@@ -20,7 +20,7 @@ from app.services.evidence_support import authorized_field_claim, independent_sp
 
 logger = get_logger(__name__)
 
-CLAIM_SUPPORT_POLICY_VERSION = "independent-source-groups-v2"
+CLAIM_SUPPORT_POLICY_VERSION = "independent-source-groups-v3"
 
 # 证据数量 → 语言强度映射（established 需要额外门禁，不只是 count）
 _SUPPORT_LEVEL_MAP = {
@@ -1805,6 +1805,27 @@ def _find_best_matching_claim(
                 best_preferred = preferred_match
 
     return best_id if best_score > 0.05 else None
+
+
+def claim_has_authorized_support(claim: dict[str, Any], card_map: dict[str, dict[str, Any]]) -> bool:
+    """复核已有主张授权；摘要覆盖主张只允许带弱化限制的逐字原句。"""
+    evidence_ids = claim.get('evidence_ids') or []
+    if not evidence_ids:
+        return False
+    if all(_is_author_stated(eid, card_map) for eid in evidence_ids):
+        return True
+    # WHY: reference_coverage原有契约允许逐字摘要作“提及”证据；它不授予方法、实验、数值或强结论资格。
+    if (claim.get('claim_type') != 'background_fact' or len(evidence_ids) != 1
+            or claim.get('support_level') != 'single' or claim.get('evidence_access_limit') != 'abstract_only'
+            or not claim.get('allowed_verbs') or not set(claim['allowed_verbs']) <= {'提及', '涉及', '关注'}):
+        return False
+    card = card_map.get(_paper_id_from_evidence(evidence_ids[0])) or {}
+    if (card.get('quality_status') == 'invalid' or not _is_weak_access_card(card)
+            or not _can_contribute_factual_claims(card)):
+        return False
+    from app.services.evidence_support import literal_support
+    return any(span['evidence_id'] == evidence_ids[0] and span.get('source_type') == 'abstract'
+               and literal_support(claim.get('claim_text') or '', span['text']) for span in independent_spans(card))
 
 
 def _is_author_stated(evidence_id: str, card_map: dict[str, dict[str, Any]]) -> bool:

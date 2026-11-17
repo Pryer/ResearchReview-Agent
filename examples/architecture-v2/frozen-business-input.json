@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "synthetic": true,
+  "description": "仅供离线控制流与门禁回归的合成材料，不是真实论文或人工语义金标。",
+  "topic": "检索增强生成",
+  "year": 2022,
+  "papers": [
+    {
+      "paper_id": "openalex:offline-fixture-0",
+      "title": "离线测试样例1",
+      "authors": [
+        "Fixture Author 1"
+      ],
+      "year": 2022,
+      "venue": "Offline Fixture Journal",
+      "source": "fixture",
+      "url": "https://example.invalid/fixture-0",
+      "publication_status": "published",
+      "publication_type": "journal_article",
+      "abstract": "检索增强生成系统将用户问题转换为检索请求，从外部文档中取得相关段落，并把这些段落作为生成回答时的输入材料。该流程将知识获取与文本生成分成两个可检查的环节，使回答使用的信息能够对应到具体来源，同时保留更新外部文档的空间。"
+    },
+    {
+      "paper_id": "openalex:offline-fixture-1",
+      "title": "离线测试样例2",
+      "authors": [
+        "Fixture Author 2"
+      ],
+      "year": 2022,
+      "venue": "Offline Fixture Journal",
+      "source": "fixture",
+      "url": "https://example.invalid/fixture-1",
+      "publication_status": "published",
+      "publication_type": "journal_article",
+      "abstract": "检索结果的组织方式影响模型能够读取哪些上下文。研究流程先对候选段落进行筛选，再保留与当前问题相关的材料，并在生成过程中记录引用位置。通过区分候选文档与实际采用的段落，分析者可以检查回答与输入材料之间的对应关系。"
+    },
+    {
+      "paper_id": "openalex:offline-fixture-2",
+      "title": "离线测试样例3",
+      "authors": [
+        "Fixture Author 3"
+      ],
+      "year": 2022,
+      "venue": "Offline Fixture Journal",
+      "source": "fixture",
+      "url": "https://example.invalid/fixture-2",
+      "publication_status": "published",
+      "publication_type": "journal_article",
+      "abstract": "针对文档内容发生变化的情形，系统在检索阶段保存来源标识和材料版本，在生成完成后重新核对引用与原始片段。该设计使后续修订能够定位受到影响的内容，并把需要补充材料的问题交回检索环节，而不是直接扩大已有结论。"
+    }
+  ],
+  "sentences": [
+    "检索增强生成系统将用户问题转换为检索请求，从外部文档中取得相关段落，并把这些段落作为生成回答时的输入材料。该流程将知识获取与文本生成分成两个可检查的环节，使回答使用的信息能够对应到具体来源，同时保留更新外部文档的空间。",
+    "检索结果的组织方式影响模型能够读取哪些上下文。研究流程先对候选段落进行筛选，再保留与当前问题相关的材料，并在生成过程中记录引用位置。通过区分候选文档与实际采用的段落，分析者可以检查回答与输入材料之间的对应关系。",
+    "针对文档内容发生变化的情形，系统在检索阶段保存来源标识和材料版本，在生成完成后重新核对引用与原始片段。该设计使后续修订能够定位受到影响的内容，并把需要补充材料的问题交回检索环节，而不是直接扩大已有结论。"
+  ],
+  "body": "## 研究背景\n\n检索增强生成系统将用户问题转换为检索请求，从外部文档中取得相关段落，并把这些段落作为生成回答时的输入材料[openalex:offline-fixture-0]。检索结果的组织方式影响模型能够读取哪些上下文[openalex:offline-fixture-1]。\n\n该流程将知识获取与文本生成分成两个可检查的环节，使回答使用的信息能够对应到具体来源，同时保留更新外部文档的空间[openalex:offline-fixture-0]。针对文档内容发生变化的情形，系统在检索阶段保存来源标识和材料版本，在生成完成后重新核对引用与原始片段[openalex:offline-fixture-2]。\n\n研究流程先对候选段落进行筛选，再保留与当前问题相关的材料，并在生成过程中记录引用位置[openalex:offline-fixture-1]。通过区分候选文档与实际采用的段落，分析者可以检查回答与输入材料之间的对应关系[openalex:offline-fixture-1]。该设计使后续修订能够定位受到影响的内容，并把需要补充材料的问题交回检索环节，而不是直接扩大已有结论[openalex:offline-fixture-2]。"
+}

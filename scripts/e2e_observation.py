@@ -50,20 +50,18 @@ class RunObserver:
         from app.storage.pgvector_store import PgVectorStore
         from app.tools import chunk_retriever
         from app.services.llm_service import LLMService
-        from app.agent import delegation_context
+        from app.agent.task_main import TaskMainPolicy
+        from app.agent.runtime.errors import AgentDecisionError
+        from app.agent.react_context import ContextBudgetExceeded
+        decide_method = TaskMainPolicy.decide
 
-        validate_context = delegation_context.validate_planning
-
-        def planning(decision, context):
+        def decide(policy, context, names, trajectory, **kwargs):
             try:
-                return validate_context(decision, context)
-            except delegation_context.ContextSelectionError as exc:
-                # WHY: 失败决策未必进入最终检查点；只留动作和ID诊断，不记录提示词或资料正文。
-                self.emit("decision_context_rejection", action=decision.action,
-                          selection=decision.context_selection.model_dump(mode="json"),
-                          invalid_ids=exc.invalid_ids, allowed_ids=exc.allowed_ids)
+                return decide_method(policy, context, names, trajectory, **kwargs)
+            except (AgentDecisionError, ContextBudgetExceeded) as exc:
+                # WHY: 只留协议错误类型和本轮目录，不记录资料正文、提示词或内部思考。
+                self.emit('main_decision_rejection', error_type=type(exc).__name__, allowed_actions=list(names))
                 raise
-
         rank_method, screen_method = ranking.rank_candidates, ranking.screen_candidates
         chunk_method, search_method = chunk_retriever.retrieve_chunks, PgVectorStore.search
         usage_method = LLMService._record_usage
@@ -119,7 +117,7 @@ class RunObserver:
 
         with ExitStack() as stack:
             for obj, name, replacement in (
-                (delegation_context, "validate_planning", planning),
+                (TaskMainPolicy, 'decide', decide),
                 (ranking, "rank_candidates", rank), (ranking, "screen_candidates", screen),
                 (chunk_retriever, "retrieve_chunks", chunks), (PgVectorStore, "search", search),
                 (EmbeddingClient, "embed", self.model_wrapper(EmbeddingClient.embed, "embedding")),

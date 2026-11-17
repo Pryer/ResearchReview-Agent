@@ -77,6 +77,15 @@ class AgentController:
             raise ValueError("publication state version changed")
         candidate = copy.deepcopy(state)
         record = publish_draft(candidate)
+        pending = (candidate.get('main_agent_trajectory') or {}).get('pending') or {}
+        paired = pending.get('action') == 'publish_draft'
+        if paired:
+            from app.agent.react_context import ReActContext
+            unchanged = state.get('published_draft_version') == record['version']
+            # WHY: 控制观察仅内存配对，随发布快照持久化；CAS前不另写“已发布”归档。
+            ReActContext(candidate).observe({'status': 'no_progress' if unchanged else 'completed',
+                'reason': 'already_published' if unchanged else 'published', 'version': record['version'],
+                'grade': record['grade'], 'delivery_status': record['grade']}, archive=False)
         check_execution()
         runtime = active_runtime()
         if runtime:
@@ -85,6 +94,8 @@ class AgentController:
         state.update({key: candidate[key] for key in ("published_versions", "delivery_status",
             "published_artifact_ref", "published_draft_version", "verification_status",
             "requirements_satisfied", "delivery_metrics") if key in candidate})
+        if paired:
+            state['main_agent_trajectory'] = candidate['main_agent_trajectory']
         return record
 
     @single_action_charge
@@ -103,6 +114,7 @@ class AgentController:
         should_cancel: Callable[[], bool] | None = None,
         consume_mandatory_action: bool = False,
         invalidate_evidence: bool = False,
+        paper_scope: tuple[str, ...] = (),
     ) -> AgentTaskResult:
         # WHY: 直接调用同样受候选版本协议约束，不能仅依靠给LLM的动作白名单。
         if state.get("intent") != "search_papers" and state.get("pending_result_validation") and operation != "validate_result":
@@ -143,7 +155,8 @@ class AgentController:
         if store is not None and not input_artifact_refs:
             input_artifact_refs = [item["ref"]
                 for manifest in (state.get("artifact_manifest") or {}).values()
-                for item in manifest["items"] if item["type"] in readable]
+                for item in manifest["items"] if item["type"] in readable
+                and (not paper_scope or item.get('paper_id') in paper_scope)]
         for ref in input_artifact_refs or []:
             if ref.startswith("state://"):
                 prefix_fields = {"state://paper-card/": "paper_cards", "state://paper/": "paper_details",
@@ -168,7 +181,12 @@ class AgentController:
         deadline_ms = int(effective_budget.get("deadline_ms") or 0)
         deadline = time.monotonic() + deadline_ms / 1000 if deadline_ms > 0 else None
         source_fingerprint = context_source_fingerprint(state)
+        from app.services.invocation_scope import current_invocation
+        invocation = current_invocation()
+        if paper_scope and invocation is None:
+            raise ValueError('paper subset requires a server-signed v2 invocation')
         idempotency_key = hashlib.sha256(json.dumps({
+            **({"invocation_attempt": invocation[1]} if invocation else {}),
             "session": state.get("session_id") or "",
             "operation_sequence": state.get("user_operation_sequence") or 0,
             "role": role.value,
@@ -217,6 +235,7 @@ class AgentController:
                 'end_year': state.get('end_year'), 'minimum_references': state.get('required_reference_count'),
                 'citation_protocol': 'paper_id-v1', 'acceptance_criteria': expected_output or []},
             input_artifact_refs=input_artifact_refs or [],
+            paper_scope=list(paper_scope),
             expected_output=expected_output or [],
             budget=effective_budget,
             source_state_version=source_state_version(state),
@@ -228,7 +247,7 @@ class AgentController:
         evidence_before = evidence_snapshot(state, operation) if invalidate_evidence else None
         from app.database.runtime_repository import RuntimeConflict
         if runtime:
-            runtime.begin_task(task, state.get("agent_execution_budget") or {})
+            runtime.begin_task(task, state.get("agent_execution_budget") or {}, resource_state=state)
         try:
             state["agent_execution_status"] = "running"
             with task_scope(task.task_id) if runtime else nullcontext():
@@ -251,7 +270,7 @@ class AgentController:
                 settle_checked_candidate(candidate)
                 from app.agent.delivery import review_published_delivery
                 review_published_delivery(candidate)
-            invalidate_changed_evidence(candidate, operation, evidence_before)
+            invalidate_changed_evidence(candidate, operation, evidence_before, paper_scope=paper_scope)
             commit_action(candidate)
             if consume_mandatory_action and result.status.value == "completed":
                 # WHY: 已选动作与任务结果必须进入同一持久化快照；否则进程在
@@ -266,6 +285,8 @@ class AgentController:
                 # WHY: 观察与研究提交进入同一检查点，恢复后不会留下未配对调用或重复执行。
                 from app.agent.react_context import record_tool_observation
                 record_tool_observation(candidate, result.model_dump(mode="json"))
+                # WHY: 合并、失效清理与观察构造也消耗时间；正式提交前重新确认Action期限。
+                check_execution()
                 runtime.snapshot(candidate, task=task, result=result,
                                  ledger=candidate.get("agent_execution_budget") or {})
                 ledger = state.get("agent_execution_budget")

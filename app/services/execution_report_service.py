@@ -12,7 +12,7 @@ import re
 import time
 import zipfile
 
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from app.core.config import get_settings
 from app.database.models import ResearchArtifactModel, ResearchCheckpointModel, ResearchTaskModel, ResearchRuntimeModel
 from app.services.execution_report_collector import collect_report, safe
@@ -58,16 +58,20 @@ def freeze_source(db,cap):
         for row in fetched:
             artifacts[row.artifact_id]={'artifact_type':row.artifact_type,'payload':json.loads(row.payload_json)}
             refs.update(x for x in re.findall(r'artifact://(art-[a-f0-9]+)',row.payload_json) if x not in artifacts)
+    from app.services.execution_progress import events_for_owner
+    events = events_for_owner(db, sid, getattr(cap, 'owner', None))
+    attempted_ids=[e['payload']['task_id'] for e in events if e['event_type']=='task_started' and e['payload'].get('task_id')]
     tasks=[{'task_id':x.task_id,'expected_version':x.expected_version,'operation':x.operation,
         'status':x.status,'result':json.loads(x.result_json or '{}')} for x in db.scalars(select(ResearchTaskModel).where(
-            ResearchTaskModel.session_id==sid,ResearchTaskModel.expected_version>=cap.start_version,
-            ResearchTaskModel.expected_version<end).order_by(ResearchTaskModel.expected_version))]
+            ResearchTaskModel.session_id==sid,or_(
+                (ResearchTaskModel.expected_version>=cap.start_version) & (ResearchTaskModel.expected_version<end),
+                ResearchTaskModel.task_id.in_(attempted_ids))).order_by(ResearchTaskModel.expected_version))]
     runtime=db.scalar(select(ResearchRuntimeModel).where(ResearchRuntimeModel.session_id==sid,ResearchRuntimeModel.owner==getattr(cap,'owner',None)))
     if runtime is not None:final['agent_execution_budget']=json.loads(runtime.budget_json)
     old={x.get('decision_id') for x in baseline.get('main_agent_decisions',[])}
     for state in [final,*[x['state'] for x in cps]]:
         state['main_agent_decisions']=[x for x in state.get('main_agent_decisions',[]) if x.get('decision_id') not in old]
-    return {'checkpoints':cps,'final':final,'baseline':baseline,'tasks':tasks,'artifacts':artifacts,'events':[]}
+    return {'checkpoints':cps,'final':final,'baseline':baseline,'tasks':tasks,'artifacts':artifacts,'events':events}
 
 
 def _descriptor(db,sid,rid):
@@ -150,9 +154,11 @@ def build_report(cap,result=None,status=None):
         'budget_ledger':{'llm_requests':max(0,cumulative-start),'retrieval_model_requests':0}}
     report=collect_report(source,capture)
     report['clarification']=(result or {}).get('clarification')
-    task_versions={x['task_id']:x['expected_version'] for x in source['tasks']}
+    task_versions={x['task_id']:x['expected_version'] for x in source['tasks'] if x['status']=='completed'}
+    failed_tasks={x['task_id'] for x in source['tasks'] if x['status']!='completed'}
     for call in report['calls']:
         if call.get('task_id') in task_versions:call['commit_checkpoint']=task_versions[call['task_id']]+1
+        elif call.get('task_id') in failed_tasks:call['commit_checkpoint']=None
         call['input_state']={k:preview(v) for k,v in call.get('input_state',{}).items()}
         for row in call.get('same_role_input_changes',[]):
             row['before']=preview(row['before'],1000);row['after']=preview(row['after'],1000)

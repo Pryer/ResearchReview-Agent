@@ -19,7 +19,8 @@ flowchart TD
 
 ## 核验失败后的选择
 
-- 证据足够但表述越界、引用或结构有问题：Main可委派Writing改写指定章节。
+- 表述、引用或结构问题可局部修复时，任务级 Main 根据当前 Check 的目标、已授权章节和剩余预算发起 Writing 修订。修订一次最多覆盖三个章节。
+- 同一证据和授权下的改写耗尽后，恢复策略可选择 Analysis 重建主张授权。模型发起普通委派时只选择能力，Main 通过注册目录确定角色。
 - 已有材料不足以支持具体主张：Main先委派Analysis诊断，随后可选择Search定向补检索。
 - Search提交的仍是候选。新增论文经过详情补全、Analysis提取与主张授权之后，才可以参与下一版正文。
 - 本次操作完成不等于内容可用或可公开。正文残稿、段落或引用不合格时，Writing返回阻断结果和具体错误，不能标记为available。
@@ -31,6 +32,8 @@ flowchart TD
 ## 候选版本与结束条件
 
 新正文产生后设置`pending_result_validation`。此时Main可委派Check独立验证或明确报告阻断；诊断、重建主张和继续写作不能跳过本版本核验。Controller直接调用也执行该约束。
+
+有当前 Check 失败稿作为修订基线时，任务级 Main 将复验安排为下一次获准的专业动作，恢复账本根据新版本的核验结果结算。
 
 独立核验完成后清除待核验状态，按当前版本比较质量；已有的保留较优候选机制继续生效。主控进展指纹同时考虑待核验状态与验证计数，但同一报告重放不会制造进展。
 
@@ -48,7 +51,7 @@ flowchart TD
 
 首批详情和证据池仍按约1.5倍引用要求处理，并可根据实际证据和引用损耗扩充。候选量、可用证据量、主张授权量与公开引用量分别记录。数量冗余不能替代逐条主张支持检查，也不会为凑数降低相关性准入。
 
-关键实现：`app/agent/quality_feedback.py`、`action_registry.py`、`main_loop.py`、`graph.py`、`delegation_recovery.py`及`slot_extractor.py`。新增行为回归见`tests/test_main_quality_loop.py`，外部模型在离线测试中均为替身。
+关键实现：`app/agent/quality_feedback.py`、`action_registry.py`、`task_main.py`、`graph.py`、`delegation_recovery.py`及`slot_extractor.py`。新增行为回归见`tests/test_main_quality_loop.py`，外部模型在离线测试中均为替身。
 # 2026-11-11 轨迹修复补充
 
 门禁汇总负责阻断，逐句核验报告负责定位。恢复诊断从完整逐句报告补齐主张与章节目标，不依赖 Main 摘要中最多展示的弱主张数。仅当前核验报告可派生执行目标，旧报告继续保留为诊断材料。

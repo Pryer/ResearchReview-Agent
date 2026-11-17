@@ -7,7 +7,7 @@ import json
 import pytest
 
 from app.agent.context_builder import build_main_agent_context
-from app.agent.main_policy import AgentDecisionError, MainAgentPolicy
+from tests.reference_v1.main_policy import AgentDecisionError, MainAgentPolicy
 
 
 class JsonLLM:

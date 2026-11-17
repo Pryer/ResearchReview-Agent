@@ -6,6 +6,8 @@ Semantic Scholar 提供免费的学术搜索 API，无需 key（有速率限制�
 
 from __future__ import annotations
 
+from app.services.tool_execution import research_tool
+
 import threading
 import time
 from typing import List, Optional
@@ -180,6 +182,9 @@ def _request_json(url: str, params: dict) -> Optional[dict]:
     return None
 
 
+
+
+@research_tool('paper_search')
 def search_semantic_scholar(
     query: str,
     start_year: int,
@@ -270,6 +275,7 @@ def parse_semantic_scholar_response(response_json: dict) -> List[PaperMetadata]:
     return papers
 
 
+@research_tool('metadata_read')
 def get_semantic_scholar_detail(identifier: str) -> Optional[dict]:
     """获取 Semantic Scholar 论文详情。
 

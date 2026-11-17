@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from app.services.verifier_profile import verifier_profile, set_verifier_receipt, verifier_receipt
+
 import json
 import hashlib
 import re
@@ -763,7 +765,8 @@ def verify_review_claims(
     previous_claims: Dict[int, ClaimEvidenceResult] = {}
     previous_by_sentence: Dict[str, list[tuple[int, ClaimEvidenceResult]]] = {}
     previous_contract_complete = (
-        previous_report.get("verifier_version") == _ENTAILMENT_VERIFIER_VERSION
+        previous_report.get("verifier_profile") == verifier_profile(llm)
+        and previous_report.get("verifier_version") == _ENTAILMENT_VERIFIER_VERSION
         and previous_report.get("evidence_input_fingerprint") == _evidence_input_fingerprint(paper_cards)
     )
     for item in (previous_report.get("claims") or []) if isinstance(previous_report, dict) else []:
@@ -915,8 +918,13 @@ def verify_review_claims(
     )
     output = report.model_dump()
     output["verifier_version"] = _ENTAILMENT_VERIFIER_VERSION
+    output["verifier_profile"] = verifier_profile(llm)
     output["evidence_input_fingerprint"] = _evidence_input_fingerprint(paper_cards)
     output["entailment_cache_stats"] = cache_stats
+    output["verifier_executions"] = llm_batch_stats.pop("execution_identities", [])
+    if reused_sentences:
+        # WHY: 局部复验保留未改句子的原核验来源，不能把缓存复用记为本轮新调用。
+        output["verifier_executions"].extend(previous_report.get("verifier_executions") or [])
     output["entailment_llm_batch_stats"] = llm_batch_stats
     output["verification_scope"] = {
         "mode": "local" if local_mode else "full",
@@ -967,10 +975,11 @@ def _evidence_input_fingerprint(cards: List[Dict[str, Any]]) -> str:
 
 
 
-def _entailment_fingerprint(claim: ClaimEvidenceResult) -> str:
+def _entailment_fingerprint(claim: ClaimEvidenceResult, llm=None) -> str:
     """绑定主张、证据片段、验证器与阈值策略，任一变化即自动失效。"""
     payload = {
         "version": _ENTAILMENT_VERIFIER_VERSION,
+        "verifier_profile": verifier_profile(llm),
         "evidence_policy": EVIDENCE_POLICY_VERSION,
         "claim": re.sub(r"\s+", " ", _clean_claim(claim.sentence)).strip().casefold(),
         "citations": sorted(str(value) for value in claim.citations),
@@ -1071,7 +1080,7 @@ def _apply_llm_entailment(
     for claim in claims:
         if not has_semantic_verification_evidence(claim):
             continue
-        fingerprint = _entailment_fingerprint(claim)
+        fingerprint = _entailment_fingerprint(claim, llm)
         fingerprints[claim.claim_id] = fingerprint
         cached = cache.get(fingerprint)
         if isinstance(cached, dict) and str(cached.get("label") or "") in {
@@ -1090,6 +1099,7 @@ def _apply_llm_entailment(
         if fingerprint:
             cache[fingerprint] = dict(result)
 
+    batch_stats["execution_identities"] = [result.get("execution_identity", {"status": "unreported"}) for result in results.values()]
     policy = get_review_threshold_policy()
     hard_issues = {
         "factual_claim_without_citation", "citation_not_found",
@@ -1192,6 +1202,7 @@ def _llm_entailment_results(
         from app.prompt.claim_verification import CLAIM_ENTAILMENT_PROMPT
         prompt = CLAIM_ENTAILMENT_PROMPT.format(payload_json=json.dumps(payload, ensure_ascii=False))
         try:
+            set_verifier_receipt(None)
             response = llm.complete(
                 prompt,
                 response_format="json_object",
@@ -1214,7 +1225,9 @@ def _llm_entailment_results(
                 if claim_id not in valid_ids or label not in {"entailed", "contradicted", "insufficient"}:
                     invalid_result = True
                     continue
-                results[claim_id] = {**item, "label": label}
+                results[claim_id] = {**item, "label": label,
+                    "execution_identity": verifier_receipt() or {"status": "unreported"},
+                    "verifier_profile": verifier_profile(llm)}
             missing_results = valid_ids - results.keys()
             if batch_stats is not None and (invalid_result or missing_results):
                 batch_stats["failed"] += 1

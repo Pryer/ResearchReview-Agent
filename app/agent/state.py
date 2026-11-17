@@ -25,6 +25,11 @@ class ResearchAgentState(TypedDict, total=False):
     agent_orchestration_mode: str
     agent_operation_mode: str
     agent_mandatory_actions: List[Dict[str, Any]]
+    # WHY: 委派与策略游标由运行时持有，不投影给专业Handler，也不计作研究产物。
+    architecture_version: int
+    active_delegation_id: str
+    delegation_control: Dict[str, Any]
+    task_main_control: Dict[str, Any]
     user_clarifications: List[str]
     clarification: Dict[str, Any]
     artifact_manifest: Dict[str, Any]

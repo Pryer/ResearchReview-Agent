@@ -8,7 +8,7 @@ import pytest
 
 from app.agent.execution import AgentCancelledError
 from app.agent.execution_budget import AgentBudgetExceeded, AgentExecutionStale
-from app.agent.main_loop import MainAgentLoop
+from tests.reference_v1.main_loop import MainAgentLoop
 from app.agent.sidecar import ActionSidecar
 from app.core.config import get_settings
 from app.core.exceptions import LLMProviderUnavailableError

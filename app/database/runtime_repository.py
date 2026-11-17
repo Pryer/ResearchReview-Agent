@@ -34,6 +34,10 @@ def lease_clock(db):
 class ResearchRuntimeRepository:
     def __init__(self, db, session_id, *, ttl=1800):
         self.db, self.session_id = db, session_id
+        self.thread_id = threading.get_ident()
+        self._persistence_engine = db.get_bind()
+        from app.services.persistence_writer import PersistenceWriter, WorkerRuntime
+        self._worker_runtime = WorkerRuntime(PersistenceWriter(self))
         self.owner = uuid4().hex
         self.ttl = ttl
         self.version = 0
@@ -44,9 +48,14 @@ class ResearchRuntimeRepository:
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
 
+    def for_current_thread(self):
+        if threading.get_ident() == self.thread_id:
+            return self
+        return self._worker_runtime
+
     @contextmanager
     def transaction(self):
-        # WHY: 同一执行的章节线程共用数据库 Session，所有账本访问串行且及时提交。
+        # WHY: 同一Repository串行短事务；Worker由PersistenceWriter在所属线程另建Session。
         with self.lock:
             try:
                 yield self.db
@@ -90,7 +99,8 @@ class ResearchRuntimeRepository:
                     # WHY: 两个进程首次创建同一会话时，唯一键只负责建行，租约 CAS 决定所有权。
                     if self._row() is None:
                         raise
-            now = time.time()
+            # WHY: 领取可能等待写锁；资格判断和新租约期限都必须按SQL真正执行时计时。
+            now = lease_clock(self.db)
             changed = self.db.execute(update(Runtime).where(
                 Runtime.session_id == self.session_id,
                 or_(Runtime.owner.is_(None), Runtime.lease_until <= now),
@@ -101,6 +111,15 @@ class ResearchRuntimeRepository:
             row = self._row()
             self.version = row.version
             saved = json.loads(row.budget_json)
+            # WHY: 工具回执未落盘不能当作未调用；未知状态不自动重放，也不重复计费。
+            tool_results = set(self.db.scalars(select(Event.event_key).where(
+                Event.session_id == self.session_id, Event.event_key.like('tool-result:%'))))
+            for started in self.db.scalars(select(Event).where(
+                Event.session_id == self.session_id, Event.event_type == 'tool_started')):
+                call_id = started.event_key.removeprefix('tool-start:')
+                if 'tool-result:' + call_id not in tool_results:
+                    self.event('tool-result:' + call_id, 'tool_interrupted',
+                               {'call_id': call_id, 'status': 'uncertain'})
             # WHY: 请求已离开进程而结果未知时，保留预留费用，禁止假设免费并自动重试。
             for attempt in self.db.scalars(select(Attempt).where(
                 Attempt.session_id == self.session_id, Attempt.status == "running"
@@ -187,7 +206,68 @@ class ResearchRuntimeRepository:
                 raise AgentExecutionCancelled("persisted cancellation requested")
             return row
 
-    def snapshot(self, state, *, task=None, result=None, ledger=None, failed_task=None):
+    def _authorize_tool_context(self, payload):
+        from app.agent.registry.tool_registry import TOOLS, tools_for_action
+        from app.database.delegation_repository import DelegationRepository
+        from app.database.models import ResearchInvocationModel
+        from app.schemas.delegation_schema import ActionInvocation
+        self._owned_row_for_write(live=True)
+        repo = DelegationRepository(self)
+        row, grant = repo.read(payload['delegation_id'])
+        saved = self.db.get(ResearchInvocationModel, payload['invocation_id'], populate_existing=True)
+        invocation = ActionInvocation.model_validate_json(saved.invocation_json) if saved else None
+        if (not saved or saved.delegation_id != grant.delegation_id or saved.status != 'running'
+                or saved.task_id != payload['task_id'] or row.status != 'running'
+                or grant.revision != payload['grant_revision'] or invocation.grant_revision != grant.revision
+                or invocation.action != payload['action'] or invocation.expected_version != repo.version()
+                or payload['action'] not in grant.allowed_actions
+                or payload['tool'] not in TOOLS or payload['tool'] not in tools_for_action(invocation.action)):
+            raise RuntimeConflict('tool invocation is stale or outside its grant')
+        return grant, invocation
+
+    def begin_tool_call(self, payload):
+        with self.transaction():
+            self._authorize_tool_context(payload)
+            self.event('tool-start:' + payload['call_id'], 'tool_started',
+                       {**payload, 'execution_owner': self.owner})
+
+    def persist_tool_artifact(self, context, kwargs):
+        from app.services.action_resources import persist
+        return persist(self, context, kwargs)
+
+    def read_tool_artifact(self, context, kwargs):
+        from app.services.action_resources import resolve
+        return resolve(self, context, kwargs)
+
+    def section_cache(self, context, descriptor, text=None):
+        from app.services.section_recovery_cache import access
+        return access(self, context, descriptor, text)
+
+    def validate_tool_resources(self, context, tool, arguments, boundary):
+        from app.services.paper_resources import validate
+        return validate(self, context, tool, arguments, boundary)
+
+    def record_tool_resources(self, context, tool, arguments, result, guard):
+        from app.services.paper_resources import record_result
+        return record_result(self, context, tool, arguments, result, guard)
+
+    def finish_tool_call(self, call_id, receipt):
+        with self.transaction():
+            if self._owned_row_for_write() is None:
+                # WHY: 迟到回执不写入新owner执行；未决start由接管时标记uncertain。
+                return False
+            start = self.db.scalar(select(Event).where(Event.session_id == self.session_id,
+                Event.event_key == 'tool-start:' + call_id))
+            if start is None or json.loads(start.payload_json).get('execution_owner') != self.owner:
+                raise RuntimeConflict('tool receipt has no matching execution')
+            terminal = self.db.scalar(select(Event).where(Event.session_id == self.session_id,
+                Event.event_key == 'tool-result:' + call_id))
+            if terminal is not None:
+                return False
+            self.event('tool-result:' + call_id, 'tool_finished', {'call_id': call_id, **receipt})
+            return True
+
+    def snapshot(self, state, *, task=None, result=None, ledger=None, failed_task=None, legacy_migration=None):
         """提交检查点、任务结果、资料引用与事件；CAS 失败则全部回滚。"""
         from app.services.research_artifact_service import ResearchArtifactService
         with self.transaction():
@@ -198,6 +278,9 @@ class ResearchRuntimeRepository:
             ).values(version=Runtime.version + 1))
             if changed.rowcount != 1:
                 raise RuntimeConflict("snapshot CAS rejected stale/cancelled execution")
+            if legacy_migration is not None:
+                from app.services.legacy_checkpoint_migration import apply_metadata
+                apply_metadata(self, legacy_migration)
             if task is not None:
                 changed = self.db.execute(update(Task).where(
                     Task.task_id == task.task_id, Task.session_id == self.session_id,
@@ -215,12 +298,27 @@ class ResearchRuntimeRepository:
                 if changed.rowcount != 1:
                     raise RuntimeConflict("failed task is no longer active")
                 self.event("terminal:" + task_id, "task_" + status, {"task_id": task_id})
+            if task is not None:
+                from app.services.invocation_scope import current_invocation
+                current = current_invocation()
+                if current:
+                    from app.database.delegation_repository import DelegationRepository
+                    DelegationRepository(self).commit(current[0], task, result)
+                else:
+                    from app.database.models import ResearchWorkVersionModel
+                    # WHY: 已建立v2业务版本的会话，兼容single提交也必须推进同一版本。
+                    self.db.execute(update(ResearchWorkVersionModel).where(
+                        ResearchWorkVersionModel.session_id == self.session_id
+                    ).values(version=ResearchWorkVersionModel.version + 1))
             # 研究快照外置重数据；任务补丁及提示词不进入运行日志。
             private = {k: v for k, v in state.items() if k not in {
                 "main_agent_context", "main_context_snapshot", "_runtime_version",
             }}
             artifacts = ResearchArtifactService(self.db)
             stored = artifacts.externalize_state(self.session_id, private)
+            if task is not None and current:
+                from app.services.action_resources import record_commit
+                record_commit(self, current[0], task, stored)
             artifacts.validate_payload(stored, max_bytes=8 * 1024 * 1024)
             encoded = dumps(stored)
             version = self.version + 1
@@ -235,7 +333,7 @@ class ResearchRuntimeRepository:
         self.version = version
         state["_runtime_version"] = version
 
-    def begin_task(self, task, ledger):
+    def begin_task(self, task, ledger, *, resource_state=None):
         with self.transaction():
             row = self._owned_row_for_write(live=True)
             existing = self.db.scalar(select(Task).where(Task.session_id == self.session_id,
@@ -246,8 +344,20 @@ class ResearchRuntimeRepository:
             self.db.add(Task(task_id=task.task_id, session_id=self.session_id,
                 idempotency_key=task.idempotency_key, operation=task.operation,
                 expected_version=self.version, status="running"))
+            from app.services.invocation_scope import current_invocation
+            current = current_invocation()
+            if current:
+                from app.database.delegation_repository import DelegationRepository
+                self.db.flush()
+                DelegationRepository(self).bind_task(current[0], task)
+                if resource_state is None:
+                    raise RuntimeConflict('v2 task requires authoritative resource inputs')
+                from app.services.action_resources import register_inputs
+                register_inputs(self, task, current[0], resource_state)
             row.budget_json = dumps(ledger)
-            self.event("task:" + task.task_id, "task_started", {"operation": task.operation})
+            self.event("task:" + task.task_id, "task_started", {"operation": task.operation,
+                **({'task_id': task.task_id, 'role': task.role.value, 'delegation_id': current[0].delegation_id,
+                    'invocation_id': current[0].invocation_id} if current else {})})
 
     def completed_task(self, idempotency_key):
         """按数据库唯一键读取历史结果，避免hydrate整个历史列表。"""
@@ -279,7 +389,10 @@ class ResearchRuntimeRepository:
             self.db.add(Attempt(attempt_id=attempt_id, session_id=self.session_id,
                 task_id=task_id, reserved_tokens=reservation, status="running"))
             row.budget_json = dumps(ledger)
-            self.event("attempt:" + attempt_id, "attempt_started", {"task_id": task_id})
+            from app.services.tool_execution import current_tool_call_id
+            call_id = current_tool_call_id()
+            self.event("attempt:" + attempt_id, "attempt_started",
+                       {"task_id": task_id, **({'tool_call_id': call_id} if call_id else {})})
         return attempt_id
 
     def persist_budget(self, ledger):

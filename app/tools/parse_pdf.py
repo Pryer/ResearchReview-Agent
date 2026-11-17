@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from app.services.tool_execution import research_tool
+
 import re
 import hashlib
 from pathlib import Path
@@ -19,6 +21,7 @@ from app.utils.text_cleaner import clean_parsed_text
 logger = get_logger(__name__)
 
 
+@research_tool('pdf_parse')
 def parse_pdf(pdf_path: str, *, paper_id: str | None = None) -> Dict[str, Any]:
     """解析 PDF 返回结构化文本。
 

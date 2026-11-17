@@ -8,7 +8,7 @@ from app.agent import graph, recovery_loop
 from app.agent.action_registry import allowed_actions, recovery_handoff_action
 from app.agent.context_builder import build_main_agent_context
 from app.agent.evidence_recovery import targeted_search_kind
-from app.agent.main_loop import _progress_fingerprint
+from tests.reference_v1.main_loop import _progress_fingerprint
 from app.agent.nodes.verification import claim_plan_node, claim_evidence_gate_node
 from app.agent.deliverable_router import check_generation_readiness
 from app.core.config import get_settings
@@ -279,7 +279,7 @@ def test_route_validation_counts_as_progress_but_diagnostic_history_does_not():
 
 @pytest.mark.parametrize('terminal', ['blocked', 'failed', 'cancelled'])
 def test_terminal_recovery_does_not_remain_started(monkeypatch, terminal):
-    from app.agent.main_loop import MainAgentLoop
+    from tests.reference_v1.main_loop import MainAgentLoop
     state = _state()
     state['active_quality_recovery'] = {'action': 'TARGETED_SEARCH'}
     state['quality_recovery_history'] = [{'action': 'TARGETED_SEARCH', 'outcome': 'started',
@@ -293,7 +293,7 @@ def test_terminal_recovery_does_not_remain_started(monkeypatch, terminal):
 
 
 def test_blocked_recovery_with_pending_mandatory_action_is_closed(monkeypatch):
-    from app.agent.main_loop import MainAgentLoop
+    from tests.reference_v1.main_loop import MainAgentLoop
     state = _state()
     state['active_quality_recovery'] = {'action': 'TARGETED_SEARCH'}
     state['quality_recovery_history'] = [{'action': 'TARGETED_SEARCH', 'outcome': 'started',

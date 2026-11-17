@@ -28,6 +28,7 @@ from app.frontend.progress_labels import (
     recovery_progress_view,
 )
 from app.frontend.query_utils import build_agent_request_payload
+from app.frontend.job_presentation import terminal_job_message, can_download_draft
 
 st.set_page_config(
     page_title="ResearchReview-Agent Chat",
@@ -151,27 +152,6 @@ def _is_clarification_answer(messages: list[dict]) -> bool:
     return False
 
 
-def _result_metadata(result: dict) -> dict:
-    return {
-        "status": result.get("status"),
-        "execution_report": result.get("execution_report"),
-        "body": result.get("body") or "",
-        "clarification": result.get("clarification"),
-        "paper_cards": result.get("paper_cards") or [],
-        "claim_verification": result.get("claim_verification") or {},
-        "steps": result.get("steps") or [],
-        "references": result.get("references") or [],
-        "intent": result.get("intent"),
-        "topic": result.get("topic"),
-        "quality_gate": result.get("quality_gate") or {},
-        "quality_recovery_decision": result.get("quality_recovery_decision") or {},
-        "quality_recovery_history": result.get("quality_recovery_history") or [],
-        "reference_coverage_stats": result.get("reference_coverage_stats") or {},
-        "source_diagnostics": (result.get("search_report") or {}).get("source_diagnostics") or result.get("source_diagnostics") or [],
-        "session_id": result.get("session_id"),
-    }
-
-
 def _finish_job(job: dict) -> None:
     active = st.session_state.active_job or {}
     session_id = active.get("session_id")
@@ -179,23 +159,8 @@ def _finish_job(job: dict) -> None:
         st.session_state.active_job = None
         return
 
-    status = job.get("status")
-    if status in {"completed", "partial", "blocked", "needs_clarification"}:
-        result = job.get("result") or {}
-        if job.get("execution_report"):result["execution_report"]=job["execution_report"]
-        answer = result.get("answer") or "✅ 任务已完成。"
-        add_message(session_id, "assistant", answer, _result_metadata(result))
-    elif status == "cancelled":
-        add_message(session_id, "assistant", "⏹ 任务已取消，后续步骤未再执行。", {"execution_report":job.get("execution_report")})
-    else:
-        from app.agent.public_errors import public_result_failure_reason
-        reason = job.get("error") or public_result_failure_reason(job.get("result"))
-        add_message(
-            session_id,
-            "assistant",
-            f"❌ 任务失败：{reason}",
-            {"execution_report":job.get("execution_report")},
-        )
+    answer, metadata = terminal_job_message(job)
+    add_message(session_id, "assistant", answer, metadata)
     st.session_state.active_job = None
 
 
@@ -213,7 +178,12 @@ def render_active_job() -> None:
     total = max(int(job.get("progress_total") or 14), 1)
     step = describe_job_step(job.get("current_step") or "等待执行")
     st.info(f"后台任务：{status} · {step}")
-    st.progress(min(current / total, 1.0), text=f"进度 {current}/{total}")
+    execution = job.get('execution_progress') or {}
+    if execution.get('architecture_version') == 2:
+        from app.frontend.progress_labels import describe_execution_progress
+        st.caption(describe_execution_progress(execution))
+    else:
+        st.progress(min(current / total, 1.0), text=f"进度 {current}/{total}")
     available=job.get("available_delivery") or {}
     if available.get("body"):
         with st.expander("阅读已生成的草稿", expanded=True):
@@ -387,9 +357,7 @@ def render_message_metadata(metadata: dict, *, allow_actions: bool = False) -> N
             render_references_compact(references)
     if (
         allow_actions
-        and (metadata.get("delivery_status") == "draft" or metadata.get("status") == "partial")
-        and (metadata.get("draft_released") is True or quality_gate.get("draft_released") is True)
-        and str(metadata.get("body") or "").strip()
+        and can_download_draft(metadata)
     ):
         st.download_button(
             "下载带限制说明的草稿",

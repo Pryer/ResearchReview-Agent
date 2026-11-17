@@ -1,0 +1,32 @@
+{
+  "source_sha256": {
+    "app/agent/main_loop.py": "b3c2bbf9eef96aeab8bffc5e6f92634ac5fd146ee8b942c9a75072c06dd72a51",
+    "app/agent/main_policy.py": "fbb377e0d3697923fe9a81bd868a2a24c2f31247ba88654950cce99742728d31",
+    "app/agent/subagents/loop.py": "c03ca913f01d65f4f441c48d14353b4cdd1a56358ae6d797f073a18aa7a9ac8a",
+    "app/agent/delegation_context.py": "2f1dea584e1b3c24e7f1bca99043ae5dbacdbb8baddf166029b033cc54aa4f6a"
+  },
+  "test_modules": [
+    "test_action_sidecar.py",
+    "test_agent_completion_regressions.py",
+    "test_agent_graph.py",
+    "test_autonomous_recovery_handoff.py",
+    "test_check_agent.py",
+    "test_context_compaction_regressions.py",
+    "test_context_polish.py",
+    "test_context_selection_repair.py",
+    "test_context_writer_repair.py",
+    "test_draft_delivery_policy.py",
+    "test_execution_reports.py",
+    "test_generation_stop_recovery.py",
+    "test_global_evidence_gate.py",
+    "test_hybrid_retrieval_integration.py",
+    "test_main_agent_loop.py",
+    "test_main_agent_policy.py",
+    "test_main_delegation_context.py",
+    "test_main_quality_loop.py",
+    "test_react_context.py",
+    "test_research_memory_retrieval.py",
+    "test_subagent_react.py",
+    "test_writing_action_boundaries.py"
+  ]
+}

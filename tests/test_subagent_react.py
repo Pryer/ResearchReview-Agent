@@ -8,10 +8,10 @@ from sqlalchemy.orm import Session
 
 from app.agent.controller import AgentController
 from app.agent.execution_budget import AgentBudgetExceeded, AgentExecutionCancelled, budget_scope
-from app.agent.main_loop import MainAgentLoop
-from app.agent.main_policy import AgentDecisionError
+from tests.reference_v1.main_loop import MainAgentLoop
+from tests.reference_v1.main_policy import AgentDecisionError
 from app.agent.react_context import ReActContext, encode
-from app.agent.subagents.loop import SubagentLoop
+from tests.reference_v1.subagent_loop import SubagentLoop
 from app.core.config import get_settings
 from app.database.models import Base
 from app.schemas.agent_decision_schema import AgentDecision
@@ -449,7 +449,7 @@ def test_next_mandatory_action_is_not_executed_without_its_own_dequeue():
 def test_delegation_metadata_does_not_mutate_registry_or_execution_contract():
     from app.agent.action_registry import tool_schemas
     from app.agent.context_builder import build_main_agent_context
-    from app.agent.main_policy import MainAgentPolicy
+    from tests.reference_v1.main_policy import MainAgentPolicy
     before = copy.deepcopy(tool_schemas(["search_and_rank"]))
     llm = ScriptedLLM({"main_agent_decision": [("search_and_rank", {"delegation_message": "补充有来源的论文"})]})
     policy = MainAgentPolicy(llm)

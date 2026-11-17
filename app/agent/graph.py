@@ -1,7 +1,7 @@
 """Agent 工作流编排。
 
 ``run_research_agent`` / ``continue_research_agent`` / ``regenerate_research_agent``
-是三个公共入口，统一进入五字段主 Agent 的单动作决策循环。历史状态在执行入口
+是三个公共入口，统一进入任务级 Main 与专业任务运行时。历史状态在执行入口
 规范为自主编排；节点权限、预算、提交版本复核与质量门禁仍由代码裁决。
 
 本文件同时承载写作质量边界（主张对齐、引用一致性、引用缺口修复与草稿回滚）和
@@ -82,15 +82,15 @@ def _draft_fingerprint(state):
     )}})
 
 
-def _run_autonomous_pipeline(
+def build_research_actions(
     state: ResearchAgentState,
     *,
     should_cancel: Callable[[], bool] | None = None,
     progress_callback: Callable[[str, int, int], None] | None = None,
     local_verification: Dict[str, Any] | None = None,
-) -> Dict[str, Any]:
-    """以五字段主控循环驱动既有研究节点；门禁仍由确定性代码执行。"""
-    from app.agent.main_loop import MainAgentLoop
+    llm=None,
+):
+    """构建共享业务Handler与交付验收器；生产与离线验证共用这一个组合根。"""
 
     if should_cancel and should_cancel():
         raise AgentCancelledError("任务已取消")
@@ -99,7 +99,7 @@ def _run_autonomous_pipeline(
     settings = get_settings()
     state["check_protocol_version"] = 1
     require_rag_runtime(settings)
-    llm = _get_llm()
+    llm = llm if llm is not None else _get_llm()
     if state.get("agent_operation_mode") == "verification_only" and not state.get("agent_mandatory_actions"):
         # WHY: 用户/恢复阶梯已选定只重验，模型不能用 finish 或 blocked
         # 跳过本轮验证；检查点恢复也必须继续履行同一动作。
@@ -230,7 +230,7 @@ def _run_autonomous_pipeline(
             current["target_section_ids"] = list(arguments["section_ids"])
         current.pop("quality_gate", None)
         current["writer_attempt_issues"] = []
-        _generate_deliverables_or_block(current, should_cancel=should_cancel)
+        _generate_deliverables_or_block(current, should_cancel=should_cancel, llm=_role_llm(llm, 'writing'))
         from app.services.writer_support import substantive
         if (current.get('writer_attempt_issues') or current.get('writer_candidates')) and not substantive(current.get('review')) and substantive(previous.get('review')):
             issues = copy.deepcopy(current.get('writer_attempt_issues') or [])
@@ -377,12 +377,25 @@ def _run_autonomous_pipeline(
             return True
         return False
 
-    status = MainAgentLoop(llm).run(
-        state,
-        handlers=handlers,
-        finish_validator=_finish,
-        should_cancel=should_cancel,
-    )
+    from app.agent.registry.agent_registry import validate_registry
+    validate_registry(handlers)
+    return handlers, _finish
+
+
+def _run_autonomous_pipeline(
+    state: ResearchAgentState, *, should_cancel=None, progress_callback=None, local_verification=None,
+) -> Dict[str, Any]:
+    """唯一生产路径：任务级Main与统一专业运行时。"""
+    from app.agent.task_main import TaskMainLoop
+    llm = _get_llm()
+    handlers, finish = build_research_actions(state, should_cancel=should_cancel,
+        progress_callback=progress_callback, local_verification=local_verification, llm=llm)
+    status = TaskMainLoop(llm).run(state, handlers=handlers, finish_validator=finish, should_cancel=should_cancel)
+    return _complete_research_pipeline(state, status, progress_callback=progress_callback)
+
+
+def _complete_research_pipeline(state, status, *, progress_callback=None):
+    """按真实终态执行恢复结算与公开输出投影。"""
     state["result_status"] = status
     if (status == "blocked" and state.get("intent") != "search_papers"
             and not state.get("quality_gate") and not str(state.get("review") or "").strip()
@@ -422,8 +435,8 @@ def _run_autonomous_pipeline(
     return _build_output(state)
 
 
-@research_budget
 @with_execution_report
+@research_budget
 def run_research_agent(
     user_query: str,
     current_year: Optional[int] = None,
@@ -1237,6 +1250,9 @@ def _build_output(state: ResearchAgentState) -> Dict[str, Any]:
             "existing_limitations", "verified_results", "target_length",
             "unsupported_task_guard",
             "state_schema_version",
+            # WHY: 终态/直接Python输出也必须保留v2恢复游标；服务随后保存结果时不能退回旧状态形状。
+            "architecture_version", "active_delegation_id", "delegation_control", "task_main_control",
+            "legacy_checkpoint_migration",
             "delivery_mode", "effective_config", "publication_reviews", "published_versions", "delivery_status", "published_artifact_ref",
             "published_draft_version", "verification_status", "requirements_satisfied", "delivery_metrics",
             "finalization_phase", "finalization_reason", "search_query_ledger", "extraction_cache", "retrieval_screening_cache",
@@ -1357,8 +1373,8 @@ def _restore_explicit_constraint_markers(state: ResearchAgentState) -> None:
                 state[key] = request[key]
 
 
-@research_budget
 @with_execution_report
+@research_budget
 def continue_research_agent(
     research_state: Dict[str, Any],
     should_cancel: Callable[[], bool] | None = None,
@@ -1430,8 +1446,8 @@ def _build_literature_matrix(state: ResearchAgentState) -> List[Dict[str, Any]]:
     ]
 
 
-@research_budget
 @with_execution_report
+@research_budget
 def regenerate_research_agent(
     research_state: Dict[str, Any],
     should_cancel: Callable[[], bool] | None = None,
@@ -1530,7 +1546,7 @@ def regenerate_research_agent(
         if (recovery_plan.get("preparatory_actions") or state.get("active_quality_recovery")
                 or state.get("best_effort_generation") or state.get("force_taxonomy_remediation")):
             # WHY: 质量恢复阶梯或用户已选定重写/最佳努力，主 Agent 不能先
-            # 报告终止而跳过该动作。必做步骤仍由同一 MainAgentLoop 的注册
+            # 报告终止而跳过该动作。必做步骤仍由同一任务运行时的注册
             # 动作、任务权限、预算和提交版本校验执行。
             mandatory: list[dict[str, Any]] = list(recovery_plan.get("preparatory_actions") or [])
             if recovery_plan["mode"] == "full_rebuild" and state.get("paper_cards"):

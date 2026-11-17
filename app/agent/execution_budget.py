@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.services.tool_execution import research_tool
+
 import time
 import json
 import threading
@@ -22,6 +24,10 @@ class AgentBudgetExceeded(RuntimeError):
 class AgentFinalizationRequired(AgentBudgetExceeded):
     """Soft research stop: return to Main; total budget remains usable for writing."""
     pass
+
+
+class AgentActionTimeout(AgentBudgetExceeded):
+    """单次Action尝试超时；不得提交部分候选，费用和计算缓存保留。"""
 
 
 class AgentExecutionCancelled(AgentCancelledError):
@@ -54,8 +60,8 @@ def is_control_exception(exc: BaseException) -> bool:
     if isinstance(exc, LLMProviderUnavailableError):
         return True
     from app.database.runtime_repository import RuntimeConflict
-
-    return isinstance(exc, RuntimeConflict)
+    from app.agent.react_context import ContextBudgetExceeded
+    return isinstance(exc, (RuntimeConflict, ContextBudgetExceeded))
 
 
 def _runtime_check(runtime):
@@ -81,6 +87,7 @@ def _runtime_persist_budget(runtime, ledger):
 _ACTIVE = ContextVar("research_budget", default=None)
 _ACTION_DEPTH = ContextVar("research_action_depth", default=0)
 _RESEARCH_STAGE = ContextVar("research_stage", default="")
+_ACTION_DEADLINE = ContextVar('research_action_deadline', default=None)
 _LOCK = threading.RLock()
 
 
@@ -168,7 +175,32 @@ def check_execution():
         if current["cancel"] and current["cancel"]():
             raise AgentExecutionCancelled("research execution cancelled")
         if time.monotonic() >= current["deadline"]:
+            action_deadline = _ACTION_DEADLINE.get()
+            if action_deadline is not None and action_deadline <= current['deadline']:
+                raise AgentActionTimeout('section revision action deadline exceeded')
             raise AgentBudgetExceeded("research execution deadline exceeded")
+
+
+@contextmanager
+def action_time_budget(seconds):
+    current = _ACTIVE.get()
+    if current is None:
+        raise RuntimeError('action deadline requires an active research budget')
+    original = current['deadline']
+    own_deadline = time.monotonic() + seconds
+    parent = _ACTION_DEADLINE.get()
+    if parent is not None:
+        own_deadline = min(parent, own_deadline)
+    deadline = min(original, own_deadline)
+    token = _ACTION_DEADLINE.set(own_deadline)
+    # WHY: Worker继承同一执行预算；现有HTTP/模型超时自然取Action和全局期限的较小值。
+    current['deadline'] = deadline
+    try:
+        check_execution()
+        yield
+    finally:
+        current['deadline'] = original
+        _ACTION_DEADLINE.reset(token)
 
 
 def consume(kind: str, amount: int = 1):
@@ -251,6 +283,9 @@ def submit_with_context(executor, fn, *args):
     return executor.submit(copy_context().run, run)
 
 
+
+
+@research_tool('llm_completion')
 def budgeted_create(client, *, on_response=None, operation="", **kwargs):
     """真实 provider 请求前预留，返回后结算；重试与备用分别记账。"""
     check_execution()
@@ -310,6 +345,8 @@ def budgeted_create(client, *, on_response=None, operation="", **kwargs):
                     attempt_id = runtime.reserve_attempt(active_task_id(), reservation, ledger)
                 except RuntimeConflict as exc:
                     raise AgentExecutionStale(str(exc)) from exc
+        # WHY: 持久预留可能等待写锁；确认后再次检查取消和期限，禁止失权后发请求。
+        check_execution()
         requested = True
         response = client.chat.completions.create(**kwargs)
         usage = getattr(response, "usage", None)
@@ -363,7 +400,14 @@ def research_budget(fn):
         state["user_operation_sequence"] = int(state.get("user_operation_sequence") or 0) + 1
         bound.arguments[key] = state
         with budget_scope(state, bound.arguments.get("should_cancel")):
-            return fn(*bound.args, **bound.kwargs)
+            from app.services.durable_execution_service import standalone_execution_scope
+            with standalone_execution_scope(state) as owned_runtime:
+                result = fn(*bound.args, **bound.kwargs)
+                if owned_runtime is not None and isinstance(result, dict) and result.get('status') not in {'cancelled', 'failed'}:
+                    check_execution()
+                    owned_runtime.snapshot(result.get('research_state') or state,
+                        ledger=state['agent_execution_budget'])
+                return result
     return wrapped
 
 
@@ -440,6 +484,12 @@ def update_finalization(state, *, requests=0, tokens=0):
     current = active_budget()
     if not current or not draft_first(state): return False
     ledger=current["ledger"]
+    if state.get('intent') == 'search_papers' and not state.get('core_deliverables'):
+        # WHY: 纯检索由代码格式化论文列表，无写作/Check收尾阶段；总预算、截止时间和取消仍按原规则检查。
+        state.pop('finalization_phase', None)
+        state.pop('finalization_reason', None)
+        ledger.pop('finalization_reserve', None)
+        return False
     reserve=finalization_reserve(state)
     ledger["finalization_reserve"]=reserve
     request_limit=int(ledger.get("model_request_limit") or 0)

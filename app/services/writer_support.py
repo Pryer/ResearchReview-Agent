@@ -7,6 +7,7 @@ import re
 from uuid import uuid4
 
 from app.services.evidence_support import independent_spans
+from app.services.tool_execution import research_tool, current_tool_context
 
 
 def substantive(text):
@@ -17,6 +18,7 @@ def substantive(text):
     return len(re.sub(r"\s", "", body)) >= 40
 
 
+@research_tool('candidate_write')
 def record_candidate(state, plan, stage, raw, normalized, validation, *, issues=()):
     from app.agent.task_context import current_task_brief
     from app.services.research_execution_service import artifact_store
@@ -48,7 +50,8 @@ def record_candidate(state, plan, stage, raw, normalized, validation, *, issues=
                 artifact_type="writer_candidate", payload={"value": value[i:i+16000]},
                 identity=f"{candidate_id}:{i}", provenance={"candidate_id": candidate_id,
                     "delegation_id": brief.get("delegation_id"), "offset": i}))
-        store.repo.db.flush()
+        if current_tool_context() is None:
+            store.repo.db.flush()
         record.pop("raw_text")
         record.pop("normalized_text")
         record["artifact_refs"] = refs
@@ -60,7 +63,12 @@ def record_candidate(state, plan, stage, raw, normalized, validation, *, issues=
     return candidate_id
 
 
+@research_tool('candidate_read')
 def read_candidate(state, candidate_id, *, role="writing"):
+    context = current_tool_context()
+    if context is not None:
+        from app.agent.action_registry import action_spec
+        role = action_spec(context.action).role.value
     record = next((r for r in state.get("writer_candidates") or [] if r["candidate_id"] == candidate_id), None)
     if not record:
         raise ValueError("writer candidate not found")

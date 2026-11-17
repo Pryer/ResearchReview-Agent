@@ -43,6 +43,7 @@ class AgentTask(BaseModel):
     objective: str
     constraints: dict[str, Any] = Field(default_factory=dict)
     input_artifact_refs: list[str] = Field(default_factory=list)
+    paper_scope: list[str] = Field(default_factory=list)
     expected_output: list[str] = Field(default_factory=list)
     budget: dict[str, int] = Field(default_factory=dict)
     source_state_version: str

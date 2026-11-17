@@ -55,6 +55,31 @@ def test_unpublished_candidate_stays_private_after_hard_stop():
     assert not out['body'] and out['delivery_status']=='none'
 
 
+def test_publication_freezes_review_materials_before_private_rewrite():
+    import copy
+    s=draft_state()
+    s['claim_verification']={'claims':[{'sentence':'published sentence', 'support_status':'unsupported'}]}
+    frozen=copy.deepcopy({k:s[k] for k in ('paper_cards','claim_verification','citation_validation')})
+    record=publish_draft(s)
+    s['claim_verification']['claims'][0]['sentence']='PRIVATE replacement'
+    s['paper_cards'][0]['title']='PRIVATE metadata'
+    s['citation_validation']['valid']=False
+    out=delivery_output(s, {'status':'blocked', **{k:s[k] for k in frozen}})
+    for key, value in frozen.items():
+        assert record[key]==value and out[key]==value
+    out['paper_cards'][0]['title']='UI mutation'
+    assert s['published_versions'][0]['paper_cards']==frozen['paper_cards']
+
+
+def test_historical_publication_never_borrows_current_review_materials():
+    s=draft_state();publish_draft(s)
+    for key in ('claim_verification','paper_cards','citation_validation'):
+        s['published_versions'][0].pop(key)
+    s['claim_verification']={'claims':[{'sentence':'PRIVATE replacement'}]}
+    out=delivery_output(s, {'status':'blocked','claim_verification':s['claim_verification']})
+    assert out['body'] and out['claim_verification']=={} and out['paper_cards']==[]
+
+
 def test_strict_policy_does_not_publish_shortfall():
     s=draft_state();s['delivery_mode']='strict'
     with pytest.raises(ValueError,match='not authorized'):publish_draft(s)
@@ -195,7 +220,7 @@ def test_actual_retrieval_tokens_reduce_status_balance():
 
 def test_committed_subagent_result_needs_no_second_model_report(monkeypatch):
     from tests.test_subagent_react import ScriptedLLM,state
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     from app.agent.controller import AgentController
     from app.schemas.agent_decision_schema import AgentDecision
     s=state();s['delivery_mode']='strict'
@@ -226,7 +251,7 @@ def test_download_marks_exact_unverified_claims():
 
 
 def test_first_usable_draft_is_published_before_more_research():
-    from app.agent.main_loop import MainAgentLoop
+    from tests.reference_v1.main_loop import MainAgentLoop
     from tests.test_subagent_react import ScriptedLLM
     s=draft_state();s['pending_result_validation']=True
     llm=ScriptedLLM({'main_agent_decision':['request_finish']})
@@ -237,7 +262,7 @@ def test_first_usable_draft_is_published_before_more_research():
 
 
 def test_exact_main_arguments_are_dispatched_without_model_replanning():
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     from app.agent.controller import AgentController
     from app.schemas.agent_decision_schema import AgentDecision
     from tests.test_subagent_react import ScriptedLLM,state

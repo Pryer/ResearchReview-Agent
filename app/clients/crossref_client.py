@@ -6,6 +6,8 @@ Crossref 提供 DOI 元数据查询，常用于补全论文详情。
 
 from __future__ import annotations
 
+from app.services.tool_execution import research_tool
+
 from typing import List, Optional
 import random
 import threading
@@ -189,6 +191,9 @@ def _request_crossref(
     return None
 
 
+
+
+@research_tool('paper_search')
 def search_crossref(
     query: str,
     start_year: int,
@@ -231,6 +236,7 @@ def search_crossref(
     return parse_crossref_response(resp.json())
 
 
+@research_tool('metadata_read')
 def get_crossref_detail(doi: str) -> Optional[dict]:
     """根据 DOI 获取详情。"""
     url = f"{CROSSREF_API_URL}/{doi}"

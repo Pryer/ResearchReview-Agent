@@ -880,6 +880,21 @@ def test_same_input_rewrite_rejection_is_not_reselected_across_restart():
     assert decision.action == RecoveryAction.REBUILD_CLAIMS
 
 
+def test_exhausted_rewrite_basis_changes_the_recovery_recommendation():
+    from app.agent.generation_recovery import repair_basis_fingerprint, rewrite_attempt_exhausted
+
+    state = _count_failure(eligible=6, authorized=4)
+    state["quality_gate"]["blocking_issues"] = [{"code": "claim_evidence_quality_not_met"}]
+    state["quality_recovery_history"] = [{
+        "action": RecoveryAction.REWRITE_SECTIONS.value,
+        "input_fingerprint": "earlier-wording",
+        "repair_basis_fingerprint": repair_basis_fingerprint(state),
+        "outcome": "no_progress",
+    }]
+    assert rewrite_attempt_exhausted(state)
+    assert decide_generation_recovery(state, max_actions=6).action == RecoveryAction.REBUILD_CLAIMS
+
+
 def test_substantive_evidence_change_reallows_same_rewrite_strategy():
     """T09：只有证据实质变化（新指纹）才允许重新尝试同一重写策略。"""
     state = _count_failure(eligible=6, authorized=4)

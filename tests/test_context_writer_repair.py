@@ -239,7 +239,7 @@ def test_rejected_backfill_retains_original_response_and_reason():
 
 
 def test_historical_completed_operation_does_not_mark_new_delegation_completed():
-    from app.agent.delegation_context import subagent_context
+    from tests.reference_v1.delegation_context import subagent_context
     s=state();s['subagent_sessions']['analysis']={'messages':[]}
     s['agent_task_results']=[{'task_id':'old','role':'analysis','operation':'extract_paper_cards','status':'completed','outcome':'succeeded','findings':['旧卡片完成']}]
     active={'id':'new','operation':'extract_paper_cards','objective':'补检索后重新抽取','arguments':{},
@@ -251,7 +251,7 @@ def test_historical_completed_operation_does_not_mark_new_delegation_completed()
 
 
 def test_early_help_report_cannot_claim_an_execution_observation():
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     from app.agent.controller import AgentController
     from app.schemas.agent_decision_schema import AgentDecision
     from tests.test_subagent_react import ScriptedLLM, state as agent_state, report

@@ -46,9 +46,25 @@ def task_settings_scope(state):
         sources = {key: "cli" if key.upper() in cli_keys else "environment" if key.upper() in os.environ else "dotenv" if key.upper() in dotenv_keys else "default" for key in values}
         state["effective_config"] = {"version": POLICY_VERSION, "revision": 1, "values": values,
             "sources": sources, "fingerprint": hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()}
-    values = state["effective_config"]["values"]
+    values = dict(state["effective_config"]["values"])
+    # WHY: 旧引擎已退役；只升级执行架构，目标、交付策略、模型和累计预算保持原任务值。
+    architecture = values.get('agent_architecture_version')
+    if architecture not in {None, 'v1', 'v2'}:
+        raise ValueError('unsupported persisted architecture version')
+    if architecture != 'v2':
+        values['agent_architecture_version'] = 'v2'
+    values.setdefault('agent_v2_local_strategy', 'deterministic')
+    values.setdefault('agent_v2_analysis_strategy', 'inherit')
+    # WHY: 新角色配置不追溯改变旧任务；显式修订后才使用新的模型身份。
+    values.setdefault('agent_role_model_profiles', '{}')
     # Validate task values against field bounds without letting process changes alter a task.
     settings = type(base)(**{**base.model_dump(), **values})
+    if architecture != 'v2':
+        # WHY: 所有历史配置通过容量/参数校验后才提交升级标记，失败时不污染原快照。
+        snapshot = state['effective_config']
+        snapshot.setdefault('architecture_migration', {'from': architecture or 'v1', 'to': 'v2'})
+        snapshot['values'] = dict(values)
+        snapshot['fingerprint'] = hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
     token = _TASK_SETTINGS.set(settings)
     try:
         yield settings

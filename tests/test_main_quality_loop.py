@@ -5,7 +5,7 @@ import pytest
 
 from app.agent.action_registry import allowed_actions
 from app.agent.controller import AgentController
-from app.agent.main_loop import MainAgentLoop, _progress_fingerprint
+from tests.reference_v1.main_loop import MainAgentLoop, _progress_fingerprint
 from app.agent.quality_feedback import diagnose_quality_recovery, quality_feedback, complete_main_recovery
 from app.agent.delegation_recovery import search_once, settle_after_analysis
 from app.schemas.agent_task_schema import AgentRole, AgentTaskOutcome

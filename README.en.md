@@ -143,17 +143,19 @@ See [examples/](examples/README.md) for related-work requests, scope clarificati
 ```mermaid
 flowchart TD
     U[Research request] --> M[Main: scope and planning]
-    M --> S[Search: retrieval, ranking, and metadata]
-    S --> A[Analysis: evidence and claim planning]
-    A --> W[Writing: candidate draft]
-    W --> C[Check: claims and citations]
-    C --> F{Quality feedback}
-    F -->|Gather evidence or revise| M
-    F -->|Request delivery| D[Controller: version and publication checks]
+    M --> G[Server issues a delegation grant]
+    G --> R[DelegationRunner: authorized actions]
+    R --> S[Search / Analysis / Writing / Check]
+    S --> C[Controller: validate and commit]
+    C --> F[Delegation outcome and quality feedback]
+    F --> M
+    M -->|Request delivery| D[Draft or formal publication gates]
     D --> O[Draft, references, and verification results]
 ```
 
-Main selects one research task per turn. Specialist agents execute in their own contexts and report back. The Controller manages action permissions, budgets, cancellation, and state commits. Papers, source passages, authorized claims, and citations are linked through the workflow, while quality feedback guides subsequent research.
+Main selects a capability, goal, and scope. The server resolves the role and issues a delegation grant. Search and Analysis may run several authorized actions per delegation, with checks and commits at each step. The default local strategy is deterministic. Search and Analysis can use ReAct, and Analysis can opt into Plan-and-Act. Writing and Check use direct execution.
+
+Writing submits a candidate. An independent Check binds its findings to that version and its evidence. Main can delegate a targeted revision and arrange a fresh check. Background jobs and direct Python entry points share the same checkpoint and budget ledger.
 
 See [the architecture guide](ARCHITECTURE.md) for modules and data flow.
 
@@ -162,6 +164,15 @@ See [the architecture guide](ARCHITECTURE.md) for modules and data flow.
 Across three topics and 480 frozen candidates with mixed-source relevance labels, RRF + reranking achieved **94.91% Precision@72**, compared with **87.04%** for Dense (**+7.87 percentage points**). Recall@120 was 95.43% and 95.70%, respectively.
 
 In 12 controlled verification cases, all 8 citation/numeric faults were detected and all 4 unchanged controls were accepted. Deterministic checks and the semantic-model-assisted run produced identical classifications. See [the benchmark report](docs/benchmarks.md) for methodology, reproduction, and cache replay results.
+
+| v2 validation | Observed result |
+| --- | --- |
+| Full regression in `rragent` | **2,769 tests passed**, including native pgvector integration |
+| Live exact-title lookup over HTTP | The background job completed and exported an execution report |
+| Draft-first review | One run delivered an editable `partial` draft with five references |
+| Strict research-status review | Structure checks passed, followed by revision, independent checking, and claim rebuilding. Two unreferenced synthesis claims blocked formal delivery |
+
+Independent review against the original sources is pending. See the [v2 validation record](docs/validation/2026-11-18-v2-live-closeout.md) for conditions, constraints, and outcomes.
 
 ## Documentation
 

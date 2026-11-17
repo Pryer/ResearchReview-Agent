@@ -220,6 +220,35 @@ class ResearchEventModel(Base):
     payload_json: Mapped[str] = mapped_column(Text)
 
 
+class ResearchWorkVersionModel(Base):
+    """业务提交版本独立于运行检查点版本。"""
+    __tablename__ = "research_work_versions"
+    session_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ResearchDelegationModel(Base):
+    __tablename__ = "research_delegations"
+    delegation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(128), index=True)
+    grant_json: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), default="running")
+    next_step: Mapped[int] = mapped_column(Integer, default=0)
+    observation_cursor: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ResearchInvocationModel(Base):
+    __tablename__ = "research_action_invocations"
+    __table_args__ = (UniqueConstraint("delegation_id", "step_index"),)
+    invocation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    delegation_id: Mapped[str] = mapped_column(String(64), index=True)
+    step_index: Mapped[int] = mapped_column(Integer)
+    invocation_json: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    task_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    result_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
 class ResearchMemoryModel(Base):
     __tablename__ = "research_memory_cursors"
     session_id: Mapped[str] = mapped_column(String(128), primary_key=True)

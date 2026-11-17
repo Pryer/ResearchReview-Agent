@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
+from app.services.tool_execution import research_tool
 
 from app.agent.execution_budget import check_execution
 from app.schemas.retrieval_schema import fingerprint
@@ -72,6 +73,7 @@ class PgVectorStore:
                 raise VectorIntegrityError("向量库权限或约束校验失败") from exc
             raise VectorStoreUnavailable("向量库操作失败") from exc
 
+    @research_tool('vector_admin')
     def migrate(self):
         dimension = self.settings.retrieval_embedding_dimension
         sql_path = Path(__file__).resolve().parents[2] / "migrations/vectorstore/001_initial.sql"
@@ -82,6 +84,7 @@ class PgVectorStore:
             if cur.fetchone()["dimension"] != dimension:
                 raise VectorIntegrityError("已安装向量库维度不同，需独立迁移")
 
+    @research_tool('vector_write')
     def register_source(self, tenant, paper_id, source_hash, *, expected_revision=None):
         with self._db() as cur:
             cur.execute("INSERT INTO rra_vector_sources VALUES (%s,%s,1,%s) ON CONFLICT DO NOTHING",
@@ -104,6 +107,7 @@ class PgVectorStore:
         if not row or row["revision"] != revision or row["source_hash"] != spec.source_hash:
             raise VectorIntegrityError("来源版本已失效或被删除")
 
+    @research_tool('vector_write')
     def claim(self, spec: IndexSpec, revision):
         with self._db() as cur:
             self._source(cur, spec, revision)
@@ -151,12 +155,14 @@ class PgVectorStore:
             raise VectorIntegrityError("索引构建所有权或租约失效")
         return row
 
+    @research_tool('vector_write')
     def renew(self, spec, ticket):
         with self._db() as cur:
             self._ticket(cur, spec, ticket)
             cur.execute("UPDATE rra_vector_snapshots SET lease_expires_at=clock_timestamp()+"
                         "(%s * interval '1 second') WHERE id=%s", (self.settings.card_vector_build_lease_seconds,ticket.snapshot_id))
 
+    @research_tool('vector_write')
     def write(self, spec, ticket, chunks, vectors, *, start_order):
         matrix = normalized_vectors(vectors, spec.dimension)
         if len(matrix) != len(chunks):
@@ -173,6 +179,7 @@ class PgVectorStore:
                              chunk["page"],chunk["offset_basis"],chunk["char_start"],chunk["char_end"],chunk["text"],
                              fingerprint(chunk["text"]),vector))
 
+    @research_tool('vector_write')
     def activate(self, spec, ticket):
         with self._db() as cur:
             self._ticket(cur, spec, ticket)
@@ -202,6 +209,7 @@ class PgVectorStore:
             raise VectorIntegrityError("快照不属于当前论文、来源或模型")
         return row
 
+    @research_tool('vector_read')
     def load(self, spec, snapshot, revision):
         with self._db() as cur:
             self._active(cur,spec,snapshot,revision)
@@ -213,6 +221,7 @@ class PgVectorStore:
                 raise VectorIntegrityError("活动快照数量不完整")
             return rows
 
+    @research_tool('vector_read')
     def search(self, spec, snapshot, revision, query, limit):
         if type(limit) is not int or not 1 <= limit <= 512:
             raise VectorIntegrityError("无效向量查询上限")
@@ -225,6 +234,7 @@ class PgVectorStore:
                         (vector,spec.tenant,spec.paper_id,snapshot,vector,limit))
             return [(row["chunk_id"],float(row["score"])) for row in cur.fetchall()]
 
+    @research_tool('vector_admin')
     def delete(self, tenant, paper_id):
         with self._db() as cur:
             cur.execute("DELETE FROM rra_vector_sources WHERE tenant=%s AND paper_id=%s", (tenant,paper_id))

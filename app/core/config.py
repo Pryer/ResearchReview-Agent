@@ -108,6 +108,15 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_base_url: str = "https://api.deepseek.com"
     llm_model: str = "deepseek-v4-flash"
+    agent_role_model_profiles: str = Field(default='{}', max_length=12000)
+    agent_section_revision_timeout_seconds: float = Field(default=300, gt=0)
+
+    @field_validator('agent_role_model_profiles')
+    @classmethod
+    def validate_role_model_profiles(cls, value):
+        from app.core.role_model_profiles import parse_profiles
+        parse_profiles(value)
+        return value
     # DeepSeek V4 是混合推理模型且默认开启思考。综述写作需要稳定产出正文，
     # 因此默认显式关闭 thinking，避免输出预算被 reasoning_content 消耗。
     llm_thinking_enabled: bool = False
@@ -168,6 +177,9 @@ class Settings(BaseSettings):
     search_query_max_attempts: int = Field(default=2, ge=1, le=5)
     search_query_retry_seconds: int = Field(default=60, ge=0)
     agent_main_max_rounds: int = Field(default=96, ge=1)
+    agent_architecture_version: Literal['v2'] = 'v2'
+    agent_v2_local_strategy: Literal['deterministic', 'react'] = 'deterministic'
+    agent_v2_analysis_strategy: Literal['inherit', 'deterministic', 'react', 'plan_and_act'] = 'inherit'
     agent_subagent_max_rounds: int = Field(default=12, ge=1, le=64)
     agent_subagent_no_progress_limit: int = Field(default=3, ge=1)
     agent_main_no_progress_limit: int = 3

@@ -1,144 +1,74 @@
 # Architecture
 
-ResearchReview-Agent uses a layered Python application layout. The production
-implementation is under app/, not src/.
+Production uses one architecture: task-level Main, bounded specialist delegations,
+and a deterministic commit kernel. Search and Analysis default to deterministic
+local flows. Both can use ReAct, and Analysis evidence building can also use Plan-and-Act.
 
 ## Layers
 
-- app/api/: FastAPI HTTP routes. Routes validate requests and delegate to services.
-- app/services/: application services for jobs, conversations, papers, reviews,
-  citations, libraries, and LLM calls.
-- app/agent/: stateful workflow orchestration, planning, routing, nodes, and bounded
-  retrieval/evidence-recovery loops. `main_loop.py` / `main_policy.py` select actions;
-  `controller.py`, `action_contracts.py`, `task_context.py` and `result_merger.py`
-  enforce specialist input/output and commit boundaries.
-  `context_builder.py` supplies the five-field status view; `subagents/loop.py`
-  runs independent Search, Analysis and Writing ReAct loops and structured
-  main/specialist communication. `react_context.py` manages their separate
-  append-only trajectories, usage estimates and compaction epochs.
-- app/clients/: thin adapters for arXiv, Semantic Scholar, OpenAlex, Crossref,
-  and CNKI. They map remote responses to PaperMetadata.
-- app/tools/: single-purpose search, ranking, deduplication, PDF, card,
-  writing-dispatch, and citation operations.
-- app/schemas/: Pydantic contracts shared across layers.
-- app/core/: configuration, logging, security, rate limiting, circuit breakers,
-  metrics, citation syntax, and text-quality infrastructure.
-- app/database/: SQLAlchemy models, SQLite initialization, and repositories.
-  `runtime_repository.py` owns execution leases, task/attempt records, budget
-  persistence and atomic CAS checkpoints.
-- app/deliverables/: deliverable specifications and renderers.
-- app/prompt/: lazy-loaded prompts and writing prompts.
+- app/api and app/services: requests, conversations, jobs, durable execution and resources.
+- app/agent/task_main.py: task-level Main policy and controls.
+- app/agent/runtime: DelegationRunner, strategies, ActionExecutor and shared progress.
+- app/agent/policy and registry: capabilities, scope, admission and acceptance.
+- app/agent/controller.py: task identity, typed input/output, evidence invalidation and atomic commit.
+- app/clients and tools: source adapters and research operations.
+- app/schemas and database: grants, invocations, attempts, leases, budgets and checkpoints.
+- app/deliverables and prompt: writing specifications, renderers and role prompts.
 
 ## Ownership Rules
 
-`main_loop.py` selects one registered task from the five-field context and delegates
-research work to the appropriate specialist loop. Each specialist can choose
-multiple currently eligible role actions through Controller before reporting
-completion, requesting help or reporting a block. `graph.py` supplies the node
-adapters and final quality boundary. New and resumed sessions use this main/specialist
-orchestration path. Historical sessions whose mode is absent or `legacy`
-are normalized at the execution boundary; their evidence, explicit constraints,
-recovery history and consumed budget remain authoritative.
-The artifact repository externalizes heavy editable-state fields and validates
-session, role, type and version on reads. A shared execution ledger covers token
-reservations, search rounds, recovery actions and cancellation/deadline boundaries.
-Retrieval refinement belongs in
-retrieval_loop.py; evidence recovery belongs in recovery_loop.py. External requests
-do not belong in nodes, and writing uses the single
-write_deliverable.py -> deliverables/renderers path.
+Main requests a capability, goal and scope. The server derives the role from the
+profile registry and issues the Grant.
+Effective actions intersect registration, role capabilities, Grant, latest admission
+and remaining budget. Every action independently checks its inputs and version.
+ActionExecutor invokes Controller; ToolExecutor checks external capabilities and
+persists receipts. Billing uses the existing ledger.
 
-Cross-layer data uses Pydantic models where a schema exists. Metadata is authoritative
-from retrieval/verification layers; LLM output cannot overwrite provenance fields.
-
-The full `ResearchAgentState` is the authoritative workflow record. The model
-request combines Stable Prefix, ReAct Trajectory and an Agent Status Bar. The
-rebuildable `MainAgentContext` is the Status Bar payload, containing `goal`, `state`,
-`key_evidence`, `decisions`, and `open_questions`. Specialist tasks use versioned
-operation-level allowlists and typed patches; they cannot change user goals, hard
-constraints or the shared budget. See [context architecture](agent-context-architecture.md).
+Search and Analysis can run multiple authorized actions. Writing and Check use
+direct parameter projection. Writing commits a candidate; independent Check binds
+its report to that candidate and evidence. Main can request targeted section
+revisions, check the new candidate, or delegate claim-plan rebuilding to Analysis
+when the revision limit is reached. Draft and formal publication apply their
+respective source, citation and quality gates.
 
 ## Specialist context and communication
 
-Each role owns a namespace in `subagent_sessions`. It stores that specialist's
-trajectory, communication history, active delegation, usage estimates and archive
-epochs. Context construction first projects the union of inputs allowed by the
-role's action contracts, then builds the five-field status view. Executing an
-individual action applies the narrower operation-specific input and output
-contract again. Full raw documents are not copied into every decision prompt.
-
-The specialist request combines its fixed role/ReAct rules, its own prior goals,
-decisions and real observations, and the latest five-field status. The status
-contains the delegated operation/objective, immutable arguments, evidence references,
-completed operations, round count and six recent messages with the main Agent.
-Other roles' private trajectories are not included. The main Agent receives bounded
-structured reports and can reply through a new delegation; native tools carry an
-optional `delegation_message` that is extracted before research argument validation.
-
-Compaction archives complete observations and bounds the working ledger by item,
-character and actual window limits. New epochs rebuild provider-neutral semantic
-history; native reasoning/tool protocol stays intact only within its epoch.
-`recall_context` searches the current trajectory's reachable archives by evidence
-ID/reference and marks incomplete scans. A new delegation is rejected while another
-is active; current role namespaces are serial session memory, not concurrent worker
-isolation. `status`, `outcome` and `delegation_status` distinguish lifecycle,
-business result and communication state; the main Agent explicitly consumes them.
-
-Research memory has a separate query-driven loop: the main Agent chooses
-`search_research_memory`, the service resolves the session summary and ranks related
-findings, active decisions, open questions and failure events, then bounded results
-enter `state.research_memory`. Explicit `memory_feedback` and subsequent action
-outcomes are appended as audit events. This is same-session lexical retrieval, not
-cross-session/vector search. Historical findings require revalidation; only the latest
-summary supplies decisions and questions. Memory cannot authorize current evidence.
-See the [retrieval contract](agent-context-architecture.md#research-memory-retrieval-loop).
-
-Delegation is synchronous. Per-delegation round/no-progress limits are separate,
-while token, action, retrieval, deadline, cancellation and lease checks share the
-session execution boundary. `report_to_main` is a communication action; it cannot
-release a review or replace citation and evidence gates.
+Main sees the five-field Status Bar. Local planning receives bounded summaries in
+PlanningContext. Each action receives only contract-projected business fields and
+authorized artifact references. Planning summaries never grant raw artifacts.
+Delegations return structured results to Main; suggestions do not authorize work.
+Plans, action results and observation cursors are durable.
+See [context architecture](agent-context-architecture.md).
 
 ## Durable execution and recovery
 
-Conversation service entry points bind the artifact store, shared budget and durable
-execution lease. Action success commits state, artifacts, task result, checkpoint,
-budget and event atomically. Attempts reserve and settle separately, preserving usage
-when a task fails, is cancelled or becomes stale. Public session saves check the
-lease/version too. Direct graph calls remain an in-memory execution mode.
+Jobs and direct Python graph entry points use the same durable kernel. Services
+own an outer scope; standalone calls create one and bind an Artifact Store.
+Nested graph calls reuse their outer scope. Snapshot revisions are independent
+from committed business versions.
 
-Child observations and progress counters commit with each research action. Metadata
-or card changes invalidate dependent claims and gates inside that same commit.
-The parent's pending call is paired when the child reports; reporting and clearing
-the active delegation also share a checkpoint. Recovery resumes an active child
-before a new main decision, preserving completed operations and local counters.
+Known historical delegations migrate after goal/source checks and durable
+completion-proof validation. Unknown formats stop explicitly. Old frozen
+architecture settings upgrade to v2 after full settings validation; constraints,
+delivery mode, models and cumulative spend remain authoritative.
 
-History entries are archived before display truncation; summaries consume only new
-events after a durable cursor. Session reads restore newer committed research
-checkpoints. `AgentRequest.resume_from_checkpoint=true` explicitly resumes interrupted
-sessions with the original constraints and accumulated budget; it does not replay an
-uncertain external request or take over a live lease. Pending clarification and
-completed-session revision retain their separate entry points.
+Calls with durable starts but missing receipts become uncertain on takeover.
+Cancellation, ownership loss and CAS conflicts prevent late business commits.
+Binary rollback requires stopping writes and restoring a compatible backup.
+Changing local strategy is a separate operation.
 
-Fixed prompt rules precede dynamic material. Native requests send tool definitions
-only through `tools`; JSON fallback retains the textual catalog. Section reuse hashes
-the actual authorized writer inputs and deterministic draft, then reruns final
-validation. Observed cache usage is distinct from conservative budget estimates.
-See [runtime and cache boundaries](agent-runtime-and-cache.md).
+## Runtime Components and retired code
 
-## Runtime Components
+The former Main loop, policy, subagent loop and delegation-context builder have
+been removed from app/. Historical protocol references live only under
+tests/reference_v1 with an explicit manifest. Production and scripts cannot import
+them; a static regression checks that boundary.
 
-- API entry: run_api.py -> app.main:app
-- Streamlit entry: run_chat_frontend.py -> app/frontend/chat_app.py
-- Database default: data/research_review.db
-- Configuration: app/core/config.py, .env, and .env.example
-- Additive execution-table migration: scripts/migrate_agent_runtime.py; also run by
-  normal startup table creation. Restart services after deployment.
-- Validation evidence: [2026-09-22 report](validation/2026-09-22-runtime-cache.md).
-  The real 3-paper commit/recovery smoke passed; the 40-reference deliverable remained
-  budget-blocked, so it is not recorded as a completed end-to-end review.
-- Latest local context-reliability regression (2026-10-16): 1,610 full-suite tests and
-  119 targeted tests passed, with 19 new compaction/recall/outcome cases. External calls were
-  mocked; no new live CNKI/LLM end-to-end or cost/performance result was established.
-
-The root ARCHITECTURE.md remains a detailed operational reference. This document is
-the stable architecture contract; update both when a structural change affects
-developers or operators.
+API and Streamlit use run_api.py and run_chat_frontend.py. Configuration lives in
+app/core/config.py and .env.example. Restart services after upgrading code.
+The latest `rragent` regression passed 2,769 tests, including native pgvector
+integration. Live runs verified exact-title retrieval through the HTTP Job API
+and produced a partial draft with five references. Formal review quality,
+independent human review and strategy comparisons remain open.
+See the [live validation record](validation/2026-11-18-v2-live-closeout.md) and
+[runtime retirement record](validation/2026-11-18-v2-runtime-retirement.md).

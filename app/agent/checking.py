@@ -17,11 +17,12 @@ def check_input_fingerprint(state):
             "start_year", "end_year", "year_range_explicit", "strict_year_range", "max_papers_explicit", "selected_scope", "core_deliverables",
             "requested_sections", "target_length", "language", "citation_style", "writing_version",
             "evidence_snapshot_fingerprint", "best_effort_on_failure", "best_effort_generation")
+    from app.services.verifier_profile import verifier_profile
     settings = get_settings()
     from app.core.config import get_review_threshold_policy
     return _stable_hash({"inputs": {k: state.get(k) for k in keys},
         "policy": EVIDENCE_POLICY_VERSION, "claim_support_policy": CLAIM_SUPPORT_POLICY_VERSION,
-        "verifier": _ENTAILMENT_VERIFIER_VERSION,
+        "verifier": _ENTAILMENT_VERIFIER_VERSION, "verifier_profile": verifier_profile(),
         "pipeline": RAG_PIPELINE_VERSION, "thresholds": get_review_threshold_policy().snapshot(),
         "verification_enabled": settings.enable_claim_verification,
         "context_limit": settings.claim_verification_max_context_chars,
@@ -105,6 +106,9 @@ def build_check_report(state, fingerprint, *, failure=""):
             report.issues.append(ResultIssue(code="claim_contradicted_by_evidence", reason="主张与原文矛盾，必须修正或移除",
                 claim_id=str(claim.get("claim_id") or ""), section_id=str(claim.get("section_id") or ""),
                 blocks_draft=True, blocks_final=True, verification_status="contradicted"))
+    from app.services.verifier_profile import verifier_profile
+    report.verifier_profile = verifier_profile()
+    report.execution_identities = verification.get("verifier_executions") or []
     state["check_report"] = report.model_dump(mode="json")
     if incomplete:
         state["generation_blocked"] = True

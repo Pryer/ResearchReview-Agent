@@ -9,13 +9,12 @@ from pydantic import ValidationError
 from app.agent.action_registry import ACTION_REGISTRY, tool_schemas, validate_arguments
 from app.agent.react_context import ContextBudgetExceeded, ReActContext, encode
 from app.core.exceptions import NativeToolsUnsupportedError
-from app.prompt.agent_system import MAIN_AGENT_SYSTEM_PROMPT
+from tests.reference_v1.prompts import MAIN_AGENT_SYSTEM_PROMPT
 from app.schemas.agent_decision_schema import AgentDecision, MemoryFeedback
 from app.schemas.context_schema import MainAgentContext
 
 
-class AgentDecisionError(ValueError):
-    pass
+from app.agent.runtime.errors import AgentDecisionError
 
 
 class MainAgentPolicy:
@@ -140,7 +139,7 @@ class MainAgentPolicy:
                     )
                 self.argument_validator(decision.action, decision.arguments)
                 if self.delegation_messages:
-                    from app.agent.delegation_context import validate_planning
+                    from tests.reference_v1.delegation_context import validate_planning
                     validate_planning(decision, context)
                 elif decision.plan or decision.context_selection is not None:
                     raise AgentDecisionError("subagent cannot replace the main plan or context selection")
@@ -160,8 +159,10 @@ class MainAgentPolicy:
                 # WHY: 已确认不支持的协议在本会话保持 JSON，避免每轮重试破坏前缀并额外计费。
                 trajectory.data["native_tools_disabled"] = True
                 last_error = "原生工具协议不可用，请按 JSON 动作契约返回。"
+            except ContextBudgetExceeded:
+                raise
             except (ValidationError, ValueError, TypeError) as exc:
-                from app.agent.delegation_context import ContextSelectionError
+                from tests.reference_v1.delegation_context import ContextSelectionError
                 last_error = str(exc)
                 if isinstance(exc, ContextSelectionError):
                     repair_context = exc.repair_context()

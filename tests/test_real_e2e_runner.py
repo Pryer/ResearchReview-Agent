@@ -70,6 +70,9 @@ runner._runtime_precheck = check
     assert process.returncode == 0, process.stdout + process.stderr
     output, manifest = load_run(runs)
     assert manifest["task_status"] == "precheck_passed"
+    assert manifest['configuration']['agent_architecture_version'] == 'v2'
+    assert manifest['configuration']['agent_v2_local_strategy'] == 'deterministic'
+    assert manifest['configuration']['python_environment'] == Path(sys.executable).parent.name
     assert manifest["primary_pre_registered_run"] is False
     assert manifest["source_tree_unchanged"] is True
     assert manifest["rag_runtime_observed"]["vector_query_successes"] == 0
@@ -160,6 +163,28 @@ def test_readable_span_does_not_turn_contradicted_claim_into_human_support():
     summary = evaluation_summary({"task_status": "blocked"}, rows, [])
     assert summary["human_support_rate"]["value"] is None
     assert summary["citation_readback_rate"]["value"] == 1
+
+
+def test_released_draft_review_uses_frozen_report_instead_of_later_candidate():
+    state=fixture_state();frozen=copy.deepcopy(state['claim_verification'])
+    result={'status':'partial','body':'The method significantly improves performance [1].',
+        'quality_gate':{'draft_released':True},'paper_cards':copy.deepcopy(state['paper_cards']),
+        'claim_verification':frozen,'citation_map':{'p1':1}}
+    state['claim_verification']['claims'][0]['atomic_claims'][0]['text']='PRIVATE replacement'
+    rows=claim_rows(state,result)
+    assert rows[0]['claim']==frozen['claims'][0]['atomic_claims'][0]['text']
+    assert rows[0]['text_scope']=='published' and rows[0]['span_readable']=='true'
+
+
+def test_legacy_released_draft_without_report_exports_actual_unverified_sentences():
+    state=fixture_state()
+    result={'status':'partial','body':'Published actual sentence has evidence [1].\n\n## 参考文献\n\nStudy',
+        'quality_gate':{'draft_released':True},'citation_map':{'p1':1},'paper_cards':state['paper_cards']}
+    rows=claim_rows(state,result)
+    assert len(rows)==1 and rows[0]['claim']=='Published actual sentence has evidence [1].'
+    assert rows[0]['paper_id']=='p1' and rows[0]['automatic_support']=='unknown'
+    assert rows[0]['span_readable']=='unknown' and rows[0]['automatic_verification_status']=='not_completed'
+    assert rows[0]['final_judgement']=='not_reviewed'
 
 
 @pytest.mark.parametrize("change, expected", [("unavailable", "unknown"), ("offset", "false"), ("version", "false"), ("uncited", "unknown")])

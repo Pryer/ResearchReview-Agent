@@ -28,9 +28,31 @@ _EXECUTION_BRIEF = ContextVar("research_execution_brief", default=None)
 def execution_task_brief(task, packet=None):
     value = {"delegation_id": task.task_id, "role": task.role.value, "operation": task.operation,
              "objective": task.objective, "constraints": copy.deepcopy(task.constraints)}
+    from app.services.invocation_scope import current_invocation
+    active = current_invocation()
+    if active is not None:
+        invocation, attempt_id = active
+        # WHY: v2委派、逻辑动作、尝试和数据库Task各有生命周期，不能共用task_id冒充。
+        value.update(stage='action', delegation_id=invocation.delegation_id, task_id=task.task_id,
+            invocation_id=invocation.invocation_id, attempt_id=attempt_id,
+            expected_version=invocation.expected_version, source_fingerprint=invocation.source_fingerprint,
+            input_artifact_refs=list(task.input_artifact_refs))
+    if task.paper_scope:
+        value['paper_scope'] = list(task.paper_scope)
     if packet:
         value["selected_context"] = copy.deepcopy(packet)
     token = _EXECUTION_BRIEF.set(value)
+    try:
+        yield
+    finally:
+        _EXECUTION_BRIEF.reset(token)
+
+
+@contextmanager
+def planning_task_brief(grant, context):
+    token = _EXECUTION_BRIEF.set({'stage': 'planning', 'role': grant.role.value,
+        'delegation_id': grant.delegation_id, 'profile': grant.profile, 'grant_revision': grant.revision,
+        'expected_version': context.get('state_version'), 'source_fingerprint': context.get('source_fingerprint')})
     try:
         yield
     finally:

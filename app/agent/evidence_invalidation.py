@@ -30,9 +30,11 @@ def evidence_snapshot(state, operation):
     }
 
 
-def invalidate_changed_evidence(state, operation, before):
+def invalidate_changed_evidence(state, operation, before, *, paper_scope=()):
     if operation == "extract_paper_cards":
-        current = {str(card.get("paper_id") or "") for card in state.get("paper_cards") or []}
+        # WHY: 子集重建不能因其他旧卡仍存在，就清掉它们尚未完成的重建标记。
+        current = {str(card.get("paper_id") or "") for card in state.get("paper_cards") or []
+                   if not paper_scope or card.get('paper_id') in paper_scope}
         state["pending_card_rebuild_ids"] = [pid for pid in state.get("pending_card_rebuild_ids") or []
                                               if pid not in current]
     if before is None or before["fields"] == evidence_snapshot(state, operation)["fields"]:

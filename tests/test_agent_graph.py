@@ -1645,7 +1645,7 @@ def test_regeneration_clears_stale_readiness_and_section_diagnostics_before_writ
     ))
     monkeypatch.setattr("app.agent.graph._run_claim_evidence_gate", lambda state: None)
 
-    def fake_generate(state, should_cancel=None):
+    def fake_generate(state, should_cancel=None, llm=None):
         observed["stale_readiness"] = state.get("generation_readiness")
         observed["stale_sections"] = state.get("writer_section_diagnostics")
         state["review"] = "## 研究现状\n\n重新生成的正文。"
@@ -1710,7 +1710,7 @@ def test_regeneration_refreshes_existing_evidence_without_expanding_candidate_po
     monkeypatch.setattr("app.agent.graph.extract_card_node", fake_extract)
     monkeypatch.setattr(
         "app.agent.graph._generate_deliverables_or_block",
-        lambda state, should_cancel=None: state.update({"review": "## 研究背景\n\n刷新后的正文。"}),
+        lambda state, should_cancel=None, llm=None: state.update({"review": "## 研究背景\n\n刷新后的正文。"}),
     )
     monkeypatch.setattr("app.agent.graph._verify_generated_draft", completed_verifier(lambda *args, **kwargs: None))
     monkeypatch.setattr(
@@ -1959,7 +1959,7 @@ def test_conservative_regeneration_reuses_routes_and_claim_plan(monkeypatch):
     monkeypatch.setattr("app.agent.graph.claim_plan_node", unexpected)
     monkeypatch.setattr("app.agent.graph.global_evidence_gate_node", unexpected)
 
-    def fake_generate(state, should_cancel=None):
+    def fake_generate(state, should_cancel=None, llm=None):
         state["review"] = "## 研究现状\n\n保守重写后的正文。"
 
     monkeypatch.setattr("app.agent.graph._generate_deliverables_or_block", fake_generate)

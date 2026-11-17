@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+from app.services.tool_execution import research_tool
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from app.agent.execution_budget import submit_with_context
+from app.agent.execution_budget import submit_with_context, is_control_exception
 from copy import deepcopy
 from typing import Any, Dict, List
 
@@ -132,6 +134,8 @@ def fetch_paper_detail(paper: Dict[str, Any]) -> Dict[str, Any]:
                 paper = _merge_enrichment(paper, detail)
                 return paper
         except Exception as e:
+            if is_control_exception(e):
+                raise
             logger.warning("Crossref detail fetch failed: %s", e)
 
     if arxiv_id:
@@ -146,6 +150,8 @@ def fetch_paper_detail(paper: Dict[str, Any]) -> Dict[str, Any]:
                     paper["pdf_url"] = f"https://arxiv.org/pdf/{arxiv_id}"
                     paper["is_open_access"] = True
         except Exception as e:
+            if is_control_exception(e):
+                raise
             logger.warning("arXiv detail fetch failed: %s", e)
 
     # 确保有 pdf_url
@@ -187,6 +193,8 @@ def enrich_with_citation_count(paper: Dict[str, Any]) -> Dict[str, Any]:
                 paper["pdf_url"] = detail["open_access_pdf"]
                 paper["is_open_access"] = True
     except Exception as e:
+        if is_control_exception(e):
+            raise
         logger.debug("Citation enrichment failed: %s", e)
     return paper
 
@@ -214,8 +222,9 @@ def enrich_with_pdf_url(paper: Dict[str, Any]) -> Dict[str, Any]:
         if detail and detail.get("open_access_pdf"):
             paper["pdf_url"] = detail["open_access_pdf"]
             paper["is_open_access"] = True
-    except Exception:
-        pass
+    except Exception as e:
+        if is_control_exception(e):
+            raise
     return paper
 
 
@@ -226,10 +235,15 @@ def _enrich_one_paper(paper: Dict[str, Any]) -> Dict[str, Any]:
         paper = enrich_with_citation_count(paper)
         paper = enrich_with_pdf_url(paper)
     except Exception as e:
+        if is_control_exception(e):
+            raise
         logger.warning("Failed to fetch detail for %s: %s", paper.get("paper_id"), e)
     return paper
 
 
+
+
+@research_tool('metadata_read')
 def fetch_batch_details(
     papers: List[Dict[str, Any]],
     max_workers: int | None = None,
@@ -260,6 +274,8 @@ def fetch_batch_details(
             try:
                 results[index] = future.result()
             except Exception as e:  # pragma: no cover - _enrich_one_paper 已负责降级
+                if is_control_exception(e):
+                    raise
                 logger.warning(
                     "Unexpected detail worker failure for %s: %s",
                     inputs[index].get("paper_id"),

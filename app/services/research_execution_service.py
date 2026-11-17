@@ -63,6 +63,9 @@ def with_artifact_store(fn):
                 from app.services.research_memory_service import ResearchMemoryService
                 with durable_scope(self.db, str(request.session_id), budget_state,
                                    budget_state["agent_execution_budget"], new_research=new_research) as runtime:
+                    if getattr(self, 'execution_job_id', None):
+                        from app.services.execution_progress import bind_job
+                        bind_job(runtime, self.execution_job_id)
                     memory = ResearchMemoryService(self.db)
                     importing = not memory.legacy_imported(str(request.session_id))
                     memory.import_legacy_history(str(request.session_id), saved_state)

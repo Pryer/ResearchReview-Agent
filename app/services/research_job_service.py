@@ -117,6 +117,10 @@ class ResearchJobService:
     def get(self, job_id: str) -> dict[str, Any] | None:
         job=self.repo.get(job_id)
         if not job: return None
+        from app.services.execution_progress import job_progress
+        execution = job_progress(self.db, job)
+        if execution:
+            job['execution_progress'] = execution
         from app.services.research_artifact_service import ResearchArtifactService
         public=ResearchArtifactService(self.db).read_published_delivery(job["session_id"],status=job["status"])
         if public:job["available_delivery"]=public
@@ -262,6 +266,7 @@ class ResearchJobService:
                     progress_callback=progress,
                 )
                 service.execution_report_id=job_id
+                service.execution_job_id=job_id
                 service.defer_execution_report=True
                 if job.get("operation") == "revise":
                     revision = ResearchRevisionRequest.model_validate(job["request"])

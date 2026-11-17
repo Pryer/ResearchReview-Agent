@@ -47,29 +47,11 @@ N 篇；有明确下限时仍同时检查下限。检索列表展示已有作者
 
 ## 数据库事务与预算
 
-Main Agent 的研究动作通过 `subagents/loop.py` 委派给独立专业循环。Search、Analysis、
-Writing 分别保存自己的追加式轨迹、通信历史、压缩 Epoch 与活跃任务。子 Agent
-可连续选择本角色动作，通过 `report_to_main` 汇报完成、请求协助或说明阻断；主控
-可用 `delegation_message` 回复并再次委派。通信不会扩大工具权限或替代证据校验。
+Main 通过 TaskMainLoop 请求能力、目标和资源范围。服务端从 Profile 注册表确定角色并签发 Grant，四角色共用 DelegationRunner。Search 和 Analysis 可连续执行获准 Action，Writing 和 Check 直接投影动作参数。每步经 ActionExecutor 进入同一个 Controller 提交内核。ToolExecutor 校验外部能力并持久化回执。阶段结果以 DelegationResult 返回 Main，后续动作由新的准入检查决定。
 
-`report_to_main.suggested_actions` 只能填写动作注册表中的名称，原生工具和 JSON
-目录均通过枚举公开这一约束；自然语言建议写入 `message`，无建议时返回空列表。
-可以建议其他角色的动作，但主控仍须重新决策并通过授权，不能把建议当作已执行操作。
+Main五字段、局部PlanningContext和具体Action输入分别投影。规划摘要不包含完整原始资料；Handler只读取当前契约允许的字段和资源。委派计划、Invocation、观察游标和累计计数持久化。每个Action独立提交产物、观察、版本及lineage，证据变化在同一提交中撤销过期派生授权。
 
-子 Agent 的决策状态从本角色动作允许输入的并集生成；执行具体动作时，Controller
-再次按该动作的契约投影输入、检查输出和版本。默认每次委派最多 12 轮决策、连续
-3 次无实质进展后停止；检查点恢复保留局部计数。三个角色和主控同步交替执行，
-共用总 Token、动作、检索、截止时间、取消与租约检查。
-
-每次子动作把研究产物、真实观察和进展计数一起提交；元数据或证据卡变化时，依赖
-它们的旧主张与门禁在同一次提交内失效。子 Agent 汇报时才配对主控的待决调用，
-并原子保存汇报及委派结束标记。重启恢复先续接活跃子循环，已提交动作不重放。
-尚未提交的外部调用继续遵循下述 uncertain 边界，不保证远程请求仅执行一次。
-
-`status=completed` 只表示执行结束；`outcome` 表示业务结果，`delegation_status`
-单独表示完成、请求协助或阻断。主控会把非成功业务结果显式反馈到下一轮状态栏，
-幂等复用的阻断结果仍把任务图标记为 blocked；提交诊断补丁不等于准许发布综述。
-当前活跃委派不能被新任务隐式复用，恢复需显式续接；尚未支持同角色并发。
+恢复先续接数据库中的活动委派，已提交动作不重放；进程退出后未知远程结果按uncertain处理。完成工具、满足阶段目标、通过Check和允许交付分别裁决。取消/失权终止观察只补内存，不能覆盖原异常或提交成功状态。
 
 每次观察完整载荷均保存为受控归档。Compaction 后工作记忆最多 8 条、8000 字符，
 并按真实输入预算进一步缩减；累计观察序号不随裁剪重置。新 Epoch 只重建结构化
@@ -77,7 +59,7 @@ Writing 分别保存自己的追加式轨迹、通信历史、压缩 Epoch 与�
 当前轨迹可达历史，返回有界摘要；扫描不完整会明确标记，历史不授予当前证据权限。
 
 持久化路径是 `ResearchConversationService.handle/revise`。执行期数据库对象通过
-ContextVar 传播，不进入模型上下文。直接调用 graph 的测试/脚本仍是内存执行模式。
+ContextVar 传播，不进入模型上下文。直接调用graph也建立持久化作用域；已有服务作用域时复用，预算与Artifact Store不会另起一套。
 
 - `research_runtime`：会话租约、CAS 版本、取消位、最新状态和累计预算。
 - `research_tasks`：动作幂等键、来源版本、运行/完成/失败/阻断/过期/取消/中断状态。
@@ -289,3 +271,78 @@ Controller 在 `fetch_metadata` 提交内比较详情变化并撤销旧证据授
 显式检查点恢复、澄清、论文集合修订以及 blocked 任务的质量恢复继续沿用原任务计数与预算。新研究递增已有操作序号，使同主题的新研究也不会误用上一任务的幂等结果。该边界不提供额外Token或请求额度，也不解除任务原有约束。
 
 retrieval_screening_cache 现在按 execution_cache 类型分片外置，恢复兼容旧的内嵌字典；筛选命中刷新字典顺序，在1024项容量下按最近使用保留热点。完整工作状态和API可编辑研究状态均保留该缓存，内容/范围/模型依赖仍由原缓存键校验。
+
+
+## 架构v2迁移中的接入边界（2026-11-17）
+
+`build_research_actions`提供生产和离线验证共用的业务Handler与交付验收器。`run_search_delegation`是显式的任务级Search服务，必须处于独立durable_scope；它不占据Action task_scope，每一步经同一个Controller独立提交。
+
+活动委派和Invocation保存在数据库中；状态中的active_delegation_id用于恢复定位，已提交委派汇总可以重读。生产旧Main已退役。已知历史活动记录通过目标/来源指纹及提交证明迁移；未知格式明确拒绝，不能只改architecture_version标记绕过迁移。
+
+启动迁移登记Agent Schema版本并验证结构，SQLite用短BEGIN IMMEDIATE事务串行升级。备份回退仅在停写副本演练，不提供运行中的逆向删表操作。完整验证与剩余工作见[重构执行记录](validation/2026-11-17-architecture-v2-s0.md)。
+
+### 任务级Main、局部策略与观察提交
+
+新任务通过 TaskMainLoop 选择研究能力，默认局部策略为 deterministic（v2-B）。历史快照在完整参数校验通过后记录架构升级，保留原模型、交付策略、约束和累计预算。旧 .env 若显式配置 v1，应移除该值或改为 v2。
+
+当前指定恢复动作使用single_action，只有服务端能够签发，绑定唯一Action及不可变参数；legacy_single_v1只保留历史迁移/回读语义。两者共用精确单动作授权与direct执行。完整退役与本地清点见[运行器退役记录](validation/2026-11-18-v2-runtime-retirement.md)。
+
+`AGENT_V2_LOCAL_STRATEGY=deterministic|react` 控制 Search 与 Analysis 的局部决策；`AGENT_V2_ANALYSIS_STRATEGY=inherit|deterministic|react|plan_and_act` 可单独选择 evidence_build 策略。模型计划在执行前校验全部步骤的静态参数，第一步需当前可执行；以后各步继续检查最新授权和输入版本。计划、游标与策略模式持久保存，恢复不重新规划已提交步骤。
+
+Writing/Check 始终走 direct 薄路径；章节修订绑定当前已知且获准的章节，单次最多三章。候选提交后进入独立 Check 门禁。Check 任务的 satisfied 表示核验执行完成，正式交付仍检查报告判定和原 finish_validator。
+
+委派结束时，Main 的 delegate_agent 观察与活动标记清理写入同一快照。提交前崩溃保留标记并重读已完成汇总；提交后恢复已有配对观察，不重放专业动作。Main 同步记录任务决策及五字段报告快照。授权拒绝和业务执行异常分开处理；取消/失权的终止观察仅修改内存。
+
+当前验证和未闭合项见[四角色与任务级Main接入记录](validation/2026-11-17-v2-role-main.md)。工具级全量治理、精确资源lineage、历史活动子Agent迁移及API/报告/前端完整展示继续实施。
+
+### v2工具回执与既有费用账本
+
+专业 Handler 的外部能力现通过 `ToolExecutor` 执行，工具依赖由 `ActionSpec.tool_dependencies` 声明。每次调用重新读取活动 Grant、Invocation、研究 Task 和业务版本，start 持久确认后再检查取消/租约并执行。调用回执不推进研究业务版本或快照版本。
+
+模型仍由原 `budgeted_create` / retrieval HTTP 账本计费，工具层只关联身份和审计，不重复收费。Worker 回执沿用线程内 Session 与串行短事务。接管时，缺少终态的工具 start 标为 uncertain；失败回执只表示调用抛错，不能据此推断免费或无外部执行。
+
+检索、详情、PDF、模型和向量快照已接入；Artifact/候选的后续接入见下节。该批范围、控制异常修复和验证见[工具边界记录](validation/2026-11-17-v2-tool-boundary.md)。
+
+### Artifact输入scope与候选暂存lineage
+
+Artifact和候选读写现已接入v2工具层。Controller创建Task时，按Action输入契约和实际角色冻结资料引用；工具不能通过猜测ID、替换state或传入service角色扩大读取范围。业务Artifact写入同Attempt暂存lineage，正式输出lineage与Action结果、业务版本和检查点一起提交。
+
+并发候选存取经PersistenceWriter使用线程内Session，v2路径不再flush父Session。暂存审计不成为证据授权或发布结果；独立Check与交付门禁继续执行。当前按Artifact引用精确控制，论文/文件级Grant scope继续实施。范围和回归见[Artifact与候选lineage记录](validation/2026-11-17-v2-artifact-lineage.md)。
+
+### 论文参数与可观测进度
+
+Action输入现同时绑定论文标识、下载元数据、文件哈希和向量来源。详情补全、下载与解析的可信回执可扩展同Attempt范围；更换PDF后旧正文source失效，必须匹配解析结果后再访问相应向量来源。显式paper_ids子集Grant的局部抽卡范围见下节。
+
+Job查询兼容增加execution_progress，按实际owner范围汇总委派/动作/工具计数，避免串入后续运行。v2前端显示动态计数；运行报告记录任务分组、工具回执和失败尝试，不为未提交动作补造提交版本。实现范围和测试见[论文文件范围与进度](validation/2026-11-17-v2-paper-scope-progress.md)。
+
+Job绑定同时记录任务配置中的架构版本，所以主控在第一次委派前澄清或停止时，v2仍显示动态计数。终态清空当前角色/动作展示，后台残留的running任务行仅供恢复诊断。工具的completed、failed、uncertain和pending分别计数；接管产生的uncertain回执仍归属于原工具调用所在执行，报告与轮询共用原事件范围，不把未知结果当成成功或免费。
+
+聊天完成消息通过统一投影保留delivery_status、verification_status、requirements_satisfied、draft_released和发布版本。取消/失败后只从服务端available_delivery读取已发布正文和该版本参考文献，不从失败结果提取候选稿；执行终态与交付等级分别保留。澄清问题仍可回答，已发布草稿可同时阅读和下载。下载需要非空正文与已发布标记，不构成新的发布授权。实际路由/组件验证见[产品交付记录](validation/2026-11-18-v2-product-delivery.md)。
+
+### 已知旧委派与局部抽卡
+
+显式进入v2后，已知v1活动委派可转换为精确single授权；已经数据库证明的提交只导入结果，不重新执行。未知格式、目标不符或提交歧义保持拒绝；旧Analysis核验转Check复验。迁移写入复用同一CAS快照，并强制读取最新业务版本拒绝并发覆盖，旧费用、轮次和审计保留。
+
+evidence_build的scope.paper_ids现支持局部卡片重建，按ID合并并保留其他论文和待办；提交后交回Main检查全局授权。该范围不能消费全局mandatory动作或降低用户引用约束。支持格式与剩余范围见[迁移与子集记录](validation/2026-11-17-v2-migration-subset.md)。
+
+### 角色模型与上下文身份
+
+`AGENT_ROLE_MODEL_PROFILES`按Main/四角色选择已有主备通道、模型和参数，默认继承全局配置。配置纳入任务快照；缺少此字段的旧快照使用空配置。委派保存模型、提示和窗口身份，恢复时拒绝混用不同配置。Check配置进入核验指纹，旧模型结论不会自动沿用。
+
+PlanningContext携带最新业务版本与来源指纹；Action简报区分委派、逻辑动作、执行尝试和数据库Task，输入权限继续由原契约裁决。每次实际模型请求前核对完整消息和最终输出额度，包含备用切换和扩额重试；超限原样传播，保留已发生费用。字段及验证见[角色模型与上下文](validation/2026-11-17-v2-role-profiles.md)。
+
+### 章节计算缓存和修订时限
+
+v2分节写作将局部结构校验合格的章节保存为内部计算Artifact，确认落盘后可跨进程恢复。复用要求目标、基稿、计划、章节授权/证据、提示及模型策略指纹一致；缓存命中仍重跑局部检查，完整候选继续一次提交并交Check。缓存不成为公开正文或事实授权。
+
+`AGENT_SECTION_REVISION_TIMEOUT_SECONDS`默认300秒，限定每次修订Action尝试，包含Sidecar与Worker，并取剩余全局期限的较小值。请求超时随剩余期限收窄；Controller正式快照前检查，超时不提交候选，费用与已保存计算缓存保留。协作式边界和验证见[章节恢复记录](validation/2026-11-18-v2-section-recovery.md)。
+
+### 竞态验证与领取时钟
+
+租约领取现与续约/提交采用相同的SQLite执行时钟，资格判断与新期限不复用等待写锁前的Python时间。固定三类各100条屏障调度覆盖取消/提交、接管/提交及ACK/中断，核对已知费用、未决预留、重复回执和已提交动作恢复。清单与有限覆盖范围见[竞态矩阵](validation/2026-11-18-v2-race-matrix.md)。
+
+### 业务控制与发布恢复
+
+v2主控每轮沿用原收尾预算和记忆准备，澄清输出遵守服务端kind/needed契约；发布预检拒绝交回主控继续规划。Controller将发布版本和publish_draft观察在同一快照提交，观察在CAS前只存在于候选内存，不另写成功归档。提交前后恢复均不会留下未配对调用或重复发布版本。
+
+冻结合成材料通过实际写作、引用、独立Check和最终门禁运行；完整范围见[业务闭环记录](validation/2026-11-18-v2-business-flows.md)。真实来源、模型质量与策略收益仍须单独验收。

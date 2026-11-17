@@ -69,7 +69,7 @@ def test_budget_stop_is_visible_even_with_quality_failure(gate_code):
 
 
 def test_failed_full_rebuild_keeps_private_candidate_across_restarts(monkeypatch):
-    from app.agent.main_loop import MainAgentLoop
+    from tests.reference_v1.main_loop import MainAgentLoop
     old_review = '旧证据正文 [old-paper]。'
     old = {'review': old_review, 'references': ['旧文献'], 'claim_plans': [{'route_id': 'old'}],
            'quality_gate': {'passed': False, 'draft_released': False},

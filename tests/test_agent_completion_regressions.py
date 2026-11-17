@@ -453,7 +453,7 @@ def test_native_unsupported_falls_back_to_strict_five_field_json(monkeypatch):
     import httpx
     from openai import BadRequestError
     from app.services.llm_service import LLMService
-    from app.agent.main_policy import MainAgentPolicy
+    from tests.reference_v1.main_policy import MainAgentPolicy
     from app.agent.context_builder import build_main_agent_context
     calls = []
     def respond(**kwargs):

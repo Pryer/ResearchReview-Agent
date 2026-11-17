@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import platform
+import sys
 from importlib.metadata import PackageNotFoundError, version
 
 
@@ -41,7 +42,8 @@ def source_identity(root):
 
 def configuration(settings):
     # WHY: 只导出允许公开的配置值，连接串、端点和密钥均不进入报告。
-    names = ("review_delivery_mode", "agent_main_max_rounds", "agent_finalization_reserve_requests",
+    names = ("agent_architecture_version", "agent_v2_local_strategy", "agent_v2_analysis_strategy",
+             "review_delivery_mode", "agent_main_max_rounds", "agent_finalization_reserve_requests",
              "agent_finalization_reserve_tokens", "agent_finalization_reserve_seconds", "agent_finalization_reserve_main_rounds",
              "agent_deterministic_subagent_report", "retrieval_ranking_mode", "enable_pdf_pipeline", "card_chunk_retrieval_mode",
              "card_vector_backend", "card_vector_db_failure_policy", "card_vector_tenant",
@@ -69,6 +71,7 @@ def configuration(settings):
     from app.core.config import get_review_threshold_policy
     values["quality_thresholds"] = get_review_threshold_policy().snapshot()
     values["python_version"] = platform.python_version()
+    values["python_environment"] = Path(sys.executable).parent.name
     values["dependency_versions"] = {}
     for name in ("pydantic", "SQLAlchemy", "psycopg", "pgvector", "numpy", "PyMuPDF", "requests", "openai", "rank-bm25", "jieba"):
         try:
@@ -175,6 +178,20 @@ def claim_rows(state, result):
     published = (result.get("status") in {"completed", "partial"}
                  and (gate.get("passed") is True or gate.get("draft_released") is True)
                  and any(str(result.get(key) or "").strip() for key in ("body", "review", "related_work", "introduction")))
+    if published and gate.get("draft_released") is True:
+        # WHY: 已发布稿与后续候选可不同版；公开结果中的冻结材料才属于该正文。
+        report = result.get("claim_verification") or {}
+        cards = {p["paper_id"]: p for p in result.get("paper_cards") or []}
+        all_evidence_ids = {s.get("evidence_id") for c in cards.values() for s in c.get("evidence_spans") or []}
+        citation_map = {str(number): pid for pid, number in (result.get("citation_map") or {}).items()}
+        if not report.get("claims"):
+            from app.tools.verify_claims import split_review_sentences
+            from app.core.citation_syntax import extract_citation_ids
+            body = next((str(result[key]) for key in ("body", "review", "related_work", "introduction") if result.get(key)), "")
+            report = {"claims": [{"claim_id": f"published_{i}", "sentence": text,
+                "factual": True, "citations": extract_citation_ids(text), "evidence_ids": [],
+                "support_status": "unknown", "verification_status": "not_completed"}
+                for i, text in enumerate(split_review_sentences(body), 1)]}
     for sentence_index, sentence in enumerate(report.get("claims") or [], 1):
         if not sentence.get("factual", True):
             continue

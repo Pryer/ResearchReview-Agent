@@ -76,7 +76,7 @@ def test_download_retries_retryable_http_status_and_saves_atomically(
         calls.append((args, kwargs))
         return responses.pop(0)
 
-    monkeypatch.setattr(download_pdf.requests, "get", fake_get)
+    monkeypatch.setattr(download_pdf, "request_public_pdf", fake_get)
     path = download_pdf.download_open_access_pdf(
         {
             "paper_id": "openalex:W1",
@@ -96,8 +96,8 @@ def test_download_rejects_html_disguised_as_pdf(monkeypatch, tmp_path: Path):
     _configure_fast_test(monkeypatch)
     html = b"<html><body>login required</body></html>" + (b"x" * 2048)
     monkeypatch.setattr(
-        download_pdf.requests,
-        "get",
+        download_pdf,
+        "request_public_pdf",
         lambda *args, **kwargs: FakeResponse(html, content_type="text/html"),
     )
 
@@ -120,7 +120,7 @@ def test_cnki_pdf_is_skipped_before_network_request(monkeypatch, tmp_path: Path)
     def fail_if_called(*args, **kwargs):
         raise AssertionError("CNKI PDF must not trigger an HTTP request")
 
-    monkeypatch.setattr(download_pdf.requests, "get", fail_if_called)
+    monkeypatch.setattr(download_pdf, "request_public_pdf", fail_if_called)
     paper = {
         "paper_id": "cnki:paper-1",
         "source": "CNKI",
@@ -174,8 +174,8 @@ def test_invalid_cached_pdf_is_replaced(monkeypatch, tmp_path: Path):
     cached = download_pdf._pdf_path_for(paper, str(tmp_path))
     cached.write_bytes(b"not a pdf" + (b"x" * 2048))
     monkeypatch.setattr(
-        download_pdf.requests,
-        "get",
+        download_pdf,
+        "request_public_pdf",
         lambda *args, **kwargs: FakeResponse(_valid_pdf_bytes()),
     )
 
@@ -189,7 +189,7 @@ def test_pdf_url_without_open_access_permission_is_rejected(monkeypatch, tmp_pat
     def fail_if_called(*args, **kwargs):
         raise AssertionError("unverified PDF URL must not trigger a network request")
 
-    monkeypatch.setattr(download_pdf.requests, "get", fail_if_called)
+    monkeypatch.setattr(download_pdf, "request_public_pdf", fail_if_called)
     paper = {
         "paper_id": "crossref:closed",
         "source": "crossref",

@@ -50,8 +50,13 @@ def quality_feedback(state: dict[str, Any], *, limit: int = 3) -> dict[str, Any]
         if candidate_usability(state)["usable"]:
             recommendations.append("request_finish")
     elif not pending and gate.get("passed") is False:
-        if mapping.get(decision.get("action")):
-            recommendations.append(mapping[decision["action"]])
+        operation = mapping.get(decision.get("action"))
+        if operation == "rewrite_sections":
+            from app.agent.generation_recovery import rewrite_attempt_exhausted
+            if rewrite_attempt_exhausted(state):
+                operation = None
+        if operation:
+            recommendations.append(operation)
         recommendations.append("diagnose_evidence_gaps")
         if (state.get("recovery_decision") or {}).get("queries"):
             recommendations.append("targeted_search")
@@ -74,6 +79,41 @@ def quality_feedback(state: dict[str, Any], *, limit: int = 3) -> dict[str, Any]
             "weak_claim_count": len(weak), "weak_claims": weak[:limit],
             "suggested_actions": list(dict.fromkeys(recommendations)),
             "recovery_reason": str(decision.get("reason") or "")[:200]}
+
+
+def checked_recovery(state: dict[str, Any]):
+    """从当前版本的 Check 报告重新计算恢复路径。"""
+    if (state.get("active_quality_recovery") or state.get("pending_result_validation")
+            or (state.get("check_report") or {}).get("verdict") != "needs_revision"):
+        return None
+    from app.agent.checking import check_is_current
+    from app.agent.generation_recovery import decide_generation_recovery
+    from app.core.config import get_settings
+
+    if not check_is_current(state):
+        return None
+    return decide_generation_recovery(state, max_actions=get_settings().recovery_total_action_budget)
+
+
+def checked_section_revision(state: dict[str, Any], recovery):
+    """由当前 Check 和恢复策略签出有界的 Writing 请求。"""
+    from app.schemas.delegation_schema import DelegationRequest
+
+    plans = state.get("writing_plans") or []
+    known = list(dict.fromkeys(section["id"] for plan in plans
+                              for section in plan.get("sections") or [] if section.get("id")))
+    permitted = set(state.get("target_section_ids") or known)
+    if recovery.target_section_ids:
+        targets = recovery.target_section_ids
+    elif len(plans) == 1:
+        # WHY: 旧报告没有句子到章节的绑定时，只用单份交付物中已有权限的章节作有界修订。
+        targets = [section for section in known if section in permitted]
+    else:
+        return None
+    if not 1 <= len(targets) <= 3 or not set(targets) <= (permitted & set(known)):
+        return None
+    return DelegationRequest(agent="writing", profile="section_revision", goal=recovery.reason,
+                             scope={"section_ids": targets})
 
 
 def diagnose_quality_recovery(state: dict[str, Any]) -> None:

@@ -6,8 +6,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.agent.context_builder import build_main_agent_context
-from app.agent.main_policy import MainAgentPolicy, AgentDecisionError
-from app.agent.subagents.loop import SubagentLoop
+from tests.reference_v1.main_policy import MainAgentPolicy, AgentDecisionError
+from tests.reference_v1.subagent_loop import SubagentLoop
 from app.agent.controller import AgentController
 from app.schemas.agent_decision_schema import AgentDecision, ContextSelection
 from tests.test_subagent_react import ScriptedLLM, state, search, report

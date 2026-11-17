@@ -35,6 +35,19 @@ def describe_job_step(step: str) -> str:
     return _RECOVERY_STEP_LABELS.get(str(step or ""), str(step or "等待执行"))
 
 
+def describe_execution_progress(progress: dict) -> str:
+    roles = {'search': '论文检索', 'analysis': '证据分析', 'writing': '综述写作', 'check': '独立核验'}
+    terminal = {'completed': '任务已完成', 'partial': '已交付草稿', 'blocked': '当前要求未满足',
+                'needs_clarification': '等待补充研究信息', 'cancelled': '任务已取消', 'failed': '执行已失败'}
+    phase = terminal.get(progress.get('job_status')) or roles.get(progress.get('current_role'), '任务规划与交接')
+    return (f"{phase} · 已完成 {int(progress.get('completed_actions') or 0)} 个研究动作 · "
+            f"工具调用 {int(progress.get('tool_calls') or 0)} 次，"
+            f"完成 {int(progress.get('completed_tools') or 0)} 次，"
+            f"失败 {int(progress.get('failed_tools') or 0)} 次，"
+            f"结果未知 {int(progress.get('uncertain_tools') or 0)} 次，"
+            f"待确认 {int(progress.get('pending_tools') or 0)} 次")
+
+
 def recovery_progress_view(
     decision: dict | None,
     history: list[dict] | None,

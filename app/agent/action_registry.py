@@ -18,35 +18,46 @@ class ActionSpec:
     parameters: dict[str, Any] = field(default_factory=lambda: {
         "type": "object", "properties": {}, "additionalProperties": False,
     })
+    tool_dependencies: tuple[str, ...] = ()
 
 
 _ACTION_SPECS = (
     ActionSpec("search_and_rank", "按当前范围检索、筛选和排序论文", AgentRole.SEARCH,
-               output_fields=("candidate_papers", "ranked_papers", "source_diagnostics")),
+               output_fields=("candidate_papers", "ranked_papers", "source_diagnostics"),
+               tool_dependencies=('artifact_read', 'artifact_write', 'paper_search', 'llm_completion', 'embedding_request', 'rerank_request')),
     ActionSpec("targeted_search", "针对已确认的证据缺口执行一次有界补检索", AgentRole.SEARCH,
                required_fields=("evidence_gap_report",), output_fields=("candidate_papers", "ranked_papers"),
                parameters={"type":"object", "properties":{
                    "purpose":{"type":"string","maxLength":600},
                    "gap_ids":{"type":"array","items":{"type":"string"},"maxItems":12},
                    "queries":{"type":"array","items":{"type":"string","minLength":2,"maxLength":300},"maxItems":6}},
-                   "additionalProperties":False}),
+                   "additionalProperties":False},
+               tool_dependencies=('artifact_read', 'artifact_write', 'paper_search', 'llm_completion', 'embedding_request', 'rerank_request')),
     ActionSpec("fetch_metadata", "补全并核验已排序论文的元数据", AgentRole.SEARCH,
-               required_fields=("ranked_papers",), output_fields=("paper_details", "source_diagnostics")),
+               required_fields=("ranked_papers",), output_fields=("paper_details", "source_diagnostics"),
+               # WHY: arXiv详情沿用按ID反查的search_arxiv；精确论文资源Scope另由资源层收窄。
+               tool_dependencies=('artifact_read', 'artifact_write', 'metadata_read', 'paper_search', 'pdf_download', 'pdf_parse', 'llm_completion', 'embedding_request', 'rerank_request', 'vector_read', 'vector_write')),
     ActionSpec("extract_paper_cards", "从已核验资料提取带溯源的证据卡", AgentRole.ANALYSIS,
-               required_fields=("paper_details",), output_fields=("paper_cards",)),
+               required_fields=("paper_details",), output_fields=("paper_cards",),
+               tool_dependencies=('artifact_read', 'artifact_write', 'llm_completion', 'embedding_request', 'rerank_request', 'vector_read', 'vector_write')),
     ActionSpec("validate_routes", "用证据验证候选研究路线", AgentRole.ANALYSIS,
-               required_fields=("paper_cards",), output_fields=("validated_routes", "route_decisions")),
+               required_fields=("paper_cards",), output_fields=("validated_routes", "route_decisions"),
+               tool_dependencies=('artifact_read', 'artifact_write', 'llm_completion',)),
     ActionSpec("cluster_papers", "没有有效候选路线时执行证据驱动聚类", AgentRole.ANALYSIS,
-               required_fields=("paper_cards",), output_fields=("clusters", "dynamic_taxonomy")),
+               required_fields=("paper_cards",), output_fields=("clusters", "dynamic_taxonomy"),
+               tool_dependencies=('artifact_read', 'artifact_write', 'llm_completion',)),
     ActionSpec("plan_claims", "为研究路线建立主张与证据授权", AgentRole.ANALYSIS,
-               required_fields=("paper_cards",), output_fields=("claim_plans", "evidence_gap_report")),
+               required_fields=("paper_cards",), output_fields=("claim_plans", "evidence_gap_report"),
+               tool_dependencies=('artifact_read', 'artifact_write', 'llm_completion',)),
     ActionSpec("diagnose_evidence_gaps", "分析证据缺口并返回受约束的恢复建议，不执行检索", AgentRole.ANALYSIS,
-               required_fields=("paper_cards",), output_fields=("evidence_gap_report", "recovery_decision")),
+               required_fields=("paper_cards",), output_fields=("evidence_gap_report", "recovery_decision"),
+               tool_dependencies=('artifact_read', 'artifact_write', 'llm_completion',)),
     ActionSpec("revise_scope", "在用户显式边界内修订研究路线框架", AgentRole.ANALYSIS,
                required_fields=("paper_cards", "evidence_gap_report", "provisional_framework"),
-               output_fields=("provisional_framework", "scope_revision_count")),
+               output_fields=("provisional_framework", "scope_revision_count"), tool_dependencies=('artifact_read', 'artifact_write', 'llm_completion',)),
     ActionSpec("generate_deliverables", "按计划和获准证据生成交付物", AgentRole.WRITING,
-               required_fields=("paper_cards", "claim_plans"), output_fields=("review", "writing_plans")),
+               required_fields=("paper_cards", "claim_plans"), output_fields=("review", "writing_plans"),
+               tool_dependencies=('artifact_read', 'artifact_write', 'candidate_read', 'candidate_write', 'section_cache_read', 'section_cache_write', 'llm_completion')),
     ActionSpec(
         "rewrite_sections", "仅重写指定且已有证据授权的章节", AgentRole.WRITING,
         required_fields=("review", "writing_plans"), output_fields=("review",),
@@ -56,9 +67,11 @@ _ACTION_SPECS = (
             "required": ["section_ids"],
             "additionalProperties": False,
         },
+        tool_dependencies=('artifact_read', 'artifact_write', 'candidate_read', 'candidate_write', 'section_cache_read', 'section_cache_write', 'llm_completion'),
     ),
     ActionSpec("validate_result", "独立核验主张、引用和交付要求，返回版本绑定报告", AgentRole.CHECK,
-               required_fields=("review",), output_fields=("quality_gate", "claim_verification", "check_report")),
+               required_fields=("review",), output_fields=("quality_gate", "claim_verification", "check_report"),
+               tool_dependencies=('artifact_read', 'artifact_write', 'candidate_read', 'llm_completion')),
     ActionSpec("recall_context", "按证据 ID 或来源引用回查本 Agent 已归档观察；历史不授予当前证据权限", None,
                parameters={"type": "object", "properties": {
                    "evidence_id": {"type": "string", "minLength": 1, "maxLength": 256},
@@ -193,7 +206,9 @@ def admitted_ranked_papers(state: dict[str, Any]) -> list[dict[str, Any]]:
 def recovery_handoff_action(state: dict[str, Any]) -> str:
     """质量恢复后优先把已确认的候选推进到当前证据与授权。"""
     from app.agent.delivery import draft_first, draft_preflight, published_delivery
-    if (not state.get("active_subagent") and draft_first(state) and not published_delivery(state)
+    # WHY: 发布属于Main；活动v2委派内不能让publish_draft抢占Check等已授权的专业动作。
+    if (not state.get("active_subagent") and not state.get('active_delegation_id')
+            and draft_first(state) and not published_delivery(state)
             and draft_preflight(state)["ready"]):
         return "publish_draft"
     if state.get("intent") != "search_papers" and state.get("pending_result_validation"):

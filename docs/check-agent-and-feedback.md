@@ -53,7 +53,7 @@ Controller 在检查结果提交后比较候选质量。只有旧稿的检查与
 
 ## 实现与验证入口
 
-核心文件：app/agent/subagents/check_agent.py、app/agent/checking.py、app/schemas/check_schema.py、agent_task_schema.py、action_registry.py、action_contracts.py、controller.py、graph.py、nodes/verification.py、subagents/loop.py 和 app/prompt/agent_system.py。
+核心文件：app/agent/subagents/check_agent.py、app/agent/checking.py、app/schemas/check_schema.py、agent_task_schema.py、action_registry.py、action_contracts.py、controller.py、graph.py、nodes/verification.py、runtime/delegation_runner.py 和 app/prompt/agent_system.py。
 
 新增行为回归见 tests/test_check_agent.py。已有真实失败恢复场景见 tests/test_main_quality_loop.py、test_writing_action_boundaries.py、test_context_selection_repair.py。离线模型均为替身，真实 Provider/pgvector E2E 另行记录，不等同于独立人工语义审查。
 

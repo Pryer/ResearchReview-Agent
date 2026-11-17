@@ -5,10 +5,15 @@
 
 from __future__ import annotations
 
+from app.services.tool_execution import research_tool
+
 import hashlib
 import os
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from urllib.parse import urlsplit
+from app.core.pdf_transport import request_public_pdf
+from app.core.retry_policy import (check_retrieval_execution, bounded_request_timeout, interruptible_sleep, retrieval_cancellation)
+from app.agent.execution_budget import is_control_exception
 from app.agent.execution_budget import submit_with_context
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -41,6 +46,13 @@ def allows_pdf_download(paper: Dict[str, Any]) -> bool:
     return source_allows_full_text(paper)
 
 
+def _trusted_repository_url(url):
+    try:
+        return (urlsplit(str(url)).hostname or "").lower() in {"arxiv.org", "www.arxiv.org", "export.arxiv.org"}
+    except ValueError:
+        return False
+
+
 def is_open_access(paper: Dict[str, Any]) -> bool:
     """判断论文是否有明确授权的开放获取 PDF。
 
@@ -57,9 +69,27 @@ def is_open_access(paper: Dict[str, Any]) -> bool:
     source = str(paper.get("source") or "").strip().lower()
     paper_id = str(paper.get("paper_id") or "").strip().lower()
     # arXiv 是开放仓储，可以由稳定的来源身份直接判定。
-    if source == "arxiv" or paper_id.startswith("arxiv:") or "arxiv.org" in str(pdf_url).lower():
+    if source == "arxiv" or paper_id.startswith("arxiv:") or _trusted_repository_url(pdf_url):
         return True
     return False
+
+
+def _response_chunks(response):
+    raw = getattr(response, "raw", None)
+    if raw is None or not hasattr(raw, "read1"):
+        yield from response.iter_content(chunk_size=64 * 1024)
+        return
+    # WHY: read1 返回当前可读数据；不等满 64KB，慢速持续流也能到达取消安全点。
+    from urllib3.exceptions import HTTPError
+    while True:
+        check_retrieval_execution()
+        try:
+            chunk = raw.read1(64 * 1024, decode_content=True)
+        except HTTPError as exc:
+            raise requests.ConnectionError("PDF stream interrupted") from exc
+        if not chunk:
+            break
+        yield chunk
 
 
 def _pdf_path_for(paper: Dict[str, Any], save_dir: str) -> Path:
@@ -79,6 +109,9 @@ def _retry_delay(attempt: int, config=None) -> float:
     return max(0.0, float(config.pdf_download_backoff_seconds)) * (2 ** (attempt - 1))
 
 
+
+
+@research_tool('pdf_download')
 def download_open_access_pdf(
     paper: Dict[str, Any],
     save_dir: Optional[str] = None,
@@ -92,6 +125,7 @@ def download_open_access_pdf(
     Returns:
         下载后的本地路径，失败返回 None。
     """
+    check_retrieval_execution()
     if not allows_pdf_download(paper):
         logger.info(
             "PDF download skipped by source policy: paper_id=%s source=cnki",
@@ -137,9 +171,9 @@ def download_open_access_pdf(
         response = None
         retryable = False
         try:
-            response = requests.get(
+            response = request_public_pdf(
                 str(pdf_url),
-                timeout=timeout,
+                timeout=tuple(bounded_request_timeout(min(value, 3.0)) for value in timeout),
                 headers={
                     "User-Agent": (
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -148,7 +182,7 @@ def download_open_access_pdf(
                     "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.1",
                 },
                 stream=True,
-                allow_redirects=True,
+                allow_redirects=False,
             )
             if response.status_code in _RETRYABLE_STATUS_CODES:
                 retryable = True
@@ -172,7 +206,8 @@ def download_open_access_pdf(
 
             total = 0
             with open(part_path, "wb") as file_obj:
-                for chunk in response.iter_content(chunk_size=64 * 1024):
+                for chunk in _response_chunks(response):
+                    check_retrieval_execution()
                     if not chunk:
                         continue
                     total += len(chunk)
@@ -188,6 +223,7 @@ def download_open_access_pdf(
                     f"response is not a parseable PDF (content-type={content_type or 'unknown'})"
                 )
 
+            check_retrieval_execution()
             os.replace(part_path, pdf_path)
             logger.info(
                 "Downloaded PDF: paper_id=%s bytes=%d attempts=%d path=%s",
@@ -216,6 +252,8 @@ def download_open_access_pdf(
                 max_attempts,
                 exc,
             )
+        except InterruptedError:
+            raise
         except (PDFDownloadError, OSError, ValueError) as exc:
             logger.warning(
                 "PDF validation failure: paper_id=%s attempt=%d/%d error=%s",
@@ -231,7 +269,7 @@ def download_open_access_pdf(
 
         if not retryable or attempt >= max_attempts:
             break
-        time.sleep(_retry_delay(attempt, config))
+        interruptible_sleep(_retry_delay(attempt, config))
 
     pdf_path.unlink(missing_ok=True)
     return None
@@ -283,23 +321,39 @@ def batch_download_pdfs(
     if should_cancel and should_cancel():
         raise InterruptedError("PDF 下载已取消")
     workers = min(max(1, int(config.pdf_download_max_workers)), len(pending) or 1)
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pdf-download") as executor:
-        futures = {
-            submit_with_context(executor, download_open_access_pdf, paper, save_dir): str(paper.get("paper_id") or "")
-            for paper in pending
-        }
-        for future in as_completed(futures):
-            if should_cancel and should_cancel():
-                # 未启动的任务移出队列；已启动的随 with 退出自然结束。
-                for pending_future in futures:
-                    pending_future.cancel()
-                raise InterruptedError("PDF 下载已取消")
-            paper_id = futures[future]
+    with retrieval_cancellation(should_cancel) as stop:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pdf-download") as executor:
+            futures = {}
+            queue = iter(pending)
+            def submit_one():
+                paper = next(queue, None)
+                if paper is not None:
+                    future = submit_with_context(executor, download_open_access_pdf, paper, save_dir)
+                    futures[future] = str(paper.get("paper_id") or "")
             try:
-                paths[paper_id] = future.result()
-            except Exception as exc:  # 单篇失败不得中断整批
-                logger.warning("Unexpected PDF download failure for %s: %s", paper_id, exc)
-                paths[paper_id] = None
+                for _ in range(workers):
+                    check_retrieval_execution()
+                    submit_one()
+                while futures:
+                    check_retrieval_execution()
+                    done, _ = wait(futures, timeout=0.1, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        paper_id = futures.pop(future)
+                        try:
+                            paths[paper_id] = future.result()
+                        except Exception as exc:
+                            # WHY: 取消、失权和预算停止必须穿透单篇失败隔离，停止同批下载。
+                            if is_control_exception(exc) or isinstance(exc, InterruptedError):
+                                raise
+                            logger.warning("Unexpected PDF download failure for %s: %s", paper_id, type(exc).__name__)
+                            paths[paper_id] = None
+                        check_retrieval_execution()
+                        submit_one()
+            except BaseException as exc:
+                stop(exc)
+                for future in futures:
+                    future.cancel()
+                raise
 
     eligible_ids = {
         str(paper.get("paper_id") or "")

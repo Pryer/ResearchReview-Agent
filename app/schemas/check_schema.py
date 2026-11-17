@@ -43,6 +43,8 @@ class CheckReport(BaseModel):
     report_id: str = Field(default_factory=lambda: uuid4().hex)
     schema_version: int = 1
     draft_version: int = 0
+    verifier_profile: str = ""
+    execution_identities: list[dict[str, str]] = Field(default_factory=list)
     input_fingerprint: str
     execution_status: Literal["completed", "incomplete", "failed"]
     verdict: Literal["passed", "needs_revision", "unable_to_verify"]

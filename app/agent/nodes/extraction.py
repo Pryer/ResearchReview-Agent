@@ -95,6 +95,9 @@ def download_pdf_node(
 
         raise AgentCancelledError(str(exc)) from exc
     except Exception as e:
+        from app.agent.execution_budget import is_control_exception
+        if is_control_exception(e):
+            raise
         from app.agent.exceptions import DegradableAgentError
 
         error = DegradableAgentError(
@@ -154,6 +157,9 @@ def parse_pdf_node(
 
         raise AgentCancelledError(str(exc)) from exc
     except Exception as e:
+        from app.agent.execution_budget import is_control_exception
+        if is_control_exception(e):
+            raise
         logger.error("parse_pdf_node failed: %s", e)
         state.setdefault("errors", []).append(f"parse_pdf: {e}")
         append_step(state, "parse_pdf", "failed", error=str(e))

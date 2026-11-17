@@ -7,8 +7,8 @@ from sqlalchemy import select
 
 from app.agent.context_builder import build_main_agent_context
 from app.agent.context_compaction import compact_main_context
-from app.agent.main_loop import MainAgentLoop
-from app.agent.main_policy import AgentDecisionError, MainAgentPolicy
+from tests.reference_v1.main_loop import MainAgentLoop
+from tests.reference_v1.main_policy import AgentDecisionError, MainAgentPolicy
 from app.agent.react_context import ReActContext, encode
 from app.core.config import get_settings
 from app.database.models import ResearchEventModel

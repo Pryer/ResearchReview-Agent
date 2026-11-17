@@ -34,8 +34,12 @@ def merge_task_result(
         result.error = "source_state_changed_before_commit"
         result.output_state_fingerprint = current
         raise StaleAgentResult(result.error)
-    for key in result.removed_state_fields:
+    patch, removed = result.state_patch, result.removed_state_fields
+    if task.paper_scope:
+        from app.agent.policy.paper_scope import merge
+        patch, removed = merge(state, task, result)
+    for key in removed:
         state.pop(key, None)
-    for key, value in result.state_patch.items():
+    for key, value in patch.items():
         state[key] = copy.deepcopy(value)
     state["state_revision"] = int(state.get("state_revision") or 0) + 1

@@ -4,9 +4,9 @@ import copy
 import pytest
 
 from app.agent.context_builder import build_main_agent_context
-from app.agent.main_loop import MainAgentLoop
+from tests.reference_v1.main_loop import MainAgentLoop
 from app.agent.react_context import ReActContext, ContextBudgetExceeded, encode, execute_context_recall
-from app.agent.subagents.loop import SubagentLoop
+from tests.reference_v1.subagent_loop import SubagentLoop
 from app.agent.controller import AgentController
 from app.core.config import get_settings
 from app.schemas.agent_decision_schema import AgentDecision
@@ -193,7 +193,7 @@ def test_new_delegation_cannot_reenter_an_active_role_context():
     current = state()
     current.update(active_subagent="search", subagent_sessions={"search": {"active": {"id": "original"}}})
     before = copy.deepcopy(current)
-    from app.agent.main_policy import AgentDecisionError
+    from tests.reference_v1.main_policy import AgentDecisionError
     with pytest.raises(AgentDecisionError, match="another delegation"):
         SubagentLoop(ScriptedLLM({}), AgentController()).run(current,
             decision=AgentDecision(action="search_and_rank"), handlers={"search_and_rank": search})

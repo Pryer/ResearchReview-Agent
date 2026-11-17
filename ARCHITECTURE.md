@@ -14,7 +14,7 @@
 |------|------|
 | 后端框架 | FastAPI + Uvicorn（`app/main.py`） |
 | 前端 | Streamlit（`app/frontend/chat_app.py`，对话式界面） |
-| 数据库 | SQLite + SQLAlchemy（`app/database/`） |
+| 存储 | SQLite + SQLAlchemy 保存业务状态与执行账本，PostgreSQL/pgvector 保存全文向量索引 |
 | LLM | 统一经 `app/services/llm_service.py` 调用（主备双模型） |
 | 检索源 | arXiv / Semantic Scholar / OpenAlex / Crossref（HTTP）+ CNKI（Selenium 浏览器，headless 可配，默认关闭） |
 | PDF 解析 | PyMuPDF（全文/分段提取） |
@@ -36,7 +36,7 @@ ResearchReview-Agent/
 │   ├── agent/                 # 智能体核心（见 §3）
 │   │   ├── graph.py           # run/continue/regenerate 入口、动作处理器适配与写作质量边界
 │   │   ├── state.py           # ResearchAgentState TypedDict 定义
-│   │   ├── main_loop.py / main_policy.py # 五字段单动作决策循环、原生工具与 JSON 回退
+│   │   ├── task_main.py           # 任务级Main、Profile委派、原生工具与JSON协议
 │   │   ├── action_registry.py # 注册动作、参数 schema 与可用性
 │   │   ├── controller.py      # 授权、任务生命周期、版本复核与提交
 │   │   ├── action_contracts.py / task_context.py # 动作读写白名单、类型校验与输入投影
@@ -44,7 +44,9 @@ ResearchReview-Agent/
 │   │   ├── execution_budget.py / orchestration.py # 共享预算与旧会话模式规范
 │   │   ├── context_builder.py # 由完整状态构建五字段主 Agent 上下文
 │   │   ├── context_compaction.py # 保留硬约束和阻塞问题的确定性压缩
-│   │   ├── subagents/         # 独立 ReAct 循环、角色执行器与主从通信
+│   │   ├── runtime/           # 统一委派/Action执行器、策略和进展摘要
+│   │   ├── policy/ / registry/ # 服务端Grant、准入、能力和验收
+│   │   ├── subagents/         # 四角色Action执行器与字段权限
 │   │   ├── execution.py       # 执行原语：AgentCancelledError、节点边界检查、LLM 工厂
 │   │   ├── retrieval_loop.py  # ReAct 检索精化循环（从 graph 下沉的策略层）
 │   │   ├── recovery_loop.py   # 路线证据恢复状态机（从 graph 下沉的策略层）
@@ -108,60 +110,32 @@ ResearchReview-Agent/
 └── chromedriver-win64/        # CNKI Selenium 专用 chromedriver
 ```
 
-## 3. 核心数据流（`app/agent/graph.py: run_research_agent`）
+## 3. 核心数据流
 
-当前采用 Main Agent 委派与三类 Subagent 独立 ReAct 循环组成的主从编排；
-主控负责短期规划、选择执行角色与分发上下文；子 Agent 每次完成一个授权动作后汇报，无 LangGraph 依赖。
-节点函数在 `app/agent/nodes/`，原子能力在 `app/tools/`。
+生产使用任务级 v2 架构。Main 通过 `delegate_agent` 请求研究能力、目标和资源范围，服务端从 Profile 注册表确定角色并签发 Grant。Grant 限定动作、资源和预算，`DelegationRunner` 每步以最新已提交状态重新检查准入。
 
-主 Agent 基于 Stable Prefix、ReAct Trajectory 与最新 Agent Status Bar 每轮选择一个已注册动作；动作权限、预算、取消、提交
-版本与质量门禁仍由确定性代码裁决。历史会话（未记录模式或标记为 `legacy` 的旧
-状态）在执行入口规范为同一调度：保留原研究目标、显式约束、论文与证据卡、恢复
-历史与预算消耗，只重算与旧调度或旧证据版本绑定的派生结果。Agent Status Bar 载荷包含 `goal`、
-`state`、`key_evidence`、`decisions`、`open_questions`；完整论文、证据和历史保留在
-权威状态与会话级 artifact 中。检索、分析和写作阶段通过带输入指纹的专业 Agent
-任务契约按动作白名单投影输入，再在隔离工作副本中执行；输出键、字段删除和类型
-双重校验，提交前再次检查身份、指纹和版本，旧任务不会合并到新证据状态。
-同一委派内保留工具对话，跨委派以任务隔离的角色摘要、候选引用和依赖增量衔接，详见[上下文与写作候选设计](docs/context-writer-repair.md)。Writer保存各阶段候选及拒绝原因，Check独立核验，Main选择恢复动作。
+Main读取五字段Status Bar；局部策略读取有界PlanningContext；具体Action只读取契约字段和授权Artifact。每步都重新校验角色能力、Grant、最新状态准入、资源范围、业务版本与预算。
 
-四类专业 Agent（Search、Analysis、Writing、Check） 各自维护持久化 ReAct 轨迹、状态栏、压缩 Epoch 和通信历史。
-主控委派任务后，子 Agent 执行本次唯一研究动作，通过 `report_to_main` 汇报完成、请求协助或报告阻断；
-同角色的后续动作也必须由 Main 再次委派。子循环仍可回查自身观察、读取结果并进行有界纠错。
-Main 的 `plan` 是最多六步的后续建议，观察后可修订，不预先授予未来工具权限。
-委派的 `context_selection` 可选择当前状态栏里的证据、决定、问题和记忆 ID；
-子 Agent 的必需输入按本次操作契约提供，硬约束、最新门禁、失败原因与预算始终附带。
-未提供选择的旧调用使用操作级最小视图；显式空选择不附加历史摘要。完整 PDF 和兄弟 Agent 私有轨迹不进入该选择协议。
-独立循环同步执行，共享研究数据和总预算；具体状态、恢复和权限边界见
-[上下文架构](docs/agent-context-architecture.md#independent-specialist-react-loops)。
-
-Compaction 将完整观察归档，工作记忆按条数、字符和实际窗口预算限制；Epoch 切换
-后以结构化决策/观察重建历史，不重放旧原生工具与思考协议。可按证据 ID/引用调用
-`recall_context` 回查本轨迹归档。当前只支持串行活动委派，新任务不得复用尚未结束
-的活动上下文；执行结束、业务结果与汇报状态分别由 `status`、`outcome`、
-`delegation_status` 表达，主控显式处理后两者，最终交付继续经过质量门禁。
-
-研究记忆通过 `research_memory_artifact_ref` 定位会话摘要。主控根据任务主动调用
-`search_research_memory`，查询结果有界注入 Status Bar 的 `state.research_memory`，
-再以 `memory_feedback` 和动作结果事件形成使用反馈。检索采用确定性中英文词项匹配，
-限当前会话；旧摘要只提供历史发现，决定/问题必须仍在最新摘要中有效。历史记录不授予
-当前证据权限，不能绕过补检索、主张验证和交付门禁。详见
-[研究记忆检索闭环](docs/agent-context-architecture.md#research-memory-retrieval-loop)。
-
-### 3.1 autonomous 控制循环
+### 3.1 任务级控制循环
 
 ```text
-请求 → 需求解析 → 构建五字段 → 主 Agent 委派任务
-                                  ↓
-                     子 Agent 操作级上下文与执行
-                                  ↓
-                     Controller 授权 → 执行 → 观察
-                                  ↓
-           结果校验与 CAS 提交 → 汇报 → 刷新状态栏 → Main 重新决策
-
-申请交付 → 确定性质量门禁 → 完成 / 明确降级 / 拒绝交付
+请求 → 需求解析 → 五字段Status Bar → TaskMainPolicy选择Profile
+→ 服务端Grant → DelegationRunner局部策略
+→ ActionExecutor → Controller → ToolExecutor受控能力
+→ 产物/失效清理/Invocation同事务提交 → 委派结果 → Main
+→ 草稿发布或正式交付门禁
 ```
 
-数据库提交保证由会话服务入口提供；直接调用 graph 的脚本仍是内存执行模式。
+| 角色 | 委派能力 | 局部执行 |
+| --- | --- | --- |
+| Search | 初始检索、缺口补搜 | 默认确定性流程，可选 ReAct |
+| Analysis | 证据构建、缺口诊断、范围修订 | 证据构建支持确定性流程、ReAct 和 Plan-and-Act；诊断与范围修订直接执行 |
+| Writing | 完整写作、章节修订 | 直接执行，从授权范围确定动作参数 |
+| Check | 独立核验 | 直接执行，将报告绑定到候选版本与证据 |
+
+Search 和 Analysis 的多步流程逐动作提交。Writing 提交候选后，Main 委派 Check。遇到可修订的缺口时，Main 按报告定向改写并复验，必要时交 Analysis 重建主张授权。工具完成、阶段达标、核验通过和正式交付各自有独立判据。取消、失权和超时后保留已提交成果，远程结果未知时记录为待确认。
+
+会话服务和直接Python入口均使用相同持久化内核；直接入口自动建立SQLite执行作用域和Artifact Store，嵌套调用复用服务作用域。生产旧Main/子循环已经退役，历史协议参考只存在于tests/reference_v1。
 
 ### 3.2 研究阶段与节点
 
@@ -212,15 +186,15 @@ running job 标为失败、完成待取消 job 的取消；它不自动重放在
 
 ## 一个请求如何流经系统
 
-以“撰写 2020—2023 年某主题的研究综述，最终引用至少 5 篇不同论文”为例：
+以“梳理 2020—2023 年开放域问答中的检索增强生成研究现状，至少引用 3 篇不同论文”为例。
 
 1. `app/api/routes_review.py` 接收任务，Job 服务保存并调度；`app/agent/graph.py` 进入研究流程，规划阶段识别主题、年份和最低引用数。
-2. `MainAgentLoop` 依据目标和当前状态委派 Search；`app/agent/action_registry.py` 与 Controller 限定可执行动作。检索和排序得到候选论文，候选数不等于最终引用数。
+2. `TaskMainLoop` 请求初始检索能力。服务端授权 Search 在同一次委派中检索、排序并补全论文详情，每一步独立提交。
 3. 详情获取、PDF 解析与 `extract_paper_card` 形成论文卡和带来源的证据；Analysis 检查范围、证据充分性与可授权主张。未获得支持的材料不能自动变成结论。
 4. Writing 依据授权证据产生候选正文；Check 独立核验该版本的引用与主张，结果交回 Main。若存在缺口，Main 可在预算内委派补检索、分析或改写。
-5. Controller 复核当前版本并执行交付门禁。最终参考文献须有至少 5 篇不同论文且满足年份约束；证据不足时可按任务策略明确交付 `partial` 草稿或报告阻断，不能把草稿当作正式验收。
+5. Controller 复核当前版本并执行交付门禁。正式正文的实际引用须包含至少 3 篇符合年份约束的不同论文。证据不足时，系统按任务策略交付明确标记的 `partial` 草稿或报告阻断。
 
-这是代码流程示例，不代表一次实际检索或人工评审结果。
+该主题的真实严格模式复验已走完候选修订、独立复验和主张重建，报告记录两条缺少引证的结论，正式发布被门禁拦截。详见[真实环境验证](docs/validation/2026-11-18-v2-live-closeout.md)。
 
 ## 4. 关键机制
 
@@ -262,14 +236,7 @@ pytest tests/
 [上下文架构](docs/agent-context-architecture.md)，CAS、预算和恢复细节见
 [运行机制](docs/agent-runtime-and-cache.md)。
 
-2026-10-16 上下文可靠性修复的全量本地回归为 1610 项通过，相关定向回归 119 项通过，
-本次新增 19 项压缩/回查/结果消费测试，此前 23 项子循环测试继续覆盖；外部调用均使用 Mock，本轮未运行真实服务全链路，
-未测量额外模型调用的成本、性能或研究质量收益。
-
-历史真实服务验收：2026-09-22 全量回归为 1224 项通过；真实备用 LLM + CNKI 3 篇检索、
-提交和数据库重开恢复已通过。40 篇完整综述场景因请求预留超过剩余预算而阻断，
-尚未完成交付验收，未据此宣称确定节费比例。详见
-[验收记录](docs/validation/2026-09-22-runtime-cache.md)。
+v2 全量回归在 `rragent` 中通过 **2769 项**，包含原生 pgvector 集成测试。真实 HTTP Job 完成精确论文检索，草稿优先场景交付了一份引用 5 篇论文的 `partial` 草稿。正式综述质量、独立人工审查和自主策略收益仍待验收。见[部署与真实任务记录](docs/validation/2026-11-18-v2-live-closeout.md)及[旧运行时迁移记录](docs/validation/2026-11-18-v2-runtime-retirement.md)。
 
 
 ## 可用草稿交付与增量处理（2026-11-10）

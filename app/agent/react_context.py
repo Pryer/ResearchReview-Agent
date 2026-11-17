@@ -145,7 +145,7 @@ class ReActContext:
         status = context.model_dump(mode="json")
         status["state"]["allowed_actions"] = list(allowed_actions)
         if self.namespace is None:
-            from app.agent.delegation_context import selectable_context_ids
+            from app.agent.context_selection import selectable_context_ids
             # WHY: ID目录随最新状态更新，保持五字段与稳定工具前缀；不从历史或论文ID补造。
             status["state"]["context_selection_ids"] = selectable_context_ids(context)
         # WHY: 状态栏也追加保留；下一次请求完全保留本次输入前缀，直至 epoch 压缩。
@@ -331,6 +331,9 @@ class ReActContext:
             feedback["research_memory"] = payload["research_memory"]
         if payload.get("delegation_status") is not None:
             feedback["delegation_status"] = payload["delegation_status"]
+        if payload.get('unresolved') is not None:
+            # WHY: needs_help必须同时给出缺口；只保留findings会让Main反复重派同一无效阶段。
+            feedback['unresolved'] = [str(reason)[:240] for reason in payload['unresolved'][:5]]
         visible = encode(feedback)
         if len(visible) > limit and refs:
             # WHY: 全量引用保留在归档中，不能截断 JSON 或让大引用数组挤掉执行反馈。
@@ -392,9 +395,8 @@ def execute_context_recall(trajectory: ReActContext, arguments: dict) -> dict:
 def record_tool_observation(state: dict, payload: dict) -> None:
     role = state.get("active_subagent")
     if role:
-        from app.agent.subagents.loop import record_subagent_observation
-        record_subagent_observation(state, payload)
-        return
+        from app.database.runtime_repository import RuntimeConflict
+        raise RuntimeConflict("historical active delegation must be migrated before execution")
     data = state.get("main_agent_trajectory") or {}
     if (data.get("pending") or {}).get("action") == payload.get("operation"):
         ReActContext(state).observe(payload)

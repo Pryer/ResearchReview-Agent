@@ -7,12 +7,14 @@ import time
 from urllib.parse import urlparse
 
 import requests
+from app.services.tool_execution import research_tool
 
 
 class RetrievalProviderError(RuntimeError):
     pass
 
 
+@research_tool(lambda arguments: {'embedding': 'embedding_request', 'rerank': 'rerank_request'}.get(arguments['kind'], 'unknown_model'))
 def post_json(url, key, body, *, timeout, retries, session=None, should_cancel=None, kind="model"):
     parsed = urlparse(url)
     if parsed.scheme != "https" or not parsed.netloc or not key:

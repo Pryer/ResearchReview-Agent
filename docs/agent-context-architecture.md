@@ -1,466 +1,66 @@
 # Agent Context Architecture
 
-The request has four cooperating parts: Stable Prefix (role and protocol rules),
-ReAct Trajectory (real decisions and observations), Agent Status Bar (latest
-authorized state), and Compaction (bounded working memory plus archival recall).
-The five-field `MainAgentContext` below is the Status Bar payload, not the entire
-model request.
-
-ResearchReview-Agent separates authoritative research state from the context shown
-to the main Agent. The authoritative `ResearchAgentState` retains retrieval data,
-paper cards, evidence spans, validation reports, drafts, checkpoints, and recovery
-history. The model-facing `MainAgentContext` is rebuilt from that state and contains
-exactly five top-level fields:
-
-```text
-goal
-state
-key_evidence
-decisions
-open_questions
-```
-
-The authoritative state also stores a clarification rewrite with source anchors and
-the source query used for semantic parsing. Citation identity is tied to the
-pre-render body and a matching numbered render snapshot. These fields remain in
-the private research state and do not add fields to `MainAgentContext`.
-
-`goal` preserves the user request, deliverables, scope, and explicit constraints.
-`state` contains separate execution/research status, the current stage, allowed and
-pending actions, a bounded recent trajectory, failure reasons, artifact counts, gate
-summary, and remaining action/token/retrieval/recovery budgets. `key_evidence` contains bounded findings with paper and
-artifact references. `decisions` records still-valid scope, route, and recovery
-choices. `open_questions` contains unresolved clarification, evidence, and quality
-problems.
-
 ## Stable and dynamic context
 
-Role rules form a stable system prefix. Native calls carry the tool catalog only
-through `tools`; the JSON fallback retains the textual catalog. Dynamic goals, evidence,
-and task state are serialized separately. `LLMService.for_agent(role)` injects the
-stable prefix for specialist calls; `MainAgentPolicy` owns the main prefix and
-sorted action catalog. Both retain provider fallback, timeout, and metrics behavior. Raw document text is treated as research material and cannot redefine the
-role or tool boundary.
-
-The context builder is deterministic. It may shorten repeated or low-priority
-material to fit configured limits, but it does not remove the goal, explicit user
-constraints, or blocking questions. It does not use an LLM to invent summaries.
-Every key-evidence entry must resolve to a paper card in the authoritative state.
-The total character budget reserves room for the stable system/tool prefix and the
-structured decision output. If the irreducible context still exceeds the dynamic
-budget, the request fails with `context_budget_exceeded` rather than dropping a hard
-constraint.
+TaskMainLoop is the production entry. Model requests combine a stable role prefix,
+semantic trajectory and current Status Bar. Its five fields are goal, state,
+key_evidence, decisions and open_questions. context_builder.py derives a bounded
+view from authoritative state.
 
 ## Main-Agent decision loop
 
-`MainAgentPolicy` receives the latest five-field status bar and the persisted
-append-only trajectory per round and returns
-exactly one `AgentDecision`. The stable action registry is the source for tool
-descriptions, parameter schemas, roles, and controller authorization. Providers with
-native tool calling use a required single tool call; deployments that disable native
-tools, or explicitly reject the native protocol, use strict JSON validated against
-the same contract. Tool schemas stay stable across rounds; the current allowed
-actions and correction reasons live inside `state`.
+TaskMainPolicy exposes delegate_agent and registered controls through native tools
+or strict JSON. Main requests a role/Profile, goal and scope; AuthorizationPolicy
+issues the Grant. Mandatory recovery uses exact server-issued single-action grants.
+Business progress and explored queries bound repetition.
 
-`MainAgentLoop` executes `build -> decide -> delegate -> receive report -> rebuild`.
-The specialist executes its own `build -> decide -> Controller validation -> execute
--> commit observation -> rebuild` cycle until it reports to the main Agent.
-The model may request completion, but deterministic quality gates decide whether the
-current draft can be released. Invalid actions receive one bounded correction chance;
-repeated no-progress actions, round limits, action limits, cancellation, and token
-budgets end in an explicit terminal state.
+## Specialist planning and action context
 
-There is a single production scheduler. The initial, incremental, regeneration,
-checkpoint-resume and verification-only entry points all reach the same five-field
-loop; verification-only sessions expose only validation and terminal control
-actions. Historical sessions whose persisted mode is absent or `legacy` are
-normalized to this scheduler at the execution boundary: the original research goal,
-explicit constraints, papers, evidence cards, recovery history and consumed budget
-are preserved, and only results derived from the retired scheduler or a stale
-evidence version are recomputed. `agent_orchestration_mode` survives as a persisted
-audit field, not as a routing switch, and migration is idempotent.
-When a quality-recovery decision or best-effort request has already selected work,
-the same main loop executes those registered actions before asking the model for a
-new choice. The pending action list is checkpointed; each action still uses the
-normal permission, budget, cancellation and version checks. A missing prerequisite
-blocks explicitly instead of silently skipping the selected remedy.
-Request parsing runs in the search/planning adapter before the five-field decision
-loop; it is not a main-Agent decision call.
+| Consumer | Input | Responsibility |
+| --- | --- | --- |
+| Main | Five-field Status Bar and bounded memory | Tasks and controls |
+| Local strategy | PlanningContext, constraints, summaries and recent results | Actions within a live Grant |
+| Action handler | Contract inputs, authorized artifacts and task brief | Research work and typed patches |
 
-## Independent specialist ReAct loops
+Search and Analysis support deterministic/ReAct; evidence_build also supports
+Plan-and-Act. Plans are validated and persisted. Each step refreshes admission,
+resource manifest and business version. Writing/Check use direct projection.
 
-`MainAgentLoop` delegates its research decision to `SubagentLoop`. Each of Search,
-Analysis and Writing has a separate persisted namespace in `subagent_sessions`:
-its role prompt, trajectory, context usage, archive epochs, communication history
-and active delegation. `ReActContext` shares the context-management algorithm,
-not the mutable messages between roles. The main context sees structured reports,
-not the child's private trajectory. A child sees only its own communication and
-the current evidence/status projection allowed by its role's action contracts.
-Authoritative research evidence remains shared and versioned through Controller.
-
-Main owns global decisions and bounded planning. An optional `plan` contains at most
-six registered-action/objective steps; only the currently selected action is authorized.
-The specialist executes that one delegated research operation, observes its committed
-result and reports. Another operation, including one owned by the same role, requires
-a new Main delegation. Recall and bounded protocol correction remain available.
-It returns through
-`report_to_main` with `completed`, `needs_help` or `blocked` and optional suggested
-actions. Suggestions and model-written reports do not authorize tools or establish
-evidence. The main model receives these reports in `state.agent_messages` and can
-reply by issuing a revised delegation; the same specialist retains its history.
-Native main-agent tools accept optional `delegation_message` text for the task or
-reply. Policy extracts it into the task objective before action argument validation;
-it is never passed to research handlers as an executable parameter. JSON decisions
-can use the existing `reason` field or the same communication metadata.
-
-The delegated operation must actually commit before a `completed` report is
-accepted. Its arguments are immutable; local rewrites cannot switch to full-draft
-generation. Mandatory recovery and evidence-handoff ordering remain authoritative.
-Requests outside the current role, action preconditions or registered handlers are
-rejected. Each delegated child action receives its own Controller permission,
-version and budget checks, plus Sidecar review when configured. A child's completion
-means that its operation executed, not that final review quality passed.
-
-`AgentTaskResult.status=completed` describes the execution lifecycle. `outcome`
-retains business success/degradation/blocking; `delegation_status` separately
-records the completed/help/block report. Main-loop consumption explicitly adds
-blocked, degraded, unknown or help outcomes to its next Status Bar's feedback,
-including restored delegations. It can replan rather than automatically ending the
-entire research job; finish requests still require the deterministic final gates.
-
-Main's optional `context_selection` names `evidence_ids`, `decision_ids`,
-`question_ids` and `memory_ids` present in its latest status bar. Unknown IDs and
-unregistered plan actions are rejected in both native and JSON transports. The
-selection is communication metadata, removed before handler argument validation
-and saved with the active delegation for checkpoint recovery. Selected evidence,
-decisions and questions are refreshed from current authoritative summaries; stale
-IDs cannot revive old evidence. Omitted selection uses an operation-level default;
-explicit empty selection attaches no additional summaries. The authoritative goal,
-constraints, current gates, failures and budgets cannot be omitted. This selects
-model-facing summaries, not arbitrary raw state keys or a new per-paper execution API.
-Handler inputs and artifact access remain bounded by the current operation contract,
-not the union of every operation owned by the role.
-
-The implementation uses synchronous delegation, not background daemon workers or
-parallel shared-state mutation. Independent contexts survive multiple delegations.
-New delegation attempts are rejected before touching an active trajectory; recovery
-must explicitly resume the existing delegation. Per-delegation parallel worker
-isolation is not implemented or claimed by the current role namespaces.
-Each delegation has `AGENT_SUBAGENT_MAX_ROUNDS` (default 12) and
-`AGENT_SUBAGENT_NO_PROGRESS_LIMIT` (default 3); these counters survive checkpoints.
-All LLM calls, retries, retrievals and committed actions share the existing session
-budgets and cancellation/lease boundaries. Changed user goals invalidate an active
-delegation and require the main Agent to issue a new task.
-
-Controller commits the child observation, progress counters, updated evidence and
-invalidation of stale claims/gates in one snapshot. The parent's tool call remains
-pending until the child reports. Final reporting pairs the parent observation and
-clears the active delegation in one snapshot. Recovery resumes the active child
-before allowing another main decision, without repeating already committed actions.
-Uncommitted external effects retain the existing runtime's explicit uncertain-task
-boundary; this does not promise exactly-once execution of remote requests.
-Specialist trajectories use service-only artifact fragments, with the same strict
-cross-session access and bounded archive/compaction behavior as the main trajectory.
-These changes add model calls; no live-provider cost, latency or review-quality
-improvement has been measured by offline regression tests.
-
-`request_clarification` returns public `needs_clarification`, stores its question and
-private `waiting_user` state, and resumes with the original evidence and the latest
-user constraints. A hard execution stop (budget exhaustion, lease staleness, or a
-ledger conflict) is distinct from a clarification: it settles as `blocked`, or `failed`
-for a stale lease, with one consistent reason across job, session, and result, and is
-never reported as a missing-checkpoint question. Cancellation, failure and waiting
-states do not publish a draft.
-Writing submits a candidate with `pending_result_validation`; Main separately delegates
-`validate_result` to Analysis. Pending candidates cannot finish, publish or be rewritten.
-A worse candidate restores the old products only if evidence and authorization still
-match; a matching old verification fingerprint can be retained without mutating that
-verified draft a second time.
-
-`diagnose_evidence_gaps` returns Analysis diagnostics and a bounded recovery recommendation;
-Main can select Search `targeted_search` or Analysis `revise_scope`. Targeted search
-commits only candidates and `pending_evidence_recovery`, never evidence cards, claims
-or a new draft. Main handles subsequent metadata, extraction, route analysis, claims
-and writing through separate delegations. Per-route new evidence and marginal-gain
-limits are settled after analysis, with cumulative budgets retained across checkpoints.
-Explicit existing-evidence refresh and focus recovery also enter the Main queue.
-
-The budget ledger is shared across conversation parsing, graph entry points,
-specialist workers and automatic recovery. Each real LLM attempt reserves prompt
-bytes plus its output token cap before execution. When the remaining budget cannot
-cover a reservation, the attempt is rejected before any provider call: the request is
-not counted as sent, no charge is incurred, and a structured diagnostic records the
-operation, used, reserved, requested, and remaining amounts. Provider usage settles an
-accepted reservation; missing usage or failed attempts retain the conservative
-reservation and set `usage_estimated`. Retries and fallback requests are charged
-separately.
-Retrieval is counted per search-node round, and recovery has its own sublimit.
-Nested controller actions charge the parent action once. The deadline spans the
-current user turn; cumulative usage survives pause/resume. In-flight external calls
-remain subject to their client timeouts; late results cannot commit after expiry.
+Task briefs distinguish delegation, invocation, attempt and input version.
+Workers inherit the bounded identity. Trusted results extend resources within an
+attempt; committed lineage is saved with the action. A summary does not grant
+access to raw documents.
 
 ## ReAct epochs and context capacity
 
-Within an epoch, the original goal and subsequent goal/constraint revisions, status
-bars, assistant decisions, and observations are appended without rewriting prior
-messages. Native assistant calls retain their provider IDs, raw argument JSON,
-content, and DeepSeek continuation fields; `tool` observations match the IDs.
-JSON mode uses assistant JSON decisions followed by explicitly marked user
-observations. Transport/provider changes can invalidate cache prefixes; DeepSeek
-private continuation fields are omitted for other providers.
+ReActContext pairs actual tool calls and observations. Role model/context settings
+remain frozen for a task and active delegation. Each actual RPC checks its input
+and output reservation.
 
-L1 projects immutable bounded observations (status, outcome, delegation status,
-findings, errors, evidence and output references). Every complete observation is
-archived when the session Artifact Store is bound, including small payloads.
-Results are split into immutable artifacts behind one service-only archive
-index, so the index list itself cannot fill the model context. Oversized reference
-lists retain their full values in that archive and expose a count plus the index;
-no truncated JSON or fabricated evidence references are used. Specialists continue
-to load only fields and artifact types allowed by their existing task contracts.
-
-Before each model request, the capacity guard counts the serialized system, native
-tools and complete trajectory with a conservative UTF-8 byte upper bound plus
-message framing overhead; this is an estimate, not provider usage. The configured
-`AGENT_CONTEXT_WINDOW_TOKENS` (default 65536) must be no larger than the smallest
-usable window among the primary and backup models. Output reserve equals
-`LLM_CONTROL_PLANE_MAX_TOKENS`. The status bar exposes the configured limit and
-previous-request estimates/usage. Actual prompt/completion/cache tokens come from
-provider usage, including OpenAI `prompt_tokens_details.cached_tokens`.
-
-At `AGENT_CONTEXT_COMPACT_RATIO` (default 0.8), or when working memory exceeds its
-limit, L2 archives the entire epoch, observation records and all goal revisions.
-The new epoch retains only the latest effective goal, archive references and a
-bounded observation/decision ledger. `AGENT_CONTEXT_MEMORY_ITEMS` defaults to 8 and
-`AGENT_CONTEXT_MEMORY_CHARS` to 8000; optional records are further removed if needed
-to fit the actual system/tools/status/output-reserve budget. Current evidence,
-decisions, open questions and gates are rebuilt in the following Status Bar instead
-of being duplicated inside the checkpoint. No LLM invents a summary.
-
-Epoch history is reconstructed as structured user-data messages, not old native
-assistant/tool messages. Old provider reasoning fields and tool IDs stay in the
-archive; real calls within the new epoch retain their original protocol. This
-avoids carrying stale thinking state across epoch/provider boundaries without
-deleting protocol fields from active tool interactions. See the provider's
-[thinking/tool protocol](https://api-docs.deepseek.com/guides/thinking_mode/).
-
-The previous archive is linked from the new archive. An `observation_count` that
-never decreases controls the compaction cooldown (`AGENT_CONTEXT_RECENT_TURNS`,
-default 2); it does not use the length of the trimmed memory. Legacy checkpoints
-derive this counter once from their full memory. Hard-window and working-memory
-limits bypass the threshold cooldown. Original hard constraints remain mandatory;
-if the irreducible request cannot fit, L3 still blocks.
-
-`recall_context(evidence_id, limit=3)` is available to main and specialist loops.
-It traverses only the current trajectory's reachable service-only archive chain,
-with session ownership, trajectory scope, artifact type and payload-integrity
-checks. It can match an evidence ID or source reference, including evidence IDs
-mapped to a current paper card. It returns bounded observation summaries rather
-than raw prompts or reasoning content, and never grants current evidence access.
-The scan is capped at 128 archive indexes / 8 MiB per call and at most 3 results;
-`search_complete=false` explicitly reports an incomplete scan or result limit.
-Recall records are excluded from evidence matches so recalled content cannot
-recursively become new evidence. Corruption/missing storage is an explicit failed
-observation; execution-control exceptions still propagate unchanged.
-
-L3 blocks before model invocation if the retained set still exceeds the hard window,
-configuration is invalid, an archive fails, or a pending call is unresolved. L2
-requires the session Artifact Store; standalone in-memory graph calls explicitly
-block at this boundary instead of silently discarding history. The existing
-character limits still govern each rebuildable five-field status view separately.
-
-The active trajectory is stored as service-only JSON fragments in checkpoints and
-restored through the existing hydration path. Controller commits pair the task
-result and its observation in one transaction. A process restart after that commit
-recovers a complete interaction. Existing leases, CAS, cancellation, task
-idempotency and quality gates remain authoritative. This design enables shared
-prefix reuse; it does not implement an inference engine KV cache or guarantee a
-provider cache hit or a measured latency/cost improvement.
+The Artifact Store archives observations. Working context is bounded by item,
+character and window limits. Compaction retains goals, unresolved work and failures.
+ContextBudgetExceeded stops execution without weakening evidence rules.
+Terminal observations use archive=False after cancellation or loss of ownership.
 
 ## Version and invalidation boundary
 
-Each context snapshot records a source fingerprint and the state/evidence/writing
-versions used to build it. Scope, hard constraints, evidence snapshots, route
-decisions, recovery decisions, or gate results change that fingerprint. A task whose
-input fingerprint or state version no longer matches is returned as `stale`. The
-controller checks before execution and again immediately before commit.
+Snapshot revision, business version, source fingerprint and execution profile have
+different lifetimes. Billing and heartbeats do not advance business versions.
+Every action checks current inputs and live ownership at commit. Evidence changes
+invalidate derived plans and reports.
 
-Context snapshots are persisted as immutable, session-scoped research artifacts. Artifact reads
-must match both `session_id` and `artifact_id`; knowing an artifact ID from another
-session is insufficient. Corrupt JSON is reported rather than converted to an empty
-payload. Registered types include raw results, metadata, document fragments, cards,
-claim/writing plans, drafts and task results. The session repository stores these
-heavy editable-state fields as an artifact manifest and hydrates them on reads;
-the public result snapshot is retained for API compatibility. Production task
-reads check role, type and version as well as session ownership. Missing, forbidden,
-corrupt and mismatched-version references have distinct errors.
+Check reads candidate/evidence and returns a bound report. Controller settles
+rollback or recovery. Published body, references and quality metadata retain their
+own version independently of the latest candidate and job execution status.
 
-Artifacts carry schema versions, payload hashes and source references. Drafts and
-parsed-document JSON are split into bounded fragments with character offsets;
-page information is preserved when supplied by the parser, never inferred.
-Individual payloads/provenance are limited to 256 KiB; session JSON to 8 MiB.
-Embedded PDF data is rejected. PDF references must resolve inside configured PDF
-or parsed-document storage, and their content hash is checked again on read.
+## Research memory and historical state
 
-Research requests, clarification answers, result events and conversation entries are
-archived before the display history is truncated. A durable cursor rebuilds summaries
-from new events only. Old sessions import the still-available history once using a
-database migration marker; earlier truncated data remains explicitly unknown. Resolved
-questions and superseded decisions stay resolved after resume. The compact context
-stores references rather than copying full documents.
+Memory search and recall preserve provenance and bounded identifiers. Historical
+recommendations do not grant actions or establish facts. Known v1 activity migrates
+through submission proofs; unknown records stop for diagnosis. Legacy fields
+remain readable for migration and reports, with no old scheduler selectable.
 
-## Specialist Agents
-
-The deterministic controller delegates bounded tasks through `AgentTask` and
-`AgentTaskResult` contracts:
-
-- Search Agent: search, ranking, metadata retrieval, and targeted retrieval.
-- Analysis Agent: evidence cards, route validation, synthesis, claim planning and
-  deterministic result validation.
-- Writing Agent: deliverable generation and authorized section rewriting.
-
-Each task declares its objective, constraints, input artifacts, expected outputs,
-budget, and source-state fingerprint. Specialist results contain findings, evidence
-references, unresolved questions, changed fields, and input/output fingerprints.
-`action_contracts.py` defines explicit input and output allowlists for every executable
-operation. Specialists receive a deep copy of the input projection; newly added state
-fields are not automatically visible. Patch keys, removals and types are checked by the
-specialist and again by the merger. The controller merges only after identity and
-version checks. Specialists cannot change the user query, explicit time/reference constraints,
-selected scope, or deliverables. The Writing Agent also cannot mutate the evidence
-pool or claim authorization.
-
-The controller updates task-graph status and rebuilds the main context after every
-specialist result. Existing retrieval loops, evidence recovery, writing renderers,
-claim verification, and final quality gates remain authoritative. A successful
-specialist call does not imply that the overall research result passed its gates.
-
-During quality recovery, deterministic handoff rules constrain the main and child
-loops to advance newly admitted hybrid candidates through detail, card, route and
-claim actions. Model decisions remain inside those allowed actions; moving work to
-another role requires a report and a new main delegation. This uses the existing
-action contracts and keeps the model-facing context at the same five fields.
-Metadata/card changes invalidate dependent plans and gates within the same Controller
-commit as the specialist result and observation; removed artifacts are also
-removed from the manifest before the next checkpoint can hydrate them.
-
-## Research memory retrieval loop
-
-`research_memory_artifact_ref` is an actual retrieval input. Before each main
-decision, `prepare_memory_context` checks availability and evicts cached results when
-the task goal changes. After an explicit search, later rounds refresh the summary
-cursor and remove decisions/questions that are no longer in the latest snapshot.
-The last search `cursor` remains distinct from `current_cursor`; refreshing validity
-does not claim that a cached query scanned newly added memories.
-Full summary contents are never automatically injected on every round.
-
-```text
-Current task → main chooses search_research_memory(query, kind, limit)
-→ session-scoped summary/failure lookup → ranked bounded Status Bar records
-→ main decision + optional memory_feedback → real action → outcome audit event
-```
-
-`ResearchMemoryRetriever` resolves the summary with session, role and artifact-type
-checks. It uses normalized English terms and Chinese bigrams. The model generates
-the query; ranking is deterministic lexical overlap, with recent records preferred
-on ties. This is neither vector retrieval nor a cross-session memory store.
-
-The current summary supplies findings, active decisions and open questions. Up to
-16 summary versions (including current) contribute historical findings only;
-invalidated decisions and resolved questions cannot be resurrected from older
-versions. The latest 200 `agent_failure` events supply failure experience, including
-specialist failures. Hitting a scan horizon yields `search_complete=false`; an empty
-result cannot prove that no earlier memory exists. `result_limited` marks output
-truncation. Both flags reach `state.memory_retrieval`.
-
-Results default to at most three records and `RESEARCH_MEMORY_CONTEXT_CHARS=1600`
-JSON characters, also capped at half `AGENT_CONTEXT_TOOL_RESULT_CHARS`. Each record
-carries an immutable summary/event source, a stable memory ID and explicit historical,
-revalidation and no-evidence-authorization flags. A large Status Bar drops retrieved
-memory before explicit constraints, current evidence and blocking questions. Memory
-queries count toward main round/no-progress limits and cannot grant research progress.
-
-Main decisions may report `memory_feedback` with `memory_id`, `disposition`
-(`used`, `irrelevant`, `outdated`) and a short reason. Native calls carry it as tool
-metadata; JSON responses carry it at the top level. Validation accepts only IDs in
-the actual bounded decision context, and metadata is removed before handler calls.
-`memory_feedback` audit events distinguish presentation from declared use;
-`memory_action_outcome` links the following control/delegated action's lifecycle,
-business outcome and delegation status. Declared use does not prove causal benefit.
-Audit keys are idempotent per decision; results and pending feedback survive state
-checkpoints. Read/write failures are diagnostic, and cancellation/lease/budget stops
-remain effective. Graph-only execution without the session store does not inject
-cached research memory.
-
-Compaction prioritizes `AGENT_CONTEXT_FAILURE_ITEMS=2` recent failures whose action
-has no later successful observation, within the existing total item/character/window
-limits. Success unpins the old failure; its archived observation and failure event
-remain queryable. Historical memory never changes user constraints, evidence admission,
-claim authorization or final gates. Real-provider retrieval usefulness, cost and
-latency have not been measured.
-
-## Configuration
-
-The compact view is controlled by:
-
-```text
-MAIN_CONTEXT_MAX_CHARS
-MAIN_CONTEXT_MAX_EVIDENCE
-MAIN_CONTEXT_MAX_DECISIONS
-MAIN_CONTEXT_MAX_OPEN_QUESTIONS
-MAIN_CONTEXT_SYSTEM_RESERVE_CHARS
-MAIN_CONTEXT_OUTPUT_RESERVE_CHARS
-AGENT_EXECUTION_ACTION_BUDGET
-AGENT_MAIN_MAX_ROUNDS
-AGENT_MAIN_NO_PROGRESS_LIMIT
-AGENT_MAIN_TOKEN_BUDGET
-AGENT_RETRIEVAL_BUDGET
-AGENT_EXECUTION_DEADLINE_SECONDS
-LLM_NATIVE_TOOLS_ENABLED
-```
-
-Context limits control the model-facing view; execution budgets can stop work.
-Neither lowers reference targets, deletes evidence, or changes validation counts.
-Database-backed conversation execution uses a session lease and database CAS. Each
-successful action commits its task result, artifact references, checkpoint, budget and
-event in one transaction. Attempts reserve and settle independently so failed, cancelled
-or stale research results cannot erase incurred usage. Public session saves also check
-the execution lease/version. The graph-only Python entry remains an in-memory mode.
-See [runtime, recovery and cache boundaries](agent-runtime-and-cache.md) for migration,
-explicit checkpoint resume, action dependencies and validation evidence.
-
-恢复细节继续外置在现有历史与候选拒绝记录中，不增加 Main Agent 的五字段。
-Controller 在创建重写任务和预留预算前执行与动作注册表、外层恢复一致的资格检查；
-task 幂等键包含 objective，不能替代这一限制。自主重写候选被回滚时保存操作和
-恢复输入指纹，随现有状态持久化。恢复历史新增可选的验证前指纹，允许同输入的
-新语义判定结算真实进展；旧历史默认空值，保持兼容和保守判断。
-
-
-## 终止观察与请求提交边界（2026-11-14）
-
-ReActContext.observe 默认归档完整观察并记录失败记忆。取消、失权、预算/上下文阻断及其他终止异常的清理使用 observe_terminal：调用 observe(archive=False)，仅补齐内存中的工具配对，既不写 Artifact，也不写研究失败记忆。清理自身发生容量或轨迹错误时记录 terminal_observation_failed，不覆盖原始异常及主任务终态。正常研究观察继续使用默认归档行为。
-
-request 将新目标作为候选消息参与容量估算，归档旧 Epoch 时只包含此前已经接受的目标和消息。压缩在独立轨迹副本中进行，只有最终窗口检查通过，才替换轨迹并追加本轮目标/状态栏；配置错误、归档错误或压缩后仍超窗时保留原轨迹。容量失败不代表新用户约束被放宽，用户请求与权威约束仍由研究状态持有。
-
-进展检测保留委派前、动作提交后及主控消费后的采样点。在运行期作用域内，内容相同的完整进展载荷复用最终摘要；副本比较仍能识别嵌套质量状态修改。没有新增持久化的“最新指纹”字段，也没有把固定采样次数当作已经测得的端到端加速比例。
-
-
-## 状态栏就绪计算与重复反馈（2026-11-14）
-
-状态栏就绪投影在本次活动预算作用域中缓存。依赖包括卡片、论文详情筛选资格、主张、引用分配、交付物、篇数、语义重点、引用计数、原请求与改约记录及阈值政策；输入变化重算，返回副本，缓存不进入研究快照。构建依赖指纹仍需要读取输入，不声称整体为O(1)。Writer实际入口继续直接执行 check_generation_readiness，状态栏缓存不授予写作权限。
-
-recent_trajectory 在权威五字段中保留；构造本轮模型请求时，仅省去与压缩后实际保留观察完全一致的任务摘要。未保留的反馈继续进入状态栏。历史状态消息保持追加式协议，不改为瞬态尾部，也不预设Token下降比例。
-
-
-## 通信压缩优先级与子角色轻量控制视图（2026-11-14）
-
-五字段超预算时，先压缩历史通信、近期轨迹与旧失败原因，再裁关键证据。每个角色最新的 needs_help/blocked 通信仍受保护；用户硬约束与blocking问题保留。当前必要信息本身超预算时继续明确阻断，不为挤入窗口静默删除。压缩只改变视图副本，原始通信与证据仍在权威状态中。
-
-专业循环常规路径只构建一次契约投影上下文。目标、门禁、失败原因与预算通过与主构建器共用的轻量函数从最新权威状态读取；旧检查点上下文包缺少摘要时才回退完整构建。委派选择仍按决策时的快照验证，目标若已变化会拒绝。就绪投影缓存扩展为执行期内最多8条LRU结果，以应对投影与完整视图交替访问；依赖仍覆盖篇数、资格、主张、语义和分配等条件。
-
-status/research_status、remaining_action_budget/budget_remaining.recovery 的同义字段只在模型输入投影中合并；持久化schema继续兼容旧快照。
-
-### 瞬态Status Bar离线对照
-
-复现：`python scripts/benchmark_status_history.py --output data/status_history_experiment.json`。实验使用合成材料、固定10轮，关闭压缩干扰，不调用Provider。追加式输入估算上界累计321527、末轮58518；瞬态实验累计79013、末轮9952。该估计为UTF-8字节上界加固定开销，不是服务商计费Token。
-
-追加式保留前次完整请求前缀9次，瞬态实验0次；这不代表后者没有固定系统/工具前缀缓存。实时Capture两组均记录10份上下文，但该实验没有验证进程崩溃后仅凭旧检查点重建瞬态请求，也没有真实模型质量/费用对照。因此生产默认继续追加式；瞬态仅作为离线实验，不将输入体积减少宣传为已测成本或质量收益。历史报告采集兼容路径保持不变。
+The retired context-selection and one-action delegation protocol is a historical
+test reference. Current decisions use Profiles.
+See [runtime and cache](agent-runtime-and-cache.md) and
+[retirement verification](validation/2026-11-18-v2-runtime-retirement.md).

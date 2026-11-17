@@ -9,13 +9,14 @@ from app.agent.action_registry import (
 )
 from app.agent.context_builder import _goal, _stable_hash, context_source_fingerprint
 from app.agent.execution_budget import check_execution, AgentExecutionCancelled
-from app.agent.main_policy import MainAgentPolicy, AgentDecisionError
+from tests.reference_v1.main_policy import MainAgentPolicy, AgentDecisionError
 from app.agent.react_context import ReActContext, execute_context_recall, observe_terminal
 from app.agent.sidecar import ActionSidecar
-from app.agent.delegation_context import context_packet, subagent_context
+from tests.reference_v1.delegation_context import context_packet, subagent_context
 from app.core.config import get_settings
 from app.core.exceptions import LLMInvocationError
-from app.prompt.agent_system import SYSTEM_PROMPTS, SUBAGENT_REACT_PROMPT, SUBAGENT_REPORT_REPAIR_HINT
+from app.prompt.agent_system import SYSTEM_PROMPTS
+from tests.reference_v1.prompts import SUBAGENT_REACT_PROMPT, SUBAGENT_REPORT_REPAIR_HINT
 from app.schemas.agent_message_schema import AgentMessage, SubagentReport
 from app.schemas.agent_task_schema import AgentRole, AgentTaskResult, AgentTaskStatus, AgentTaskOutcome
 
@@ -68,7 +69,7 @@ def record_subagent_observation(state, payload):
     active["last_result"] = payload
     if payload.get("status") == "completed":
         active["completed_operations"].append(payload["operation"])
-    from app.agent.main_loop import _progress_fingerprint
+    from tests.reference_v1.main_loop import _progress_fingerprint
     progress = _progress_fingerprint(state)
     active["no_progress"] = active["no_progress"] + 1 if progress == active["progress"] else 0
     active["cycled"] = progress != active["progress"] and progress in active["recent_progress"]
@@ -118,7 +119,7 @@ class SubagentLoop:
         else:
             spec = ACTION_REGISTRY[decision.action]
             role = spec.role.value
-            from app.agent.main_loop import _progress_fingerprint
+            from tests.reference_v1.main_loop import _progress_fingerprint
             progress = _progress_fingerprint(state)
             try:
                 packet = context_packet(state, decision, decision_context=decision_context)

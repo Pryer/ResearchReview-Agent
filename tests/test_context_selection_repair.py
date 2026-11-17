@@ -5,8 +5,8 @@ import json
 import pytest
 
 from app.agent.context_builder import build_main_agent_context
-from app.agent.delegation_context import ContextSelectionError, validate_planning
-from app.agent.main_policy import AgentDecisionError, MainAgentPolicy
+from tests.reference_v1.delegation_context import ContextSelectionError, validate_planning
+from tests.reference_v1.main_policy import AgentDecisionError, MainAgentPolicy
 from app.schemas.agent_decision_schema import AgentDecision, ContextSelection
 from app.schemas.context_schema import KeyEvidence
 from scripts.e2e_observation import RunObserver
@@ -87,21 +87,24 @@ def test_ids_from_another_namespace_are_not_accepted(field):
     assert str(caught.value) == "selected context ID is outside the current status bar"
 
 
-def test_e2e_observer_keeps_rejected_selection_without_changing_exception(tmp_path):
+def test_e2e_observer_keeps_task_protocol_failure_without_changing_exception(tmp_path, monkeypatch):
     observer = RunObserver(tmp_path / "events.jsonl")
-    decision = AgentDecision(action="fetch_metadata", context_selection=ContextSelection(evidence_ids=[PAPER_ID]))
+    from app.agent.task_main import TaskMainPolicy
+    from app.agent.react_context import ReActContext
+    from app.core.config import get_settings
+    from tests.test_subagent_react import ScriptedLLM
+    from app.agent.runtime.errors import AgentDecisionError
+    monkeypatch.setattr(get_settings(), 'agent_decision_repair_attempts', 1)
     context = build_main_agent_context(state())
-    # 从模块取函数，覆盖真实调用方的晚导入路径。
-    from app.agent import delegation_context
+    llm = ScriptedLLM({'main_agent_decision': [('fetch_metadata', {})]})
     with observer.installed():
-        with pytest.raises(ContextSelectionError):
-            delegation_context.validate_planning(decision, context)
+        with pytest.raises(AgentDecisionError, match='repair exhausted'):
+            TaskMainPolicy(llm).decide(context, ['report_blocked'], ReActContext(state()))
     event = observer.events[-1]
-    assert event["kind"] == "decision_context_rejection"
-    assert event["selection"]["evidence_ids"] == [PAPER_ID]
-    assert event["invalid_ids"] == {"evidence_ids": [PAPER_ID]}
-    assert event["allowed_ids"]["evidence_ids"] == []
-    assert set(event) == {"sequence", "kind", "stage", "action", "selection", "invalid_ids", "allowed_ids"}
+    assert event['kind'] == 'main_decision_rejection'
+    assert event['error_type'] == 'AgentDecisionError'
+    assert event['allowed_actions'] == ['report_blocked']
+    assert set(event) == {'sequence', 'kind', 'stage', 'error_type', 'allowed_actions'}
 
 
 def _previous_plan(current):
@@ -111,7 +114,7 @@ def _previous_plan(current):
 
 
 def test_main_new_plan_does_not_invalidate_its_own_selected_previous_summary():
-    from app.agent.main_loop import MainAgentLoop
+    from tests.reference_v1.main_loop import MainAgentLoop
     from tests.test_subagent_react import fetch, report
     current = state()
     current["ranked_papers"] = [{"paper_id": "p1", "title": "待获取论文"}]
@@ -133,7 +136,7 @@ def test_main_new_plan_does_not_invalidate_its_own_selected_previous_summary():
 
 def test_selected_snapshot_survives_restart_after_main_plan_replacement(agent_artifacts):
     from app.agent.controller import AgentController
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     from tests.test_subagent_react import fetch, report
     class Crash(BaseException):
         pass
@@ -158,7 +161,7 @@ def test_selected_snapshot_survives_restart_after_main_plan_replacement(agent_ar
 
 def test_prepared_snapshot_does_not_replace_latest_gate_or_goal():
     from app.agent.controller import AgentController
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     from tests.test_subagent_react import search, report
     current = state()
     selected_id = _previous_plan(current)
@@ -182,7 +185,7 @@ def test_prepared_snapshot_does_not_replace_latest_gate_or_goal():
 @pytest.mark.parametrize("native", [True, False])
 def test_oversized_report_repairs_without_reexecuting_tool(native):
     from app.agent.controller import AgentController
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     from tests.test_subagent_react import search, report
     current = state()
     calls = []
@@ -203,7 +206,7 @@ def test_oversized_report_repairs_without_reexecuting_tool(native):
 
 def test_repeated_oversized_report_returns_main_at_original_retry_limit():
     from app.agent.controller import AgentController
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     from tests.test_subagent_react import search, report
     child = ScriptedLLM({"search_agent_decision": ["search_and_rank", report(message="X" * 1201), report(message="X" * 1201)]})
     current = state()
@@ -217,7 +220,7 @@ def test_repeated_oversized_report_returns_main_at_original_retry_limit():
 
 @pytest.mark.parametrize("passes", [True, False])
 def test_unchanged_candidate_is_validated_before_no_progress_decision(monkeypatch, passes):
-    from app.agent.main_loop import MainAgentLoop
+    from tests.reference_v1.main_loop import MainAgentLoop
     from app.core.config import get_settings
     from tests.test_subagent_react import report
     monkeypatch.setattr(get_settings(), "agent_main_no_progress_limit", 1)
@@ -245,7 +248,7 @@ def test_unchanged_candidate_is_validated_before_no_progress_decision(monkeypatc
 
 
 def test_candidate_cycle_is_checked_after_validation(monkeypatch, store):
-    from app.agent.main_loop import MainAgentLoop
+    from tests.reference_v1.main_loop import MainAgentLoop
     from app.core.config import get_settings
     from tests.test_subagent_react import report
     monkeypatch.setattr(get_settings(), "agent_main_no_progress_limit", 3)
@@ -273,7 +276,7 @@ def test_candidate_cycle_is_checked_after_validation(monkeypatch, store):
 @pytest.mark.parametrize("native", [True, False])
 def test_finished_validation_cannot_be_repeated_and_repairs_to_report(native):
     from app.agent.controller import AgentController
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     from tests.test_subagent_react import report
     current = state()
     current["review"] = "待验证正文"
@@ -294,7 +297,7 @@ def test_finished_validation_cannot_be_repeated_and_repairs_to_report(native):
 
 def test_finished_validation_returns_main_after_bounded_illegal_report_attempts():
     from app.agent.controller import AgentController
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     current = state()
     current["review"] = "待验证正文"
     seen = []

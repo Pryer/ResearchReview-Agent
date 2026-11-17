@@ -15,9 +15,10 @@ from app.schemas.deliverable_schema import (
     WritingSection,
 )
 from app.tools.cluster_papers import semantic_route_label
-from app.services.evidence_support import authorized_field_claim
+from app.services.evidence_support import authorized_field_claim, independent_spans
 
 _FALLBACK_THEME_RE = re.compile(r"其他|其它|未分类|兜底|other|misc", re.I)
+_YEAR_FOCUS_RE = re.compile(r"\d{4}\s*年?(?:\s*[-~—–到至]\s*\d{4}\s*年?)?")
 
 # 独立成节所需的最低论文数：spec 要求每条路线做“路线内比较”而非逐篇
 # 复述（planning.require_comparative_synthesis），两篇只能并列、三篇起
@@ -109,11 +110,7 @@ def build_writing_plan(
     else:
         citation_target = spec.min_references
     citation_target = min(citation_target, len(usable_ids))
-    required_focuses = [
-        str(item).strip()
-        for item in (state.get("research_semantic_frame") or {}).get("required_focuses") or []
-        if str(item).strip()
-    ]
+    required_focuses = _writing_focuses(state)
     covered_focuses, undercovered_focuses = _evaluate_focus_coverage(
         required_focuses, sections, semantic_frame
     )
@@ -171,6 +168,51 @@ def build_writing_plan(
         covered_focuses=covered_focuses,
         undercovered_focuses=undercovered_focuses,
     )
+
+
+def _writing_focuses(state: dict[str, Any]) -> list[str]:
+    from app.agent.evidence_roles import is_temporal_qualifier_text
+    from app.agent.slot_extractor import extract_year_range
+
+    years = (state.get("start_year"), state.get("end_year"))
+    focuses = []
+    for item in (state.get("research_semantic_frame") or {}).get("required_focuses") or []:
+        focus = str(item).strip()
+        if not focus or is_temporal_qualifier_text(focus):
+            continue
+        # WHY: 旧会话可能把精确年份放进研究重点。已编译到检索范围的年份由年份门禁检查。
+        if years[1] and _YEAR_FOCUS_RE.fullmatch(focus) and extract_year_range(focus, years[1]) == years:
+            continue
+        focuses.append(focus)
+    return focuses
+
+
+def _supported_overview_domains(state: dict[str, Any], paper_ids: list[str]) -> list[str]:
+    frame = state.get("research_semantic_frame") or {}
+    focuses = set(_writing_focuses(state))
+    domains = [domain for domain in frame.get("application_domains") or []
+               if (domain.get("label") or domain.get("surface_text")) in focuses]
+    if not domains:
+        return []
+    allowed = set(paper_ids)
+
+    def normalize(text):
+        return re.sub(r"[^\w]|_", "", str(text or "").casefold())
+
+    sources = [
+        normalize(span["text"])
+        for card in state.get("paper_cards") or [] if card.get("paper_id") in allowed
+        for span in independent_spans(card)
+    ]
+    supported = []
+    for domain in domains:
+        label = domain.get("label") or domain.get("surface_text")
+        aliases = {normalize(value) for value in
+                   [label, domain.get("id"), domain.get("surface_text"), *(domain.get("aliases") or [])]}
+        # WHY: 只有已入选论文的可定位原文命中场景，才可将该研究场景分配给综述概述。
+        if any(alias and alias in source for alias in aliases for source in sources):
+            supported.append(label)
+    return list(dict.fromkeys(supported))
 
 
 def _build_background_plan(
@@ -367,6 +409,9 @@ def _build_research_status_plan(
         overview_supporting = list(dict.fromkeys([*route_paper_ids, *usable_ids]))
     else:
         overview_supporting = usable_ids
+    supported_domains = _supported_overview_domains(state, overview_supporting)
+    if supported_domains:
+        overview_purpose += "。围绕" + "、".join(supported_domains) + "归纳有原文支撑的研究进展"
     sections = [WritingSection(
         id="status_overview",
         title=visible_title,

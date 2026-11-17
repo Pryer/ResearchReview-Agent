@@ -37,6 +37,7 @@ def _section_input_fingerprint(
     plan: WritingPlan,
     section,
     state: dict[str, Any],
+    llm=None,
 ) -> str:
     allocation = next((
         item for item in (state.get("citation_allocation_plan") or {}).get("sections") or []
@@ -102,7 +103,7 @@ def _section_input_fingerprint(
             & section_paper_ids
         ),
         # 综述论文清单注入每一节提示词，是唯一的合法全局输入。
-        "fingerprint_schema": 2,
+        "fingerprint_schema": 3,
         "survey_papers": _survey_papers(projected),
         "projected_cards": [card for card in projected if str(card.get("paper_id")) in section_paper_ids],
         "original": _split_planned_sections(draft, plan).get(section.id, ""),
@@ -119,6 +120,14 @@ def _section_input_fingerprint(
             state.get("claim_plans"), section.title
         ),
     }
+    from app.services.role_execution_profile import execution_profile
+    from app.prompt.writing.section import _section_rewrite_prompt
+    from app.deliverables.few_shot_blueprints import get_section_blueprint
+    import inspect
+    # WHY: 章节输入相同但写手或提示已变化时，旧局部检查点也必须重新生成/核验。
+    payload['writer'] = execution_profile(llm, 'writing')['fingerprint']
+    payload['prompt_source'] = inspect.getsource(_section_rewrite_prompt)
+    payload['blueprint'] = get_section_blueprint(plan.deliverable_type, section.id)
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()[:20]
@@ -127,6 +136,7 @@ def _section_input_fingerprint(
 def _reusable_checkpoint_sections(
     plan: WritingPlan,
     state: dict[str, Any],
+    llm=None,
 ) -> dict[str, str]:
     """返回本轮无需生成且依赖指纹仍匹配的已验证章节。"""
     target_ids = {str(value) for value in state.get("target_section_ids") or [] if value}
@@ -141,7 +151,7 @@ def _reusable_checkpoint_sections(
         if (
             checkpoint.get("status") not in {"validated", "writer_validated", "reused"}
             or checkpoint.get("input_fingerprint")
-            != _section_input_fingerprint(plan, section, state)
+            != _section_input_fingerprint(plan, section, state, llm)
             or not str(checkpoint.get("text") or "").strip()
         ):
             continue
@@ -153,6 +163,7 @@ def _reuse_and_checkpoint_sections(
     text: str,
     plan: WritingPlan,
     state: dict[str, Any],
+    llm=None,
 ) -> str:
     """复用未受影响的已验证章节，并保存本轮章节候选。"""
     sections = _split_planned_sections(text, plan)
@@ -164,7 +175,7 @@ def _reuse_and_checkpoint_sections(
     merged: list[str] = []
     for section in plan.sections:
         key = _section_checkpoint_key(plan, section.id)
-        fingerprint = _section_input_fingerprint(plan, section, state)
+        fingerprint = _section_input_fingerprint(plan, section, state, llm)
         current = sections.get(section.id, "")
         previous = verified.get(key) or {}
         reused = bool(
@@ -427,7 +438,7 @@ def write_deliverable(
             'reason': '引用计划存在没有可用授权声明的论文', 'paper_ids': missing})
         return ''
     renderer = get_renderer(plan.deliverable_type)
-    reusable_sections = _reusable_checkpoint_sections(plan, state)
+    reusable_sections = _reusable_checkpoint_sections(plan, state, llm)
     sentinel = object()
     previous_reusable = state.get("_reusable_section_texts", sentinel)
     if reusable_sections:
@@ -463,4 +474,4 @@ def write_deliverable(
     from app.core.citation_density import break_citation_dumps
 
     final_text = break_citation_dumps(str(text or ""))
-    return _reuse_and_checkpoint_sections(final_text, plan, state)
+    return _reuse_and_checkpoint_sections(final_text, plan, state, llm)

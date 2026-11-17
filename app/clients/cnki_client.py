@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from app.services.tool_execution import research_tool
+
 import hashlib
 import io
 import json
@@ -913,6 +915,9 @@ def resolve_detail_enrichment_limit(max_results: int) -> int:
     return min(ceiling, max(baseline, demand))
 
 
+
+
+@research_tool('paper_search')
 def search_cnki(
     query: str,
     start_year: int,

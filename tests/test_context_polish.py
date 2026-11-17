@@ -70,14 +70,14 @@ def test_model_projection_omits_aliases_without_changing_snapshot_schema():
 
 
 def test_subagent_builds_one_context_and_reads_fresh_authoritative_controls():
-    from app.agent.delegation_context import subagent_context
+    from tests.reference_v1.delegation_context import subagent_context
     current = {'topic': 'topic', 'user_query': 'topic', 'research_plan': {'task_graph': []},
                'subagent_sessions': {'search': {'messages': []}},
                'quality_gate': {'passed': False}, 'result_status': 'blocked',
                'agent_execution_budget': {'token_limit': 100, 'llm_tokens': 20}}
     active = {'id': 'd', 'operation': 'search_and_rank', 'objective': 'search', 'arguments': {},
               'evidence_refs': [], 'completed_operations': [], 'rounds': 0}
-    with patch('app.agent.delegation_context.build_main_agent_context', wraps=build_main_agent_context) as build:
+    with patch('tests.reference_v1.delegation_context.build_main_agent_context', wraps=build_main_agent_context) as build:
         result = subagent_context(current, 'search', active, ['search_and_rank'])
     assert build.call_count == 1
     assert result.state.gate_status['quality'] is False

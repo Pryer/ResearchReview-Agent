@@ -6,6 +6,8 @@ arXiv 提供免费的 Atom XML API，无需 API key。
 
 from __future__ import annotations
 
+from app.services.tool_execution import research_tool
+
 import time
 import threading
 import xml.etree.ElementTree as ET
@@ -150,6 +152,9 @@ def _format_arxiv_query(query: str, force_phrase: bool = False) -> str:
     return f"all:{clean_q}"
 
 
+
+
+@research_tool('paper_search')
 def search_arxiv(
     query: str,
     start_year: int,

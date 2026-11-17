@@ -5,7 +5,7 @@ import pytest
 from app.agent import graph
 from app.agent.checking import build_check_report, check_input_fingerprint, check_is_current
 from app.agent.controller import AgentController
-from app.agent.main_loop import MainAgentLoop
+from tests.reference_v1.main_loop import MainAgentLoop
 from app.agent.subagents.base import AgentBoundaryViolation
 from app.schemas.agent_task_schema import AgentRole, AgentTaskResult
 from app.schemas.check_schema import SuggestedAction
@@ -236,7 +236,7 @@ def test_blocking_claim_issue_cannot_coexist_with_passed_verdict():
 
 
 def test_unfinished_legacy_analysis_validation_is_redelegated_to_check(store):
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     from app.schemas.agent_decision_schema import AgentDecision
     from app.agent.context_builder import context_source_fingerprint
     s=prepared();s.update(review='历史候选',pending_result_validation=True,active_subagent='analysis')
@@ -264,7 +264,7 @@ def test_rejected_report_reference_survives_rollback_and_restart(store):
 
 @pytest.mark.parametrize('after_commit',[True,False])
 def test_model_protocol_failure_returns_structured_result_without_replaying(after_commit):
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     from app.schemas.agent_decision_schema import AgentDecision
     from app.core.exceptions import LLMInvocationError
     s=prepared();s['review']='待核验';calls=[]
@@ -280,7 +280,7 @@ def test_model_protocol_failure_returns_structured_result_without_replaying(afte
 
 
 def test_model_provider_balance_failure_still_stops_execution():
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     from app.schemas.agent_decision_schema import AgentDecision
     from app.core.exceptions import LLMProviderUnavailableError
     s=prepared();s['review']='待核验'
@@ -290,7 +290,7 @@ def test_model_provider_balance_failure_still_stops_execution():
 
 
 def test_report_suggestions_are_preserved_in_unified_result():
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     from app.schemas.agent_decision_schema import AgentDecision
     s=state()
     llm=ScriptedLLM({'search_agent_decision':['search_and_rank',report(suggestions=['fetch_metadata'])]})
@@ -335,7 +335,7 @@ def test_execution_brief_resets_on_failed_tool():
 
 @pytest.mark.parametrize('native',[True,False])
 def test_subagent_reason_cannot_replace_main_execution_objective(native):
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     from app.schemas.agent_decision_schema import AgentDecision
     from app.agent.task_context import current_task_brief
     s=prepared();seen=[]

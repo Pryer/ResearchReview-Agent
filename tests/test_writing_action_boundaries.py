@@ -7,7 +7,7 @@ import pytest
 from app.agent import graph
 from app.agent.action_contracts import validate_patch
 from app.agent.action_registry import ACTION_REGISTRY
-from app.agent.main_loop import MainAgentLoop
+from tests.reference_v1.main_loop import MainAgentLoop
 from app.agent.writing_plan import build_writing_plan
 
 

@@ -9,8 +9,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.agent.context_builder import build_main_agent_context
-from app.agent.main_loop import MainAgentLoop
-from app.agent.main_policy import AgentDecisionError, MainAgentPolicy
+from tests.reference_v1.main_loop import MainAgentLoop
+from tests.reference_v1.main_policy import AgentDecisionError, MainAgentPolicy
 from app.agent.react_context import ContextBudgetExceeded, ReActContext, encode
 from app.core.config import get_settings
 from app.database.models import Base
@@ -264,7 +264,7 @@ def test_stop_cleanup_preserves_subagent_exception_and_main_status(store, monkey
     from app.agent.execution import AgentCancelledError
     from app.agent.execution_budget import AgentExecutionStale
     from app.database.runtime_repository import RuntimeConflict
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     errors = {e.__name__: e for e in (AgentCancelledError, AgentExecutionStale, RuntimeConflict, ContextBudgetExceeded)}
     original = errors[error_name]('original stop')
     def stopped(*args, **kwargs):
@@ -291,7 +291,7 @@ def test_stop_cleanup_preserves_subagent_exception_and_main_status(store, monkey
 
 
 def test_broken_terminal_memory_cleanup_cannot_replace_original_exception(monkeypatch):
-    from app.agent.subagents.loop import SubagentLoop
+    from tests.reference_v1.subagent_loop import SubagentLoop
     from app.agent.execution_budget import AgentExecutionStale
     current = state()
     current['active_subagent'] = 'search'

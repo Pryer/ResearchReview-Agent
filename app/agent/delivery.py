@@ -166,6 +166,10 @@ def publish_draft(state):
         "verification_status":preflight["verification_status"],"requirements_satisfied":final,
         "quality_report":copy.deepcopy(state.get("check_report") or {}),
         "quality_gate":copy.deepcopy(state.get("quality_gate") or {}),
+        # WHY: 后续私有候选会改写核验与证据；公开正文必须携带同一发布时刻的审查材料。
+        "claim_verification":copy.deepcopy(state.get("claim_verification") or {}),
+        "paper_cards":copy.deepcopy(state.get("paper_cards") or []),
+        "citation_validation":copy.deepcopy(state.get("citation_validation") or {}),
         "citation_map":copy.deepcopy(state.get("citation_map") or {}),
         "citation_registry":copy.deepcopy(state.get("citation_registry") or {}),
         "public_related_work":bool(state.get("related_work")), "public_introduction":bool(state.get("introduction")),
@@ -201,6 +205,9 @@ def delivery_output(state, output):
             draft_available=True,draft_released=True,draft_disposition="approved" if record["grade"]=="final" else "released_best_effort")
         output["citation_map"]=copy.deepcopy(record.get("citation_map") or {})
         output["citation_registry"]=copy.deepcopy(record.get("citation_registry") or {})
+        # WHY: 历史版本未冻结的材料保持未知，不能借用当前候选的核验结果补齐。
+        for key, empty in (("claim_verification", {}), ("paper_cards", []), ("citation_validation", {})):
+            output[key]=copy.deepcopy(record.get(key, empty))
         output["published_quality_report"]=copy.deepcopy(record.get("quality_report") or {})
         output["related_work"]=record["body"] if record.get("public_related_work") else None
         output["introduction"]=record["body"] if record.get("public_introduction") else None

@@ -180,7 +180,7 @@ def test_background_job_auto_exports_after_actual_terminal_status(reports,monkey
 def test_real_main_subagent_loop_captures_context_and_role_continuity(reports):
     db,_=reports
     from tests.test_subagent_react import ScriptedLLM,state,search,fetch
-    from app.agent.main_loop import MainAgentLoop
+    from tests.reference_v1.main_loop import MainAgentLoop
     from app.agent.execution_budget import budget_scope
     from app.services.durable_execution_service import durable_scope
     from app.services.research_artifact_service import ResearchArtifactService
@@ -211,7 +211,7 @@ def test_policy_handoff_has_its_own_context_without_extra_llm_call(reports):
     db,_=reports
     from tests.test_draft_delivery_policy import draft_state
     from tests.test_subagent_react import ScriptedLLM
-    from app.agent.main_loop import MainAgentLoop
+    from tests.reference_v1.main_loop import MainAgentLoop
     from app.agent.delivery import published_delivery
     s=draft_state();s['pending_result_validation']=True;cap=Capture('s','已有材料先交草稿')
     llm=ScriptedLLM({'main_agent_decision':['request_finish']})

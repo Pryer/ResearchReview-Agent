@@ -216,6 +216,15 @@ class ResearchConversationService:
             raise ValueError("当前会话不处于可恢复的中断状态")
         state = dict(session.get("state") or {})
         editable = dict(state.get("editable_research_state") or {})
+        from app.services.durable_execution_service import active_runtime
+        runtime = active_runtime()
+        if runtime:
+            restored = runtime.restore()
+            # WHY: 活动委派与显式配置修订以执行检查点为准，不能被较旧的会话结果覆盖。
+            if restored.get('active_subagent') or restored.get('active_delegation_id') or restored.get('architecture_version') == 2:
+                editable = restored
+            elif restored.get('effective_config'):
+                editable['effective_config'] = restored['effective_config']
         if not editable or not state.get("runtime_checkpoint_version"):
             raise ValueError("当前会话没有已提交的执行检查点")
         # WHY: 恢复是一个明确的新操作，只重决策未完成工作；原约束、证据和消耗全部保留。

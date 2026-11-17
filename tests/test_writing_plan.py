@@ -64,6 +64,24 @@ def _make_paper_card(paper_id: str, title: str, summary: str = "", method: str =
     }
 
 
+@pytest.mark.parametrize("source_status, expected", [
+    ("source_verified", True), ("source_unverified", False),
+])
+def test_status_plan_preserves_source_backed_domain_and_keeps_years_as_scope(source_status, expected):
+    card = _make_paper_card("p1", "Grounded retrieval for open-domain question answering")
+    excerpt = "We evaluate retrieval for open-domain question answering."
+    card["evidence_spans"] = [{"evidence_id": "p1:e1", "text": excerpt, "source_type": "abstract",
+                               "source_status": source_status, "char_start": 0, "char_end": len(excerpt)}]
+    state = {"paper_cards": [card], "start_year": 2020, "end_year": 2023, "year_range_explicit": True,
+             "research_semantic_frame": {"required_focuses": ["开放域问答", "2020—2023年"],
+                 "application_domains": [{"id": "open_domain_question_answering", "label": "开放域问答"}]}}
+    plan = build_writing_plan(CoreDeliverableType.RESEARCH_STATUS, state)
+    assert plan.required_focuses == ["开放域问答"]
+    assert ("开放域问答" in plan.covered_focuses) is expected
+    assert ("开放域问答" in plan.undercovered_focuses) is not expected
+    assert (state["start_year"], state["end_year"]) == (2020, 2023)
+
+
 def test_structured_focus_ids_resolve_through_concepts_and_requirements():
     frame = {
         "research_objects": [

@@ -3,14 +3,14 @@
 from __future__ import annotations
 from tests.agent_decision_fakes import completed_verifier, accept_check_kwargs
 
-from app.agent.main_loop import MainAgentLoop, _progress_fingerprint
+from tests.reference_v1.main_loop import MainAgentLoop, _progress_fingerprint
 from tests.test_main_delegation_context import agent_artifacts
 
 
 def test_progress_digest_cache_detects_nested_mutation_and_ignores_reordering():
-    from app.agent.main_loop import progress_cache_scope
+    from tests.reference_v1.main_loop import progress_cache_scope
     from unittest.mock import patch
-    import app.agent.main_loop as module
+    import tests.reference_v1.main_loop as module
     state = {'paper_cards': [{'paper_id': 'p', 'spans': [{'text': 'original'}]},
                              {'paper_id': 'q', 'spans': []}]}
     original = module.json.dumps
@@ -35,9 +35,9 @@ def test_progress_digest_cache_detects_nested_mutation_and_ignores_reordering():
 
 
 def test_equal_progress_payload_reuses_final_digest_but_nested_quality_invalidates():
-    from app.agent.main_loop import progress_cache_scope
+    from tests.reference_v1.main_loop import progress_cache_scope
     from unittest.mock import patch
-    import app.agent.main_loop as module
+    import tests.reference_v1.main_loop as module
     current = {'quality_gate': {'details': {'passed': False}}}
     original = module.json.dumps
     encoded = []

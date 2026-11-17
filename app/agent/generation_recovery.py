@@ -375,10 +375,14 @@ def rewrite_attempt_exhausted(state: dict[str, Any]) -> bool:
     # WHY: task 幂等键含决策措辞，不能替代恢复资格；改变 objective 或重启
     # 不会让相同正文/证据/授权重新获得已拒绝的重写机会。
     return (RecoveryAction.REWRITE_SECTIONS.value in _used_actions_for_same_input(state, input_fingerprint(state))
-        or any(item.get("action") == RecoveryAction.REWRITE_SECTIONS.value
-               and item.get("outcome") == "no_progress"
-               and item.get("repair_basis_fingerprint") == repair_basis_fingerprint(state)
-               for item in state.get("quality_recovery_history") or []))
+        or _same_basis_rewrite_exhausted(state))
+
+
+def _same_basis_rewrite_exhausted(state: dict[str, Any]) -> bool:
+    failed = {item.get("repair_basis_fingerprint") for item in state.get("quality_recovery_history") or []
+              if item.get("action") == RecoveryAction.REWRITE_SECTIONS.value
+              and item.get("outcome") == "no_progress"}
+    return bool(failed and repair_basis_fingerprint(state) in failed)
 
 
 def reverify_eligible_claim_ids(state: dict[str, Any]) -> list[str]:
@@ -484,6 +488,8 @@ def decide_generation_recovery(
         claim_id for issue in issues for claim_id in issue.affected_claim_ids
     ))
     used = _used_actions_for_same_input(state, fingerprint)
+    if _same_basis_rewrite_exhausted(state):
+        used.append(RecoveryAction.REWRITE_SECTIONS.value)
     allow_search = state.get("allow_evidence_expansion", True) is not False
     # WHY: 任务级恢复预算与证据级恢复预算是两套独立边界。证据恢复已耗尽时
     # TARGETED_SEARCH 必然是空动作，仍按 RECOVERABLE 下发会让主循环重复同一诊断

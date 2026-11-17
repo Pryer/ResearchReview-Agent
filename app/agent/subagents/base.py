@@ -78,6 +78,9 @@ class BaseSubAgent(ABC):
             )
 
         working_state = build_task_state(state, self.role, task.operation)
+        if task.paper_scope:
+            from app.agent.policy.paper_scope import project
+            working_state = project(working_state, task.paper_scope)
         before = copy.deepcopy(working_state)
         from app.agent.execution_budget import AgentFinalizationRequired
         partial_reason = ""

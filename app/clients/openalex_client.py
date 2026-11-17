@@ -6,6 +6,8 @@ OpenAlex 提供完全开放的学术元数据 API，无需 key。
 
 from __future__ import annotations
 
+from app.services.tool_execution import research_tool
+
 import random
 import threading
 import time
@@ -99,6 +101,9 @@ def _reset_cooldown() -> None:
         _COOLDOWN_UNTIL = 0.0
 
 
+
+
+@research_tool('paper_search')
 def search_openalex(
     query: str,
     start_year: int,
@@ -292,6 +297,7 @@ def parse_openalex_response(response_json: dict) -> List[PaperMetadata]:
     return papers
 
 
+@research_tool('metadata_read')
 def get_openalex_detail(work_id: str) -> Optional[dict]:
     """获取 OpenAlex work 详情。"""
     resp = _request_openalex(f"{OPENALEX_API_URL}/{work_id}", params={"mailto": _effective_mailto()})

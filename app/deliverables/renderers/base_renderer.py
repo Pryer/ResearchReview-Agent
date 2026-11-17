@@ -171,6 +171,13 @@ def _write_sections_in_chinese(
         )
         prompt += "\n【本节授权声明及使用边界】\n" + json.dumps(section_cards, ensure_ascii=False)
         prompt += "\n【本次可信引用标签表】\n" + json.dumps(trusted_numbers, ensure_ascii=False)
+        from app.services.section_recovery_cache import descriptor, cached_section, enabled
+        cache_key = descriptor(plan, section, state, llm, prompt) if enabled(section.id, state) else None
+        if cache_key:
+            restored = cached_section(cache_key)
+            if restored and not _validate_rewritten_section(restored, section.title, required_ids, section.heading_level or 2):
+                return section.id, restored, {'section_id': section.id, 'status': 'recovered_calculation',
+                    'attempts': 0, 'required_citations': len(required_ids)}
         last_errors: list[str] = []
         previous_candidate = ""
         best_candidate = ""
@@ -230,6 +237,8 @@ def _write_sections_in_chinese(
                 best_score = score
             previous_candidate = candidate
             if not last_errors:
+                if cache_key:
+                    cached_section(cache_key, text=candidate)
                 return section.id, candidate, {
                     "section_id": section.id,
                     "status": "success",
@@ -283,6 +292,8 @@ def _write_sections_in_chinese(
                 localized_errors.extend(i['reason'] for i in localized_protocol)
                 localized_audit.update(normalized=localized, errors=list(localized_errors))
                 if not localized_errors:
+                    if cache_key:
+                        cached_section(cache_key, text=localized)
                     return section.id, localized, {
                         "section_id": section.id,
                         "status": "success_after_english_repair",

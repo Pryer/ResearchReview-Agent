@@ -19,6 +19,7 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, BadReque
 from app.core.config import get_settings
 from app.core.exceptions import LLMInvocationError, LLMProviderUnavailableError, NativeToolsUnsupportedError
 from app.database.runtime_repository import RuntimeConflict
+from app.agent.react_context import ContextBudgetExceeded
 from app.agent.execution_budget import (
     budgeted_create,
     AgentBudgetExceeded,
@@ -71,6 +72,7 @@ class LLMService:
         self.backup_provider = settings.llm_backup_provider
         self.backup_enabled = settings.llm_backup_enabled
         self._backup_client = None
+        self._role_services = {}
 
     def with_task_settings(self):
         """把进入任务作用域前创建的服务绑定到已持久化配置。"""
@@ -347,7 +349,7 @@ class LLMService:
                 raise LLMProviderUnavailableError("configured LLM providers have insufficient balance") from last_exc
             raise last_exc  # type: ignore[misc]
 
-        except (AgentBudgetExceeded, AgentExecutionCancelled, LLMProviderUnavailableError):
+        except (AgentBudgetExceeded, AgentExecutionCancelled, LLMProviderUnavailableError, ContextBudgetExceeded):
             raise
         except RuntimeConflict as exc:
             # WHY: 账本 CAS/租约检查在个别路径上仍可能抛出裸 RuntimeConflict；
@@ -432,7 +434,7 @@ class LLMService:
                     request_kwargs=kwargs,
                 ))
             try:
-                response = budgeted_create(client, on_response=record_tool_response, operation=operation, **kwargs)
+                response = self._checked_create(client, on_response=record_tool_response, operation=operation, **kwargs)
                 choices = getattr(response, "choices", None) or []
                 calls = (
                     getattr(choices[0].message, "tool_calls", None) or []
@@ -490,6 +492,8 @@ class LLMService:
                 ):
                     continue
                 break
+            except ContextBudgetExceeded:
+                raise
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 last_exc = exc
                 if provider_name == "primary" and self.backup_enabled:
@@ -503,7 +507,49 @@ class LLMService:
 
     def for_agent(self, role: str):
         """返回带稳定系统前缀和固定工具目录的轻量角色视图。"""
-        return _RoleBoundLLM(self, role)
+        return _RoleBoundLLM(self._for_role_settings(role), role, root=self)
+
+    def _for_role_settings(self, role):
+        from app.core.role_model_profiles import profile_for
+        profile = profile_for(role)
+        if profile is None:
+            return self
+        key = (role, profile.model_dump_json())
+        if key in self._role_services:
+            return self._role_services[key]
+        service = copy.copy(self)
+        service._role_services = {}
+        slots = {
+            'primary': (self.api_key, self.base_url, self.model, self.provider, self._client),
+            'backup': (self.backup_api_key, self.backup_base_url, self.backup_model, self.backup_provider, self._backup_client),
+        }
+        if profile.provider_slot == 'backup' and not self.backup_enabled:
+            raise ValueError('role model requires a configured backup provider')
+        service.api_key, service.base_url, service.model, service.provider, service._client = slots[profile.provider_slot]
+        service.model = profile.model or service.model
+        fallback = profile.fallback
+        if fallback == 'inherit':
+            fallback = ('backup' if profile.provider_slot == 'primary' else 'primary')
+            enabled = self.backup_enabled if fallback == 'backup' else bool(self.api_key)
+        else:
+            enabled = fallback != 'disabled'
+            if enabled and not all(slots[fallback][:3]):
+                raise ValueError('role fallback requires a configured provider')
+        service.backup_enabled = enabled
+        if enabled:
+            (service.backup_api_key, service.backup_base_url, service.backup_model,
+             service.backup_provider, service._backup_client) = slots[fallback]
+            service.backup_model = profile.fallback_model or service.backup_model
+        for name in ('temperature', 'max_tokens', 'control_plane_max_tokens', 'native_tools_enabled',
+                     'thinking_enabled', 'thinking_effort'):
+            value = getattr(profile, name)
+            if value is not None:
+                setattr(service, name, value)
+        service.context_window_tokens = profile.context_window_tokens or get_settings().agent_context_window_tokens
+        if service.context_window_tokens <= max(service.max_tokens, service.control_plane_max_tokens):
+            raise ValueError('role context window must exceed output token reserves')
+        self._role_services[key] = service
+        return service
 
     @staticmethod
     def _provider_messages(messages: list[dict[str, Any]], provider: str) -> list[dict[str, Any]]:
@@ -622,6 +668,11 @@ class LLMService:
         started = time.monotonic()
 
         def _record(resp) -> None:
+            if operation == "verify_claim_entailment":
+                from app.services.verifier_profile import set_verifier_receipt
+                set_verifier_receipt({"provider": provider, "requested_model": str(kwargs.get("model") or self.model),
+                                      "response_model": str(getattr(resp, "model", "") or ""),
+                                      "response_id": str(getattr(resp, "id", "") or "")})
             self._record_usage(
                 getattr(resp, "usage", None),
                 model=str(kwargs.get("model") or self.model),
@@ -653,7 +704,7 @@ class LLMService:
         ):
             logger.warning("LLM returned empty JSON response, retrying without response_format")
             kwargs.pop("response_format", None)
-            resp = budgeted_create(client, on_response=_record, operation=operation, **kwargs)
+            resp = self._checked_create(client, on_response=_record, operation=operation, **kwargs)
             resp = self._retry_if_content_empty(kwargs, resp, client=client, record=_record, operation=operation)
             content = _content_of(resp)
         return content
@@ -668,14 +719,14 @@ class LLMService:
         if client is None:
             client = self.client
         try:
-            return budgeted_create(client, on_response=record, operation=operation, **kwargs)
+            return self._checked_create(client, on_response=record, operation=operation, **kwargs)
         except BadRequestError:
             # 模型不支持 response_format=json_object —— 移除参数重试一次。
             if "response_format" not in kwargs:
                 raise
             logger.info("Model does not support response_format, retrying without it")
             kwargs.pop("response_format", None)
-            return budgeted_create(client, on_response=record, operation=operation, **kwargs)
+            return self._checked_create(client, on_response=record, operation=operation, **kwargs)
 
     def _retry_if_content_empty(self, kwargs: dict, resp, client=None, record=None, operation: str = ""):
         """LongCat 等 reasoning 模型可能先消耗 token 到 reasoning_content。
@@ -721,7 +772,16 @@ class LLMService:
             "LLM returned empty content after reasoning tokens; retrying with max_tokens=%d",
             retry_max,
         )
-        return budgeted_create(client, on_response=record, operation=operation, **retry_kwargs)
+        return self._checked_create(client, on_response=record, operation=operation, **retry_kwargs)
+
+    def _checked_create(self, client, **kwargs):
+        window = getattr(self, 'context_window_tokens', None)
+        if window is not None:
+            from app.agent.react_context import estimate_tokens
+            # WHY: 校验最终请求，覆盖主备切换、思考模式及扩额重试；不裁证据、不退已发生费用。
+            if estimate_tokens(kwargs.get('messages') or [], kwargs.get('tools') or []) + int(kwargs['max_tokens']) > window:
+                raise ContextBudgetExceeded('role_context_window_exceeded')
+        return budgeted_create(client, **kwargs)
 
     def is_available(self) -> bool:
         """检查 LLM 是否配置可用（主用或备用任一可用即视为可用）。"""
@@ -729,19 +789,23 @@ class LLMService:
 
 
 class _RoleBoundLLM:
-    """不复制客户端状态，只在消息边界注入稳定角色前缀。"""
+    """绑定角色模型和稳定前缀；共享连接，不修改全局模型参数。"""
 
-    def __init__(self, service: LLMService, role: str) -> None:
+    def __init__(self, service: LLMService, role: str, *, root=None) -> None:
         from app.agent.tool_registry import tools_for_role
         from app.prompt.agent_system import SYSTEM_PROMPTS
 
         if role not in SYSTEM_PROMPTS:
             raise ValueError(f"unknown agent role: {role}")
         self._service = service
+        self._root_service = root if root is not None else service
         self._role = role
         tools = json.dumps(tools_for_role(role), ensure_ascii=False, sort_keys=True)
         self._role_prompt = SYSTEM_PROMPTS[role].strip()
         self._system_prompt = f"{self._role_prompt}\n核心工具目录：{tools}"
+
+    def for_agent(self, role):
+        return self if role == self._role else self._root_service.for_agent(role)
 
     def _task_messages(self):
         from app.agent.task_context import current_task_brief
@@ -754,14 +818,12 @@ class _RoleBoundLLM:
         messages = kwargs.pop("messages", None)
         if messages is None:
             messages = [{"role": "user", "content": prompt}]
-        return self._service.complete_messages(
-            [{"role": "system", "content": self._system_prompt}, *self._task_messages(), *messages],
-            **kwargs,
-        )
+        return self.complete_messages(messages, **kwargs)
 
     def complete_messages(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+        messages = [{"role": "system", "content": self._system_prompt}, *self._task_messages(), *messages]
         return self._service.complete_messages(
-            [{"role": "system", "content": self._system_prompt}, *self._task_messages(), *messages],
+            messages,
             **kwargs,
         )
 
@@ -776,9 +838,10 @@ class _RoleBoundLLM:
         tools: list[dict[str, Any]],
         operation: str = "tool_decision",
     ) -> dict[str, Any]:
+        # WHY: 原生 tools 已携带完整契约；JSON 通道仍保留文本目录。
+        messages = [{"role": "system", "content": self._role_prompt}, *self._task_messages(), *messages]
         return self._service.complete_tool_call(
-            # WHY: 原生 tools 已携带完整契约；JSON 通道仍保留文本目录。
-            [{"role": "system", "content": self._role_prompt}, *self._task_messages(), *messages],
+            messages,
             tools=tools,
             operation=operation,
         )

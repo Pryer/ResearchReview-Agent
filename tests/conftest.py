@@ -23,6 +23,48 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def retired_protocol_reference(request, monkeypatch, tmp_path):
+    """显式历史协议清单只运行测试参考；生产默认与v2专项不替换调度器。"""
+    import json
+    from pathlib import Path
+    from contextlib import nullcontext
+    from app.agent import graph, react_context
+    from app.services import durable_execution_service
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from app.database.models import Base
+    manifest = json.loads((Path(__file__).parent / 'reference_v1/manifest.json').read_text(encoding='utf-8'))
+    historical = request.path.name in manifest['test_modules']
+    if historical or request.path.name == 'test_legacy_checkpoint_migration.py':
+        from tests.reference_v1.subagent_loop import record_subagent_observation
+        original = react_context.record_tool_observation
+        def observe(state, payload):
+            if state.get('active_subagent'):
+                return record_subagent_observation(state, payload)
+            return original(state, payload)
+        monkeypatch.setattr(react_context, 'record_tool_observation', observe)
+    if historical:
+        from tests.reference_v1.pipeline import run_pipeline
+        monkeypatch.setattr(durable_execution_service, 'standalone_execution_scope', lambda state: nullcontext(None))
+        monkeypatch.setattr(graph, '_run_autonomous_pipeline', run_pipeline)
+    else:
+        # WHY: 直接Python入口使用临时库；不让测试初始化或写入开发者的真实研究库。
+        engines = []
+        def session():
+            if not engines:
+                engine = create_engine('sqlite:///' + str(tmp_path / 'standalone.db'), connect_args={'check_same_thread': False})
+                Base.metadata.create_all(engine)
+                engines.append(engine)
+            return sessionmaker(bind=engines[0])()
+        monkeypatch.setattr(durable_execution_service, 'standalone_session', session)
+        yield
+        for engine in engines:
+            engine.dispose()
+        return
+    yield
+
+
+@pytest.fixture(autouse=True)
 def offline_rag_models(monkeypatch, tmp_path):
     from app.core.config import get_settings
     from app.services import retrieval_ranking_service

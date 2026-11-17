@@ -53,6 +53,8 @@ def init_db() -> None:
     """建表（如果不存在）。"""
     from app.database.models import Base
 
+    from app.database.architecture_migrations import migrate_architecture
+    migrate_architecture(engine)
     Base.metadata.create_all(bind=engine)
     _migrate_sqlite_evidence_card_columns()
     logger.info("Database initialized: %s", settings.database_url)
