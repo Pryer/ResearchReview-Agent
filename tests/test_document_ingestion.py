@@ -37,6 +37,65 @@ def test_page_order_and_document_identity_affect_fingerprint():
     assert source_fingerprint({"pages": pages, "source_pdf_hash": "different"}) != first
 
 
+def test_layout_reorders_two_columns_without_merging_page_offsets(tmp_path, monkeypatch):
+    import fitz
+    from app.core.config import get_settings
+    from app.services.source_alignment import locate_quote
+
+    path = tmp_path / "columns.pdf"
+    with fitz.open() as doc:
+        page = doc.new_page()
+        left = "Methods\nLeft column explains the setup."
+        right = "Right column introduces the result\nand the paragraph continues"
+        # The PDF content stream stores the right column first.
+        page.insert_text((350, 90), right)
+        page.insert_text((52, 90), left)
+        doc.new_page().insert_text((52, 90), "on the next page without a heading.")
+        doc.save(path)
+    settings = get_settings()
+    monkeypatch.setattr(settings, "pdf_layout_enabled", False)
+    native = parse_pdf(str(path))
+    assert native["pages"][0]["text"] == f"{right}\n{left}"
+    monkeypatch.setattr(settings, "pdf_layout_enabled", True)
+    parsed = parse_pdf(str(path))
+    assert parsed["pages"][0]["text"] == f"{left}\n{right}"
+    assert parsed["parse_diagnostics"]["page_layouts"][0]["reading_order"] == "two_columns"
+    assert parsed["parsed_source_hash"] != native["parsed_source_hash"]
+    assert parsed["section_spans"][-1]["section"] == "method"
+    for page, quote in zip(parsed["pages"], [right, "on the next page without a heading."]):
+        match = locate_quote(page["text"], quote)
+        assert match and page["text"][match.start:match.end] == quote
+    validate_chunk_sources(parsed["paper_id"], chunk_pdf(parsed, paper_id=parsed["paper_id"]), parsed)
+
+
+def test_layout_table_retains_row_and_column_identity(tmp_path, monkeypatch):
+    import fitz
+    from app.core.config import get_settings
+
+    rows = [["Method", "F1", "Accuracy"], ["First", "86%", "91%"], ["Second", "91%", "86%"]]
+    path = tmp_path / "table.pdf"
+    with fitz.open() as doc:
+        page = doc.new_page()
+        for x in (50, 150, 250, 350):
+            page.draw_line((x, 50), (x, 140))
+        for y in (50, 80, 110, 140):
+            page.draw_line((50, y), (350, y))
+        for row in range(len(rows)):
+            for column, value in enumerate(rows[row]):
+                page.insert_text((60 + column * 100, 68 + row * 30), value)
+        doc.save(path)
+    monkeypatch.setattr(get_settings(), "pdf_layout_enabled", True)
+    parsed = parse_pdf(str(path))
+    layout = parsed["parse_diagnostics"]["page_layouts"][0]
+    assert layout["reading_order"] == "native"
+    assert parsed["parse_diagnostics"]["table_count"] == 1
+    cells = layout["tables"][0]["rows"]
+    assert [[cell["text"] for cell in row] for row in cells] == rows
+    assert cells[1][1]["anchor"] is None and cells[2][2]["anchor"] is None
+    anchor = cells[1][0]["anchor"]
+    assert parsed["pages"][0]["text"][anchor["char_start"]:anchor["char_end"]] == "First"
+
+
 def test_exclusion_changes_invalidate_processing_profile():
     from app.core.config import Settings
     from app.services.document_ingestion import processing_profile

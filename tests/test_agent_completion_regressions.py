@@ -112,7 +112,8 @@ def test_clarification_is_public_persisted_and_resumed_with_latest_constraints(d
     llm = Decisions(("report_blocked", {"reason": "尚需更多证据"}))
     monkeypatch.setattr(graph, "_get_llm", lambda: llm)
     monkeypatch.setattr("app.agent.research_semantic_parser.parse_research_semantics", lambda *a, **k: SimpleNamespace(model_dump=lambda **kw: {}))
-    result = ResearchConversationService(db, llm=None).handle(AgentRequest(
+    rewriter = SimpleNamespace(complete=lambda *a, **kw: "{}")
+    result = ResearchConversationService(db, llm=rewriter).handle(AgentRequest(
         session_id="pause", user_query="研究主题", clarification_answer="仅限2021-2023年，基于已有证据保守重写",
     ))
     assert result["status"] == "blocked"
@@ -317,7 +318,7 @@ def test_autonomous_rewrite_rolls_back_a_worse_candidate(monkeypatch):
 def test_rejected_rewrite_history_blocks_availability_and_direct_controller():
     from app.agent.action_registry import allowed_actions
     from app.agent.controller import AgentController
-    from app.agent.generation_recovery import input_fingerprint
+    from app.agent.recovery.generation_recovery import input_fingerprint
     from app.schemas.recovery_schema import RecoveryAction
 
     current = state()

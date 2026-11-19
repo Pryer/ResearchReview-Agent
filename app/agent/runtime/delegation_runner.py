@@ -95,7 +95,7 @@ class DelegationRunner:
                     action, arguments = deterministic_decision(grant, state, available, results)
                 if action == 'report_to_main':
                     return self._finish(repo, grant, results, 'needs_help', acceptance.missing)
-                from app.agent.quality_feedback import begin_main_recovery
+                from app.agent.recovery.quality_feedback import begin_main_recovery
                 begin_main_recovery(state, action, arguments)
                 self.authorization.assert_action_allowed(grant, state, handlers, action, arguments)
                 invocation = ActionInvocation(delegation_id=delegation_id, step_index=row.next_step,

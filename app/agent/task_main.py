@@ -163,7 +163,7 @@ class TaskMainLoop:
                 operation = 'validate_result'
             state['agent_execution_budget']['decision_rounds'] = int(state['agent_execution_budget'].get('decision_rounds', 0)) + 1
             active_runtime().persist_budget(state['agent_execution_budget'])
-            from app.agent.quality_feedback import checked_recovery, checked_section_revision
+            from app.agent.recovery.quality_feedback import checked_recovery, checked_section_revision
             repair = checked_recovery(state) if not operation else None
             revision = None
             if repair and repair.remaining_budget:

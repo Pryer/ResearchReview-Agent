@@ -263,6 +263,8 @@ class Settings(BaseSettings):
     pdf_save_dir: str = "./data/pdfs"
     parsed_save_dir: str = "./data/parsed"
     review_save_dir: str = "./data/reviews"
+    pdf_layout_enabled: bool = False
+
     # 本地 PDF 导入采用 inbox 模式，API 不允许读取该目录之外的服务器文件。
     library_import_dir: str = "./data/imports"
 

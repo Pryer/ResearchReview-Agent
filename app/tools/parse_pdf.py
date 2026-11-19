@@ -28,8 +28,11 @@ def parse_pdf(pdf_path: str, *, paper_id: str | None = None) -> Dict[str, Any]:
     Returns:
         包含 sections 和 full_text 的字典。
     """
+    from app.core.config import get_settings
+
+    layout = get_settings().pdf_layout_enabled
     diagnostics: Dict[str, Any] = {}
-    pages = extract_pdf_pages(pdf_path, diagnostics=diagnostics)
+    pages = extract_pdf_pages(pdf_path, diagnostics=diagnostics, layout=layout)
     full_text = clean_parsed_text("\n".join(page["text"] for page in pages))
     sections = split_paper_sections(full_text)
     references = extract_references(full_text)
@@ -48,9 +51,9 @@ def parse_pdf(pdf_path: str, *, paper_id: str | None = None) -> Dict[str, Any]:
         "paper_id": paper_id or Path(pdf_path).stem,
         "pages": pages,
         "source_pdf_hash": digest.hexdigest(),
-        "parser_profile": PARSER_PROFILE,
+        "parser_profile": f"{PARSER_PROFILE}.layout-v1" if layout else PARSER_PROFILE,
         "parse_diagnostics": {**diagnostics, "recognized_sections": list(sections),
-                              "table_count": None, "reading_order_verified": False},
+                              "reading_order_verified": False},
     }
     result["parsed_source_hash"] = source_fingerprint(result)
     return result
@@ -65,17 +68,28 @@ def extract_pdf_text(pdf_path: str) -> str:
     return clean_parsed_text("\n".join(page["text"] for page in pages))
 
 
-def extract_pdf_pages(pdf_path: str, *, diagnostics: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+def extract_pdf_pages(
+    pdf_path: str, *, diagnostics: Optional[Dict[str, Any]] = None, layout: bool = False,
+) -> List[Dict[str, Any]]:
     """逐页提取文本，保留 Evidence Card 所需的页码信息。"""
     try:
         import fitz  # PyMuPDF
 
-        doc = fitz.open(pdf_path)
-        pages = [
-            {"page": index + 1, "text": clean_parsed_text(page.get_text())}
-            for index, page in enumerate(doc)
-        ]
-        doc.close()
+        pages = []
+        layouts = []
+        with fitz.open(pdf_path) as doc:
+            for number, page in enumerate(doc, 1):
+                text = clean_parsed_text(page.get_text())
+                if layout and text:
+                    from app.tools.pdf_layout import analyze_layout
+
+                    try:
+                        text, info = analyze_layout(page, text)
+                    except (ValueError, RuntimeError) as exc:
+                        logger.warning("PDF layout analysis fell back on page %d: %s", number, type(exc).__name__)
+                        info = {"reading_order": "native", "tables": [], "analysis_failed": True}
+                    layouts.append({"page": number, **info})
+                pages.append({"page": number, "text": text})
         if diagnostics is not None:
             empty = [page["page"] for page in pages if not page["text"].strip()]
             diagnostics.update(
@@ -83,7 +97,10 @@ def extract_pdf_pages(pdf_path: str, *, diagnostics: Optional[Dict[str, Any]] = 
                 text_characters=sum(len(page["text"]) for page in pages),
                 # WHY: 低文本只表示 OCR 候选；空白封面等也会命中，不等同于解析失败。
                 ocr_candidate_pages=[page["page"] for page in pages if len(page["text"].strip()) < 40],
+                table_count=sum(len(item["tables"]) for item in layouts) if layout else None,
             )
+            if layout:
+                diagnostics["page_layouts"] = layouts
         return [page for page in pages if page["text"]]
     except ImportError:
         raise PDFParseError("PyMuPDF is required to parse PDF files")

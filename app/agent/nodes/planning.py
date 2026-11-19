@@ -83,7 +83,9 @@ def plan_node(state: "ResearchAgentState", llm=None, current_year: int | None = 
     try:
         from app.agent.intent import recognize_intent
         from app.agent.slot_extractor import extract_slots
-        from app.agent.planner import build_screening_protocol, build_search_plan
+        from app.agent.planner import (
+            build_screening_protocol, build_search_plan, has_english_search_keyword, search_name_source,
+        )
         from app.agent.research_plan import build_research_request_plan
         from app.agent.research_semantic_parser import parse_research_semantics
         from app.core.config import get_settings
@@ -225,9 +227,10 @@ def plan_node(state: "ResearchAgentState", llm=None, current_year: int | None = 
         ).strip()
 
         # 生成计划；语义分支优先于通用关键词，旧字段继续兼容下游节点。
+        name_source = search_name_source(state, resumed=is_resumed_query)
         plan = build_search_plan(
             user_query, intent_result.intent, slots, llm,
-            semantic_frame=semantic_frame,
+            semantic_frame=semantic_frame, name_source=name_source,
         )
         state["workflow"] = plan["workflow"]
         state["topic"] = plan["topic"]
@@ -380,7 +383,7 @@ def plan_node(state: "ResearchAgentState", llm=None, current_year: int | None = 
         state["user_paper_profile"] = profile.model_dump(mode="json")
 
         has_english_keyword = any(
-            re.search(r"[A-Za-z]{4,}", keyword)
+            has_english_search_keyword(keyword, name_source)
             for keyword in state["keywords"]
         )
         planning_error = plan.get("planning_error")
@@ -587,7 +590,7 @@ def diagnose_evidence_gaps_node(
     """诊断缺口但不决定是否执行恢复动作。"""
     t0 = time.time()
     try:
-        from app.agent.evidence_recovery import diagnose_evidence_gaps
+        from app.agent.recovery.evidence_recovery import diagnose_evidence_gaps
 
         report = diagnose_evidence_gaps(state, llm=llm)
         state["evidence_gap_report"] = report.model_dump(mode="json")
@@ -629,7 +632,7 @@ def recovery_controller_node(state: "ResearchAgentState") -> "ResearchAgentState
     """确定性恢复控制器；不调用 LLM。"""
     t0 = time.time()
     try:
-        from app.agent.evidence_recovery import decide_recovery
+        from app.agent.recovery.evidence_recovery import decide_recovery
         from app.core.config import get_settings
         from app.schemas.recovery_schema import EvidenceGapReport
 
@@ -690,7 +693,7 @@ def scope_revision_node(state: "ResearchAgentState", llm=None) -> "ResearchAgent
     """执行至多由控制器批准的范围修订，不修改用户 selected_scope。"""
     t0 = time.time()
     try:
-        from app.agent.evidence_recovery import revise_scope_framework
+        from app.agent.recovery.evidence_recovery import revise_scope_framework
         from app.schemas.recovery_schema import EvidenceGapReport
 
         report = EvidenceGapReport.model_validate(state.get("evidence_gap_report") or {})

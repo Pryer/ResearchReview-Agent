@@ -8,7 +8,7 @@ import re
 from typing import Any
 
 from app.core.config import get_settings
-from app.agent.quality_feedback import quality_feedback
+from app.agent.recovery.quality_feedback import quality_feedback
 from app.utils.search_constraints import search_count_bounds, exact_search_title
 from app.schemas.context_schema import (
     AgentStateContext,
@@ -205,7 +205,7 @@ def _next_actions(state: dict[str, Any]) -> list[str]:
     handoff = recovery_handoff_action(state)
     if handoff:
         pending.insert(0, handoff)
-    from app.agent.evidence_recovery import targeted_search_kind
+    from app.agent.recovery.evidence_recovery import targeted_search_kind
     return [item for item in dict.fromkeys(pending) if item and (
         item.lower() != "targeted_search" or targeted_search_kind(state)
     )][:8]

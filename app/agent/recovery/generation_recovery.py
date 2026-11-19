@@ -494,7 +494,7 @@ def decide_generation_recovery(
     # WHY: 任务级恢复预算与证据级恢复预算是两套独立边界。证据恢复已耗尽时
     # TARGETED_SEARCH 必然是空动作，仍按 RECOVERABLE 下发会让主循环重复同一诊断
     # 直到 no-progress 阻断，且永远进不了 EXHAUSTED 分支的最佳努力兜底。
-    from app.agent.evidence_recovery import route_recovery_stop_reason
+    from app.agent.recovery.evidence_recovery import route_recovery_stop_reason
 
     search_stop_reason = route_recovery_stop_reason(state) if allow_search else ""
     search_viable = allow_search and not search_stop_reason

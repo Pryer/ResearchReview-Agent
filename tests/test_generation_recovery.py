@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from app.agent.deliverable_router import check_generation_readiness
 from app.agent.graph import _build_output, _verify_generated_draft
-from app.agent.generation_recovery import (
+from app.agent.recovery.generation_recovery import (
     active_focus_recovery_targets,
     candidate_is_not_worse,
     complete_recovery_action,
@@ -130,7 +130,7 @@ def test_changed_draft_invalidates_no_progress_action_history():
 
 
 def test_allocation_gap_uses_stable_citation_source_after_rendering():
-    from app.agent.generation_recovery import _missing_allocation_sections
+    from app.agent.recovery.generation_recovery import _missing_allocation_sections
 
     state = {
         "review": "正文 [1]。",
@@ -798,7 +798,7 @@ def test_genuine_semantic_pending_schedules_reverify():
 
 
 def test_legacy_access_failure_is_not_reverify_eligible():
-    from app.agent.generation_recovery import reverify_eligible_claim_ids, reverify_ineligible_claim_ids
+    from app.agent.recovery.generation_recovery import reverify_eligible_claim_ids, reverify_ineligible_claim_ids
 
     state = {"claim_verification": {"claims": [{
         "claim_id": "c001", "verification_status": "not_completed",
@@ -819,7 +819,7 @@ def _pending_verification_state():
 
 
 def test_same_input_fresh_reverification_counts_as_progress():
-    from app.agent.generation_recovery import start_recovery_action
+    from app.agent.recovery.generation_recovery import start_recovery_action
     from app.agent.graph import _draft_fingerprint
 
     state = _pending_verification_state()
@@ -835,7 +835,7 @@ def test_same_input_fresh_reverification_counts_as_progress():
 
 
 def test_old_verification_fingerprint_cannot_authorize_cleared_gate():
-    from app.agent.generation_recovery import start_recovery_action
+    from app.agent.recovery.generation_recovery import start_recovery_action
     from app.agent.graph import _draft_fingerprint
 
     state = _pending_verification_state()
@@ -849,7 +849,7 @@ def test_old_verification_fingerprint_cannot_authorize_cleared_gate():
 
 def test_replay_of_prior_verified_report_is_not_new_progress():
     import copy
-    from app.agent.generation_recovery import start_recovery_action
+    from app.agent.recovery.generation_recovery import start_recovery_action
     from app.agent.graph import _draft_fingerprint
 
     state = _pending_verification_state()
@@ -881,7 +881,7 @@ def test_same_input_rewrite_rejection_is_not_reselected_across_restart():
 
 
 def test_exhausted_rewrite_basis_changes_the_recovery_recommendation():
-    from app.agent.generation_recovery import repair_basis_fingerprint, rewrite_attempt_exhausted
+    from app.agent.recovery.generation_recovery import repair_basis_fingerprint, rewrite_attempt_exhausted
 
     state = _count_failure(eligible=6, authorized=4)
     state["quality_gate"]["blocking_issues"] = [{"code": "claim_evidence_quality_not_met"}]

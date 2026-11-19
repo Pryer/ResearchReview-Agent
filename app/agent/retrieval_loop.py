@@ -217,7 +217,7 @@ def search_rank_with_refinement(
     if state.get("incremental_retrieval"):
         max_rounds = min(max_rounds, 1)
 
-    from app.agent.generation_recovery import active_focus_recovery_targets
+    from app.agent.recovery.generation_recovery import active_focus_recovery_targets
 
     focus_targets = active_focus_recovery_targets(state)
     if focus_targets:

@@ -77,6 +77,8 @@ def build_search_plan(
     slots: SlotResult,
     llm=None,
     semantic_frame=None,
+    *,
+    name_source: str | None = None,
 ) -> Dict[str, Any]:
     """整合意图和槽位，生成完整执行计划。
 
@@ -96,11 +98,13 @@ def build_search_plan(
     from app.agent.slot_extractor import has_topic_content
 
     plan_topic = slots.topic if has_topic_content(slots.topic or "") else None
+    name_source = user_query if name_source is None else name_source
     strategy = generate_search_strategy(
         plan_topic or user_query,
         llm,
         user_query=user_query,
         semantic_frame=semantic_frame,
+        name_source=name_source,
     )
     keywords = strategy["keywords"]
     keyword_batches = strategy.get("keyword_batches") or []
@@ -143,7 +147,7 @@ def build_search_plan(
             limit=keyword_limit,
         )
         if strategy.get("planning_error") and any(
-            re.search(r"[A-Za-z]{4,}", keyword) for keyword in keywords
+            has_english_search_keyword(keyword, name_source) for keyword in keywords
         ):
             strategy["planning_error"] = None
 
@@ -558,10 +562,13 @@ def generate_search_strategy(
     llm=None,
     user_query: str | None = None,
     semantic_frame=None,
+    *,
+    name_source: str | None = None,
 ) -> Dict[str, Any]:
     """生成检索关键词和主题锚点（仅用于词法打分，不参与硬过滤）。"""
     topic = (topic or "").strip()
     user_query = (user_query or topic).strip()
+    name_source = user_query if name_source is None else name_source
     keywords = [topic] if topic else []
     topic_anchors: list[list[str]] = []
     dropped_anchor_groups: list[dict[str, str]] = []
@@ -577,6 +584,7 @@ def generate_search_strategy(
                 topic=topic,
                 user_query=user_query,
                 llm=llm,
+                name_source=name_source,
             )
             llm_keywords = strategy.get("keywords", [])
             # 兼容旧字段名 required_concepts 和新字段名 topic_anchors
@@ -586,7 +594,7 @@ def generate_search_strategy(
             # 校验 LLM 实际返回了可用的英文检索词
             english_keywords = [
                 kw for kw in llm_keywords
-                if re.search(r"[A-Za-z]{4,}", kw)
+                if has_english_search_keyword(kw, name_source)
             ]
             if not english_keywords and not llm_concepts:
                 planning_error = (
@@ -603,7 +611,7 @@ def generate_search_strategy(
             logger.warning("LLM keyword generation failed: %s", e)
             planning_error = str(e)
 
-    if topic and (planning_error or not any(re.search(r"[A-Za-z]{4,}", kw) for kw in keywords)):
+    if topic and (planning_error or not any(has_english_search_keyword(kw, name_source) for kw in keywords)):
         keywords.extend(fallback["keywords"])
         if not topic_anchors:
             topic_anchors = fallback.get("topic_anchors") or []
@@ -624,7 +632,7 @@ def generate_search_strategy(
         except Exception as exc:
             logger.warning("Keyword generation expansion skipped: %s", exc)
     if planning_error and (
-        any(re.search(r"[A-Za-z]{4,}", kw) for kw in final_keywords)
+        any(has_english_search_keyword(kw, name_source) for kw in final_keywords)
         or topic_anchors
     ):
         planning_error = None
@@ -692,6 +700,8 @@ def refine_search_strategy(
     feedback: dict[str, Any],
     llm,
     existing_batches: list[dict[str, Any]] | None = None,
+    *,
+    name_source: str | None = None,
 ) -> Dict[str, Any]:
     """根据上一轮检索反馈，让 LLM 重新生成下一轮检索策略。"""
     strategy = llm_refine_search_strategy(
@@ -700,6 +710,7 @@ def refine_search_strategy(
         current_keywords=current_keywords,
         feedback=feedback,
         llm=llm,
+        name_source=name_source,
     )
     keywords = _deduplicate_keywords(
         _clean_keyword_pool(
@@ -733,7 +744,9 @@ def llm_generate_search_keywords(topic: str, user_query: str, llm) -> list[str]:
     return llm_generate_search_strategy(topic, user_query, llm)["keywords"]
 
 
-def llm_generate_search_strategy(topic: str, user_query: str, llm) -> Dict[str, Any]:
+def llm_generate_search_strategy(
+    topic: str, user_query: str, llm, *, name_source: str | None = None,
+) -> Dict[str, Any]:
     """调用 LLM 生成检索词及必需概念组（含双语对齐门禁）。"""
     from app.prompt.search import SEARCH_KEYWORD_GENERATION_PROMPT
 
@@ -742,7 +755,8 @@ def llm_generate_search_strategy(topic: str, user_query: str, llm) -> Dict[str, 
         topic=topic,
     )
     return _request_llm_strategy_with_anchor_gate(
-        prompt, llm, topic, operation="initial_search_planning",
+        prompt, llm, topic, name_source=user_query if name_source is None else name_source,
+        operation="initial_search_planning",
     )
 
 
@@ -752,6 +766,8 @@ def llm_refine_search_strategy(
     current_keywords: list[str],
     feedback: dict[str, Any],
     llm,
+    *,
+    name_source: str | None = None,
 ) -> Dict[str, Any]:
     """调用 LLM 根据检索反馈修正关键词（含双语对齐门禁）。"""
     from app.prompt.search import SEARCH_KEYWORD_REFINEMENT_PROMPT
@@ -763,7 +779,8 @@ def llm_refine_search_strategy(
         feedback_json=json.dumps(feedback, ensure_ascii=False, default=str),
     )
     return _request_llm_strategy_with_anchor_gate(
-        prompt, llm, topic, operation="refined_search_planning",
+        prompt, llm, topic, name_source=user_query if name_source is None else name_source,
+        operation="refined_search_planning",
     )
 
 
@@ -793,6 +810,38 @@ def _topic_requires_cjk(topic: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", topic or ""))
 
 
+_LATIN_NAME_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*")
+
+
+def search_name_source(state: dict, *, resumed: bool) -> str:
+    if not resumed:
+        return str(state.get("user_query") or "")
+    # WHY: 澄清改写可含模型扩写，只能用原始请求和用户实际回答授予专名例外。
+    request = state.get("research_request") or {}
+    return "\n".join(
+        [str(request.get("original_query") or state.get("quality_original_query") or ""),
+         *(str(answer) for answer in state.get("user_clarifications") or [])]
+    )
+
+
+def _explicit_latin_names(user_query: str) -> set[str]:
+    names = set()
+    for match in _LATIN_NAME_TOKEN.finditer(user_query):
+        term = match.group()
+        if (re.fullmatch(r"[A-Z]{2,10}", term)
+                or any(char.isdigit() for char in term)
+                or (any(char.islower() for char in term) and any(char.isupper() for char in term[1:]))):
+            names.add(term.casefold())
+    return names
+
+
+def has_english_search_keyword(keyword: str, user_query: str) -> bool:
+    if re.search(r"[A-Za-z]{4,}", keyword):
+        return True
+    explicit_names = _explicit_latin_names(user_query)
+    return any(token.casefold() in explicit_names for token in _LATIN_NAME_TOKEN.findall(keyword))
+
+
 def _parse_llm_strategy_payload(data: Dict[str, Any]) -> Tuple[List[str], List[List[str]]]:
     """从 LLM 响应解析检索关键词与概念组，兼容 dict/list 两种概念组形态。"""
     raw_keywords = data.get("keywords", [])
@@ -820,10 +869,11 @@ def _parse_llm_strategy_payload(data: Dict[str, Any]) -> Tuple[List[str], List[L
 def _validate_bilingual_topic_anchors(
     topic_anchors: List[List[str]],
     topic: str,
+    explicit_names: set[str],
 ) -> Tuple[List[List[str]], List[Dict[str, str]]]:
     """校验概念组与主题语言对齐，返回 ``(合规组, 被丢弃组诊断)``。
 
-    主题含中文时每个概念组须含至少一个中文词，纯英文主题反之亦然。
+    普通概念组须含主题语言的术语。中文主题也可保留用户原文的专名。
     单语概念组会让 rank 阶段的任务偏移惩罚静默失效（惩罚只对主题或
     同义词中出现的维度生效），因此不合规的组被显式丢弃并记录诊断，
     不在本地猜测补译——跨语言术语对齐必须由 LLM 显式给出。
@@ -842,6 +892,11 @@ def _validate_bilingual_topic_anchors(
         if aligned:
             kept.append(terms)
         else:
+            explicit_terms = [term for term in terms if term.casefold() in explicit_names]
+            if requires_cjk and explicit_terms:
+                # WHY: 原文里的专名可直接检索；同组模型补出的英文同义词仍须经过语言对齐。
+                kept.append(explicit_terms)
+                continue
             dropped.append({
                 "group": " / ".join(terms[:4]),
                 "reason": "missing_topic_language_term",
@@ -859,6 +914,8 @@ def _request_llm_strategy_with_anchor_gate(
     prompt: str,
     llm,
     topic: str,
+    *,
+    name_source: str,
     operation: str,
 ) -> Dict[str, Any]:
     """调用 LLM 生成检索策略，并对概念组执行双语对齐门禁。
@@ -883,7 +940,8 @@ def _request_llm_strategy_with_anchor_gate(
 
     data = _complete(prompt)
     keywords, anchors = _parse_llm_strategy_payload(data)
-    kept, dropped = _validate_bilingual_topic_anchors(anchors, topic)
+    explicit_names = _explicit_latin_names(name_source)
+    kept, dropped = _validate_bilingual_topic_anchors(anchors, topic, explicit_names)
 
     if dropped:
         lang_label = "中文" if _topic_requires_cjk(topic) else "英文"
@@ -891,18 +949,24 @@ def _request_llm_strategy_with_anchor_gate(
         corrective = (
             f"\n\n注意：上次输出的以下 topic_anchors 概念组缺少{lang_label}术语，"
             f"已被系统判无效：\n{dropped_summary}\n"
-            f"请重新输出完整结果，并确保每个概念组同时包含中文术语和英文术语。"
+            f"请重新输出完整结果，为上述普通概念补充同语言术语，并保留用户原文中的专名。"
         )
         try:
             retry_data = _complete(prompt + corrective)
             retry_keywords, retry_anchors = _parse_llm_strategy_payload(retry_data)
             retry_kept, retry_dropped = _validate_bilingual_topic_anchors(
-                retry_anchors, topic,
+                retry_anchors, topic, explicit_names,
             )
             if retry_kept and retry_keywords:
+                retry_terms = {term.casefold() for group in retry_kept for term in group}
+                preserved = [
+                    group for group in kept
+                    if all(term.casefold() in explicit_names for term in group)
+                    and retry_terms.isdisjoint(term.casefold() for term in group)
+                ]
                 return {
                     "keywords": retry_keywords,
-                    "topic_anchors": retry_kept,
+                    "topic_anchors": (preserved + retry_kept)[:4],
                     "dropped_monolingual_groups": [*dropped, *retry_dropped],
                 }
         except Exception as exc:

@@ -4,7 +4,7 @@ import copy
 import pytest
 
 from app.agent.controller import AgentController
-from app.agent.delegation_recovery import search_once, settle_after_analysis
+from app.agent.recovery.delegation_recovery import search_once, settle_after_analysis
 from app.agent.execution_budget import budget_scope
 from app.agent.action_registry import allowed_actions, recovery_handoff_action
 from app.agent.subagents.base import AgentBoundaryViolation

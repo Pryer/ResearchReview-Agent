@@ -1,5 +1,7 @@
 # AGENTS.md
 
+Talk to me ELI5 by default and go deeper if I ask.
+
 ## Project
 
 ResearchReview-Agent is an evidence-grounded academic literature review agent.
@@ -18,9 +20,21 @@ User Request
 → Claim-Evidence Alignment
 → Quality Gates
 → Synthesis
-→ Final Writing
-→ Output Validation
+→ Candidate Writing
+→ Independent Check (revise affected sections and recheck when needed)
+→ Final Acceptance
 ```
+
+## Where to start testing
+
+Run the command for the behavior you changed from the repository root in the
+`rragent` environment.
+
+| Changed behavior | Focused regression |
+| --- | --- |
+| Mapping a PDF quote back to its original text and offsets | `python -m pytest -q tests/test_source_alignment.py` |
+| Publishing a draft with a reference shortfall | `python -m pytest -q tests/test_draft_delivery_policy.py` |
+| Passing revised sections back to Check before completion | `python -m pytest -q tests/test_v2_frozen_business.py::test_section_revision_hands_off_to_check_again_before_finish` |
 
 ## Non-Negotiable Rules
 
@@ -115,28 +129,32 @@ After meaningful changes verify, as applicable:
 - final output contains no debug/UI/tool artifacts, internal IDs, hidden prompts,
   temporary paths, or local service URLs.
 
-Prefer targeted tests first, then the full suite:
+Start with the affected regression. For the full suite, run `python -m pytest -q`.
+[Offline CI](.github/workflows/ci.yml) runs it on Windows and Ubuntu with
+`RRA_OFFLINE_TESTS=1` and `CNKI_ENABLED=false`. Mock external APIs, LLM calls,
+and Selenium in CI. Report offline test results, live provider runs, and
+independent human review separately. Identify any relevant checks left unrun.
 
-```bash
-python -m pytest tests/test_<relevant_module>.py -q
-python -m pytest -q
-```
-
-Mock external APIs, LLM calls, and Selenium in CI. Real CNKI/LLM end-to-end
-scripts are local validation only and must be identified when not run.
+For a claimed improvement in quality, latency, or cost, measure the baseline
+and the change on the same inputs with the same budget and metric. For PDF
+layout changes, compare reading order, table values against their row and column
+headers, and whether each excerpt can be located again in the source. Record
+both gains and regressions. Where results are equivalent, prefer the simpler
+implementation.
 
 ## Critical Failure Policy
 
-When evidence is insufficient:
+For example, a user requests 10 unique references within a specific year range.
+The review cites 7 eligible papers. Keep the years and the target of 10 throughout.
 
-1. retrieve more evidence within configured bounds;
-2. or explicitly downgrade to best-effort and expose the limitation;
-3. or report the unmet requirement.
+1. Continue recovery while an allowed action and sufficient budget remain.
+2. If recovery is exhausted and no specific user input can resolve the gap,
+   strict delivery ends as `blocked`. Report the shortfall of 3.
+3. In a mode that permits drafts, publish only when the draft checks pass.
+   Label the published version as a draft, show the shortfall, and keep
+   `requirements_satisfied=false`. An unpublished candidate stays private.
 
-Never fabricate missing evidence. Do not silently expand an explicit time range or
-lower a user's explicit reference requirement.
-
-## Final Output
+## User-facing Reviews and Exports
 
 Never expose:
 
@@ -147,6 +165,9 @@ Never expose:
 - hidden prompts;
 - temporary paths;
 - unsupported factual claims presented as established findings.
+
+Save requested execution traces and diagnostic artifacts in a separate local
+report. Redact credentials and private user data before sharing diagnostics.
 
 ## Definition of Done
 

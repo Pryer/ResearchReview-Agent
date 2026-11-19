@@ -1056,7 +1056,7 @@ def test_cached_negative_verdict_is_reused_and_not_auto_cleared():
 @pytest.mark.parametrize("legacy", [False, True])
 def test_access_failure_never_requests_entailment_or_becomes_pending(legacy):
     from app.tools.verify_claims import _verify_review_claims_legacy
-    from app.agent.generation_recovery import reverify_eligible_claim_ids
+    from app.agent.recovery.generation_recovery import reverify_eligible_claim_ids
 
     calls = []
 

@@ -6,8 +6,8 @@ import pytest
 from app.agent.action_registry import allowed_actions
 from app.agent.controller import AgentController
 from tests.reference_v1.main_loop import MainAgentLoop, _progress_fingerprint
-from app.agent.quality_feedback import diagnose_quality_recovery, quality_feedback, complete_main_recovery
-from app.agent.delegation_recovery import search_once, settle_after_analysis
+from app.agent.recovery.quality_feedback import diagnose_quality_recovery, quality_feedback, complete_main_recovery
+from app.agent.recovery.delegation_recovery import search_once, settle_after_analysis
 from app.schemas.agent_task_schema import AgentRole, AgentTaskOutcome
 from tests.test_subagent_react import ScriptedLLM, report, state, store
 from tests.agent_decision_fakes import checked_result
@@ -142,7 +142,7 @@ def test_feedback_distinguishes_previous_verification_from_current_candidate():
 
 @pytest.mark.parametrize('stop',['permission','budget'])
 def test_quality_search_respects_existing_permission_and_recovery_budget(stop):
-    from app.agent.evidence_recovery import targeted_search_kind
+    from app.agent.recovery.evidence_recovery import targeted_search_kind
     current=prepared();current['review']='已有候选';failed_verification(current)
     if stop=='permission':current['allow_evidence_expansion']=False
     else:current['recovery_action_count']=999
@@ -164,7 +164,7 @@ def test_empty_quality_retrieval_settles_as_exhausted_without_resetting_history(
 
 @pytest.mark.parametrize('change',['review','claim_plans'])
 def test_stale_quality_queries_cannot_be_reused_for_a_new_input(change):
-    from app.agent.evidence_recovery import targeted_search_kind
+    from app.agent.recovery.evidence_recovery import targeted_search_kind
     current=prepared();current['review']='待恢复正文';failed_verification(current)
     diagnose_quality_recovery(current)
     assert targeted_search_kind(current)=='quality'

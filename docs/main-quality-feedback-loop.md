@@ -51,7 +51,9 @@ flowchart TD
 
 首批详情和证据池仍按约1.5倍引用要求处理，并可根据实际证据和引用损耗扩充。候选量、可用证据量、主张授权量与公开引用量分别记录。数量冗余不能替代逐条主张支持检查，也不会为凑数降低相关性准入。
 
-关键实现：`app/agent/quality_feedback.py`、`action_registry.py`、`task_main.py`、`graph.py`、`delegation_recovery.py`及`slot_extractor.py`。新增行为回归见`tests/test_main_quality_loop.py`，外部模型在离线测试中均为替身。
+T07 一类修订由 [Main](../app/agent/task_main.py) 读取当前版本的 Check 结论。[质量反馈](../app/agent/recovery/quality_feedback.py) 请求已有的[生成恢复策略](../app/agent/recovery/generation_recovery.py)判定可行路径。当策略选中章节改写时，质量反馈把目标投影到已获准章节，Main 再发起 Writing 委派。独立 Check 对新候选复验。证据诊断与路线恢复也位于 [recovery](../app/agent/recovery/) 子包。相关测试使用离线替身。见[主控质量回归](../tests/test_main_quality_loop.py)及[冻结业务回归](../tests/test_v2_frozen_business.py)。
+
+真实 T07 记录曾执行章节修订、独立复验与主张重建。最后两条综合结论仍缺引证，正式交付被门禁阻断。该记录用于追踪恢复职责。见 [T07 修订复验](validation/2026-11-18-v2-live-closeout.md#t07-修订复验)。
 # 2026-11-11 轨迹修复补充
 
 门禁汇总负责阻断，逐句核验报告负责定位。恢复诊断从完整逐句报告补齐主张与章节目标，不依赖 Main 摘要中最多展示的弱主张数。仅当前核验报告可派生执行目标，旧报告继续保留为诊断材料。

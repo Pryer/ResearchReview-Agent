@@ -2108,7 +2108,7 @@ def _apply_final_quality_gate(state: "ResearchAgentState") -> None:
             or requested_count <= 0
             or coverage_ratio >= float(settings.reference_coverage_best_effort_ratio)
         )
-        from app.agent.generation_recovery import draft_has_unsafe_quality
+        from app.agent.recovery.generation_recovery import draft_has_unsafe_quality
         best_effort_released = not draft_has_unsafe_quality(state, issues) and bool(
             (state.get("best_effort_generation") and automatic_count_allowed)
             or reference_best_effort_release

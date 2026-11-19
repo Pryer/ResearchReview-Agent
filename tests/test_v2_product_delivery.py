@@ -8,6 +8,7 @@ from app.agent.execution_budget import budget_scope
 from app.core.config import get_settings
 from app.database.db import get_db
 from app.database.repositories import ResearchJobRepository
+from app.frontend.job_presentation import draft_markdown
 from app.main import app
 from app.services.durable_execution_service import active_runtime, durable_scope
 from app.services.execution_progress import bind_job
@@ -65,7 +66,9 @@ render_assistant_message(message['content'], message['metadata'], allow_actions=
     assert message['metadata']['status'] == status
     assert message['metadata']['verification_status'] == published['verification_status']
     assert not message['metadata']['requirements_satisfied']
+    assert any('研究草稿 · 正式交付门禁待通过' in warning.value for warning in ui.warning)
     assert any(button.label == '下载带限制说明的草稿' for button in ui.get('download_button'))
+    assert draft_markdown(message['metadata']).endswith(published['body'])
     if status == 'needs_clarification':
         assert '需要哪个主题？' in message['content']
         assert any('输入框' in caption.value for caption in ui.caption)

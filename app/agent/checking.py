@@ -129,7 +129,7 @@ def settle_checked_candidate(state):
     state["autonomous_verified_fingerprint"] = _draft_fingerprint(state)
     previous = state.pop("pending_generation_previous", None)
     if previous:
-        from app.agent.generation_recovery import candidate_is_not_worse, input_fingerprint
+        from app.agent.recovery.generation_recovery import candidate_is_not_worse, input_fingerprint
         # WHY: 上一稿缺省的字段也必须恢复为缺省，不能继承新稿引用快照使旧报告失效。
         restored = {k:v for k,v in state.items() if k not in (*_GENERATION_PRODUCT_KEYS, "writing_version")}
         restored.update(copy.deepcopy(previous["products"]))
@@ -143,5 +143,5 @@ def settle_checked_candidate(state):
                 "reason": "独立Check发现候选质量退化，Controller保留同证据版本的较优稿", "operation": previous["operation"],
                 "input_fingerprint": previous.get("input_fingerprint") or input_fingerprint(restored),
                 "check_report": copy.deepcopy(report)})
-    from app.agent.quality_feedback import complete_main_recovery
+    from app.agent.recovery.quality_feedback import complete_main_recovery
     complete_main_recovery(state)

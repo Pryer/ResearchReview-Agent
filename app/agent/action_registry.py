@@ -144,7 +144,7 @@ def allowed_actions(
         if spec.role is not None and spec.name not in handlers:
             continue
         if spec.name in {"rewrite_sections", "generate_deliverables"}:
-            from app.agent.generation_recovery import rewrite_attempt_exhausted
+            from app.agent.recovery.generation_recovery import rewrite_attempt_exhausted
 
             if state.get("pending_result_validation") or state.get("pending_evidence_recovery") or rewrite_attempt_exhausted(state):
                 continue
@@ -154,11 +154,11 @@ def allowed_actions(
                 if not pending and not has_unsearched_queries(state):
                     continue
         if spec.name == "targeted_search":
-            from app.agent.evidence_recovery import targeted_search_kind
+            from app.agent.recovery.evidence_recovery import targeted_search_kind
             if not targeted_search_kind(state):
                 continue
         elif spec.name == "revise_scope":
-            from app.agent.evidence_recovery import route_recovery_stop_reason
+            from app.agent.recovery.evidence_recovery import route_recovery_stop_reason
             if (route_recovery_stop_reason(state) or state.get("scope_revision_failed")
                     or (state.get("recovery_decision") or {}).get("action") != "SCOPE_REVISION"):
                 continue

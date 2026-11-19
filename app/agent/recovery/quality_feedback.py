@@ -52,7 +52,7 @@ def quality_feedback(state: dict[str, Any], *, limit: int = 3) -> dict[str, Any]
     elif not pending and gate.get("passed") is False:
         operation = mapping.get(decision.get("action"))
         if operation == "rewrite_sections":
-            from app.agent.generation_recovery import rewrite_attempt_exhausted
+            from app.agent.recovery.generation_recovery import rewrite_attempt_exhausted
             if rewrite_attempt_exhausted(state):
                 operation = None
         if operation:
@@ -87,7 +87,7 @@ def checked_recovery(state: dict[str, Any]):
             or (state.get("check_report") or {}).get("verdict") != "needs_revision"):
         return None
     from app.agent.checking import check_is_current
-    from app.agent.generation_recovery import decide_generation_recovery
+    from app.agent.recovery.generation_recovery import decide_generation_recovery
     from app.core.config import get_settings
 
     if not check_is_current(state):
@@ -118,8 +118,8 @@ def checked_section_revision(state: dict[str, Any], recovery):
 
 def diagnose_quality_recovery(state: dict[str, Any]) -> None:
     """分析角色提交缺口和备选查询，检索与写作仍由Main另行选择。"""
-    from app.agent.generation_recovery import decide_generation_recovery, input_fingerprint
-    from app.agent.evidence_recovery import query_novelty, route_recovery_stop_reason
+    from app.agent.recovery.generation_recovery import decide_generation_recovery, input_fingerprint
+    from app.agent.recovery.evidence_recovery import query_novelty, route_recovery_stop_reason
     from app.core.config import get_settings
     if state.get("pending_result_validation") or (state.get("quality_gate") or {}).get("passed") is not False:
         return
@@ -157,7 +157,7 @@ def begin_main_recovery(state: dict[str, Any], operation: str, arguments: dict[s
     if (state.get("active_quality_recovery") or state.get("pending_result_validation")
             or (state.get("quality_gate") or {}).get("passed") is not False):
         return
-    from app.agent.generation_recovery import decide_generation_recovery, start_recovery_action
+    from app.agent.recovery.generation_recovery import decide_generation_recovery, start_recovery_action
     from app.agent.execution_budget import AgentBudgetExceeded
     from app.core.config import get_settings
     from app.schemas.recovery_schema import RecoveryAction
@@ -169,7 +169,7 @@ def begin_main_recovery(state: dict[str, Any], operation: str, arguments: dict[s
     if selected is None:
         return
     if operation == "rewrite_sections":
-        from app.agent.generation_recovery import resolve_rewrite_sections
+        from app.agent.recovery.generation_recovery import resolve_rewrite_sections
         arguments = {**arguments, "section_ids": resolve_rewrite_sections(state, arguments.get("section_ids") or [])}
     decision = decide_generation_recovery(state, max_actions=get_settings().recovery_total_action_budget)
     if decision.remaining_budget <= 0:
@@ -187,5 +187,5 @@ def begin_main_recovery(state: dict[str, Any], operation: str, arguments: dict[s
 
 def complete_main_recovery(state: dict[str, Any]) -> None:
     if (state.get("active_quality_recovery") or {}).get("origin") == "main":
-        from app.agent.generation_recovery import complete_recovery_action
+        from app.agent.recovery.generation_recovery import complete_recovery_action
         complete_recovery_action(state)

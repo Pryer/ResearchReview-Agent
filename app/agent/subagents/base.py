@@ -11,7 +11,7 @@ from typing import Any
 
 from app.agent.context_builder import context_source_fingerprint
 from app.agent.task_context import build_task_state, execution_task_brief
-from app.agent.quality_feedback import quality_feedback
+from app.agent.recovery.quality_feedback import quality_feedback
 from app.schemas.check_schema import ResultIssue, SuggestedAction
 from app.agent.tool_registry import operation_allowed
 from app.schemas.agent_task_schema import (

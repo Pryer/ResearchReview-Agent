@@ -745,6 +745,7 @@ def refine_search_node(state: "ResearchAgentState", llm=None) -> "ResearchAgentS
         from app.agent.planner import (
             _normalize_topic_anchor_groups,
             refine_search_strategy,
+            search_name_source,
         )
         from app.agent.focus_coverage import (
             required_focus_coverage,
@@ -831,6 +832,10 @@ def refine_search_node(state: "ResearchAgentState", llm=None) -> "ResearchAgentS
                 feedback=feedback,
                 llm=llm,
                 existing_batches=state.get("keyword_batches") or [],
+                name_source=search_name_source(
+                    state,
+                    resumed=state.get("intent_context_role") in {"working_query", "clarification_answer"},
+                ),
             )
             if llm is not None
             else {"keywords": current_keywords}

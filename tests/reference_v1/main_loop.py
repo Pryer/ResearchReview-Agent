@@ -265,10 +265,10 @@ class MainAgentLoop:
                         "code": "unbound_agent_action", "message": action,
                     })
                     return "failed"
-                from app.agent.generation_recovery import RewriteTargetError
+                from app.agent.recovery.generation_recovery import RewriteTargetError
                 result = None
                 try:
-                    from app.agent.quality_feedback import begin_main_recovery
+                    from app.agent.recovery.quality_feedback import begin_main_recovery
                     begin_main_recovery(state, action, decision.arguments)
                     result = self.specialists.run(
                         state, decision=decision, handlers=handlers,

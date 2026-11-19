@@ -18,7 +18,7 @@ def test_published_candidate_is_not_offered_again():
 
 
 def test_recovery_targets_survive_summary_gate_and_feedback_truncation():
-    from app.agent.generation_recovery import decide_generation_recovery
+    from app.agent.recovery.generation_recovery import decide_generation_recovery
     state = {'review': '待修复正文', 'quality_gate': {'passed': False, 'blocking_issues': [
         {'code': 'claim_evidence_quality_not_met', 'message': '证据不足'}]},
         'claim_verification': {'claims': [
@@ -32,7 +32,7 @@ def test_recovery_targets_survive_summary_gate_and_feedback_truncation():
 
 
 def test_section_type_maps_to_plan_but_unknown_target_is_rejected():
-    from app.agent.generation_recovery import resolve_rewrite_sections
+    from app.agent.recovery.generation_recovery import resolve_rewrite_sections
     state = {'writing_plans': [{'deliverable_type': 'research_background',
              'sections': [{'id': 'background_body'}]}]}
     assert resolve_rewrite_sections(state, ['research_background']) == ['background_body']
@@ -58,7 +58,7 @@ def test_report_refresh_alone_does_not_create_publication():
 
 
 def test_unchanged_quality_rewrite_does_not_reset_attempt_after_rewording():
-    from app.agent.generation_recovery import repair_basis_fingerprint, rewrite_attempt_exhausted
+    from app.agent.recovery.generation_recovery import repair_basis_fingerprint, rewrite_attempt_exhausted
     state = {'review': '旧措辞', 'claim_verification': {'unsupported': 1},
              'quality_gate': {'passed': False, 'blocking_issues': [{'code': 'claim_evidence_quality_not_met'}]}}
     state['quality_recovery_history'] = [{'action': 'REWRITE_SECTIONS', 'outcome': 'no_progress',
@@ -96,7 +96,7 @@ def test_delegation_summary_does_not_double_count_quality_failure(monkeypatch):
 
 
 def test_stale_report_is_not_used_to_authorize_claim_targets():
-    from app.agent.generation_recovery import diagnose_generation_issues
+    from app.agent.recovery.generation_recovery import diagnose_generation_issues
     state = {'review': '新稿', 'check_report': {'input_fingerprint': 'old'},
         'quality_gate': {'passed': False, 'blocking_issues': [{'code': 'claim_evidence_quality_not_met'}]},
         'claim_verification': {'claims': [{'claim_id': 'c1', 'support_status': 'unsupported'}]}}

@@ -172,7 +172,7 @@ def run_route_evidence_recovery(
     should_cancel: Callable[[], bool] | None = None,
 ) -> None:
     """在路线验证和 Claim Planning 之间执行有界、增量的证据恢复闭环。"""
-    from app.agent.evidence_recovery import count_new_relevant_evidence, route_recovery_stop_reason
+    from app.agent.recovery.evidence_recovery import count_new_relevant_evidence, route_recovery_stop_reason
     from app.schemas.recovery_schema import RecoveryAction, RecoveryStatus
 
     settings = get_settings()
@@ -191,7 +191,7 @@ def run_route_evidence_recovery(
     state.setdefault("route_recovery_attempts", {})
     state.setdefault("scope_revision_count", 0)
     state.setdefault("recovery_history", [])
-    from app.agent.generation_recovery import recovery_action_count
+    from app.agent.recovery.generation_recovery import recovery_action_count
 
     # WHY: v1 会话分别保存路线轮次和写作尝试；迁移后以两类旧计数之和作为
     # 下界，避免新增共享计数从零开始而绕过任务总预算。

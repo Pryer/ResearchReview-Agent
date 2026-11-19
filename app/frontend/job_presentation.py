@@ -61,3 +61,21 @@ def can_download_draft(metadata):
     return bool((delivery == 'draft' or (not delivery and metadata.get('status') == 'partial'))
                 and (metadata.get('draft_released') is True or gate.get('draft_released') is True)
                 and str(metadata.get('body') or '').strip())
+
+
+def draft_notice(metadata):
+    if not can_download_draft(metadata):
+        return ""
+    status = metadata.get("verification_status")
+    verification = {
+        "complete": "当前版本的语义核验已通过",
+        "partial": "语义核验尚未全部通过",
+        "pending": "语义核验尚未完成",
+        "not_started": "语义核验尚未开始",
+    }.get(status, "语义核验状态未知")
+    return f"研究草稿 · 正式交付门禁待通过 · {verification}"
+
+
+def draft_markdown(metadata):
+    notice = draft_notice(metadata)
+    return f"> **{notice}**\n\n{metadata['body']}" if notice else ""

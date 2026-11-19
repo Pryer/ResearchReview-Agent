@@ -10,7 +10,7 @@ from app.schemas.agent_task_schema import AgentRole
 
 class WritingAgent(BaseSubAgent):
     def _outcome(self, state, status, changed):
-        from app.agent.quality_feedback import candidate_usability
+        from app.agent.recovery.quality_feedback import candidate_usability
         from app.schemas.agent_task_schema import AgentTaskOutcome, AgentTaskStatus
         if status == AgentTaskStatus.COMPLETED and not candidate_usability(state)["usable"]:
             return AgentTaskOutcome.BLOCKED
@@ -27,7 +27,7 @@ class WritingAgent(BaseSubAgent):
     def summarize(
         self, state: dict[str, Any]
     ) -> tuple[list[str], list[str], list[dict[str, Any]]]:
-        from app.agent.quality_feedback import candidate_usability
+        from app.agent.recovery.quality_feedback import candidate_usability
         candidate = candidate_usability(state)
         findings = [
             f"生成 {len(state.get('writing_plans') or [])} 个写作计划，正文 {len(str(state.get('review') or ''))} 字符",

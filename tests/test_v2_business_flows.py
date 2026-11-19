@@ -35,7 +35,8 @@ def test_v2_clarification_is_persisted_as_a_resumable_user_question(db, monkeypa
     followup = ScriptedLLM({'main_agent_decision': [('report_blocked', {'reason': '当前范围证据仍不足'})]})
     monkeypatch.setattr(graph, '_get_llm', lambda: followup)
     monkeypatch.setattr('app.agent.research_semantic_parser.parse_research_semantics', lambda *a, **kw: NS(model_dump=lambda **kw: {}))
-    result = ResearchConversationService(db, llm=None).handle(AgentRequest(session_id='v2',
+    rewriter = NS(complete=lambda *a, **kw: '{}')
+    result = ResearchConversationService(db, llm=rewriter).handle(AgentRequest(session_id='v2',
         user_query=current['user_query'], clarification_answer='仅限2021-2023年，仍需40篇'))
     assert result['status'] == 'blocked'
     goal = json.loads(followup.calls[0][1][-1]['content'])['goal']

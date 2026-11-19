@@ -39,7 +39,7 @@ _RESOLVED_STRUCTURAL_ACTIONS = {
 def route_recovery_stop_reason(state: dict[str, Any]) -> str:
     """调度与执行共用的恢复边界；耗尽后不再调用模型重复诊断。"""
     from app.core.config import get_settings
-    from app.agent.generation_recovery import recovery_action_count
+    from app.agent.recovery.generation_recovery import recovery_action_count
 
     settings = get_settings()
     if not settings.enable_evidence_recovery or state.get("allow_evidence_expansion") is False:
@@ -79,7 +79,7 @@ def targeted_search_kind(state: dict[str, Any]) -> str:
     decision = state.get("recovery_decision") or {}
     if (decision.get("kind") == "quality" and decision.get("action") == "TARGETED_SEARCH"
             and decision.get("queries") and (state.get("evidence_gap_report") or {}).get("quality_claim_gaps")):
-        from app.agent.generation_recovery import input_fingerprint
+        from app.agent.recovery.generation_recovery import input_fingerprint
         # WHY: 查询只适用于被Analysis诊断的正文/证据/授权，资料变化后必须重新诊断。
         if (state.get("evidence_gap_report") or {}).get("quality_input_fingerprint") == input_fingerprint(state):
             return "quality"

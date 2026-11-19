@@ -3,7 +3,12 @@ import copy
 
 import pytest
 
-from app.frontend.job_presentation import terminal_job_message, can_download_draft
+from app.frontend.job_presentation import (
+    can_download_draft,
+    draft_markdown,
+    draft_notice,
+    terminal_job_message,
+)
 
 
 def publication():
@@ -59,6 +64,20 @@ def test_download_requires_release_flag_and_body():
     assert not can_download_draft({**current, 'body': ''})
     assert not can_download_draft({**current, 'draft_released': False, 'quality_gate': {'passed': False}})
     assert not can_download_draft({**current, 'delivery_status': 'none'})
+
+
+@pytest.mark.parametrize(('status', 'label'), [
+    ('complete', '当前版本的语义核验已通过'),
+    ('partial', '语义核验尚未全部通过'),
+    ('not_started', '语义核验尚未开始'),
+    (None, '语义核验状态未知'),
+])
+def test_download_keeps_visible_draft_grade_and_verification_after_export(status, label):
+    current = {**publication(), 'verification_status': status}
+    notice = draft_notice(current)
+    assert '正式交付门禁待通过' in notice and label in notice
+    assert draft_markdown(current) == f"> **{notice}**\n\n{current['body']}"
+    assert draft_markdown({**current, 'delivery_status': 'final'}) == ''
 
 
 def test_completed_result_keeps_publication_metadata_and_question_is_not_invented():

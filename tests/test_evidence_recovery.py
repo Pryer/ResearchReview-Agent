@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from app.agent.claim_plan import apply_claim_budget, enforce_claim_evidence_gate
-from app.agent.evidence_recovery import (
+from app.agent.recovery.evidence_recovery import (
     _source_health,
     decide_recovery,
     diagnose_evidence_gaps,
@@ -276,7 +276,7 @@ def test_validate_routes_node_preserves_full_validation_report(monkeypatch):
 def test_recovery_loop_runs_incrementally_and_stops_when_route_recovers(monkeypatch):
     state = _route_state()
     llm = DiagnosisLLM()
-    monkeypatch.setattr("app.agent.recovery_loop._get_llm", lambda: llm)
+    monkeypatch.setattr("app.agent.recovery.recovery_loop._get_llm", lambda: llm)
 
     def fake_search(current, should_cancel=None):
         current["last_search_new_results"] = 1
@@ -311,17 +311,17 @@ def test_recovery_loop_runs_incrementally_and_stops_when_route_recovers(monkeypa
         }
         return current
 
-    monkeypatch.setattr("app.agent.recovery_loop.search_node", fake_search)
+    monkeypatch.setattr("app.agent.recovery.recovery_loop.search_node", fake_search)
     def fake_rank(current, llm=None):
         assert llm is None
         return current
 
-    monkeypatch.setattr("app.agent.recovery_loop.rank_node", fake_rank)
-    monkeypatch.setattr("app.agent.recovery_loop.fetch_detail_node", fake_fetch)
-    monkeypatch.setattr("app.agent.recovery_loop.download_pdf_node", lambda current: current)
-    monkeypatch.setattr("app.agent.recovery_loop.should_parse_pdf", lambda current: False)
-    monkeypatch.setattr("app.agent.recovery_loop.extract_card_node", fake_extract)
-    monkeypatch.setattr("app.agent.recovery_loop.validate_routes_node", fake_validate)
+    monkeypatch.setattr("app.agent.recovery.recovery_loop.rank_node", fake_rank)
+    monkeypatch.setattr("app.agent.recovery.recovery_loop.fetch_detail_node", fake_fetch)
+    monkeypatch.setattr("app.agent.recovery.recovery_loop.download_pdf_node", lambda current: current)
+    monkeypatch.setattr("app.agent.recovery.recovery_loop.should_parse_pdf", lambda current: False)
+    monkeypatch.setattr("app.agent.recovery.recovery_loop.extract_card_node", fake_extract)
+    monkeypatch.setattr("app.agent.recovery.recovery_loop.validate_routes_node", fake_validate)
 
     _run_route_evidence_recovery(state)
 
@@ -356,7 +356,7 @@ def test_recovery_does_not_treat_off_target_evidence_as_progress(monkeypatch):
         "search_queries": ["other direction query"],
     })
     llm = DiagnosisLLM()
-    monkeypatch.setattr("app.agent.recovery_loop._get_llm", lambda: llm)
+    monkeypatch.setattr("app.agent.recovery.recovery_loop._get_llm", lambda: llm)
 
     def fake_search(current, should_cancel=None):
         current["last_search_new_results"] = 1
@@ -392,21 +392,21 @@ def test_recovery_does_not_treat_off_target_evidence_as_progress(monkeypatch):
         }
         return current
 
-    monkeypatch.setattr("app.agent.recovery_loop.search_node", fake_search)
-    monkeypatch.setattr("app.agent.recovery_loop.rank_node", lambda current, llm=None: current)
+    monkeypatch.setattr("app.agent.recovery.recovery_loop.search_node", fake_search)
+    monkeypatch.setattr("app.agent.recovery.recovery_loop.rank_node", lambda current, llm=None: current)
     monkeypatch.setattr(
-        "app.agent.recovery_loop.fetch_detail_node",
+        "app.agent.recovery.recovery_loop.fetch_detail_node",
         lambda current, should_cancel=None: current,
     )
-    monkeypatch.setattr("app.agent.recovery_loop.download_pdf_node", lambda current: current)
-    monkeypatch.setattr("app.agent.recovery_loop.should_parse_pdf", lambda current: False)
+    monkeypatch.setattr("app.agent.recovery.recovery_loop.download_pdf_node", lambda current: current)
+    monkeypatch.setattr("app.agent.recovery.recovery_loop.should_parse_pdf", lambda current: False)
     monkeypatch.setattr(
-        "app.agent.recovery_loop.extract_card_node",
+        "app.agent.recovery.recovery_loop.extract_card_node",
         lambda current, llm=None: current.update(
             {"paper_cards": [{"paper_id": "p-off", "title": "Off target"}]}
         ) or current,
     )
-    monkeypatch.setattr("app.agent.recovery_loop.validate_routes_node", fake_validate)
+    monkeypatch.setattr("app.agent.recovery.recovery_loop.validate_routes_node", fake_validate)
 
     _run_route_evidence_recovery(state)
 

@@ -65,6 +65,31 @@ def retired_protocol_reference(request, monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def forbid_provider_connections(monkeypatch):
+    if os.environ.get("RRA_OFFLINE_TESTS") != "1":
+        return
+    import socket
+    from ipaddress import ip_address
+
+    def guard(connect):
+        def connect_local(sock, address):
+            if sock.family == getattr(socket, "AF_UNIX", None):
+                return connect(sock, address)
+            try:
+                local = ip_address(address[0]).is_loopback
+            except (TypeError, ValueError):
+                local = False
+            # WHY: Windows 的 asyncio 使用 loopback 建立进程内自唤醒通道。
+            if local:
+                return connect(sock, address)
+            pytest.fail("CI tests must mock outbound connections")
+        return connect_local
+
+    monkeypatch.setattr(socket.socket, "connect", guard(socket.socket.connect))
+    monkeypatch.setattr(socket.socket, "connect_ex", guard(socket.socket.connect_ex))
+
+
+@pytest.fixture(autouse=True)
 def offline_rag_models(monkeypatch, tmp_path):
     from app.core.config import get_settings
     from app.services import retrieval_ranking_service

@@ -405,6 +405,60 @@ def test_generate_search_strategy_adopts_bilingual_retry_anchors():
     assert len(strategy["dropped_monolingual_groups"]) == 1  # 首轮丢弃被记录
 
 
+def test_user_named_benchmark_survives_retry_without_model_added_aliases():
+    from app.agent.planner import llm_generate_search_strategy, llm_refine_search_strategy
+
+    class BenchmarkLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, prompt, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return '{"keywords":["SQuAD"],"topic_anchors":[["SQuAD","general benchmark"],["QA"]]}'
+            return '{"keywords":["SQuAD"],"topic_anchors":[["问答","question answering"]]}'
+
+    query = "写一份 SQuAD 数据集上的问答研究综述"
+    for strategy in (
+        llm_generate_search_strategy("问答基准", query, BenchmarkLLM()),
+        llm_refine_search_strategy("问答基准", query, ["SQuAD"], {}, BenchmarkLLM()),
+    ):
+        assert strategy["topic_anchors"] == [["SQuAD"], ["问答", "question answering"]]
+        assert strategy["dropped_monolingual_groups"] == [
+            {"group": "QA", "reason": "missing_topic_language_term"}
+        ]
+
+
+def test_only_short_acronym_anchored_in_user_query_counts_as_english():
+    from app.agent.planner import has_english_search_keyword
+
+    assert has_english_search_keyword("RAG", "写一份RAG的研究综述")
+    assert not has_english_search_keyword("QA", "写一份RAG的研究综述")
+    assert not has_english_search_keyword("RAG", "调研RAGX方法")
+
+
+def test_model_rewritten_working_query_cannot_authorize_new_proper_names():
+    from app.agent.planner import llm_generate_search_strategy, search_name_source
+
+    class ModelLLM:
+        def complete(self, prompt, **kwargs):
+            return '{"keywords":["SQuAD QA"],"topic_anchors":[["SQuAD"],["MMLU"],["QA"]]}'
+
+    state = {
+        "user_query": "对比 SQuAD、MMLU 与 QA",
+        "research_request": {"original_query": "调研 SQuAD"},
+        "user_clarifications": ["只看 QA"],
+    }
+    strategy = llm_generate_search_strategy(
+        "问答综述", state["user_query"], ModelLLM(),
+        name_source=search_name_source(state, resumed=True),
+    )
+    assert strategy["topic_anchors"] == [["SQuAD"], ["QA"]]
+    dropped = strategy["dropped_monolingual_groups"]
+    assert {item["group"] for item in dropped} == {"MMLU"}
+    assert all(item["reason"] == "missing_topic_language_term" for item in dropped)
+
+
 def test_generate_search_strategy_consumes_list_form_anchors():
     """list 形态概念组不再被 dict 过滤器静默丢弃（管道断点回归测试）。"""
 

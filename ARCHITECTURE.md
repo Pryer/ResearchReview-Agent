@@ -30,6 +30,7 @@ ResearchReview-Agent/
 ├── run_api.py                 # FastAPI 启动入口（uvicorn app.main:app）
 ├── run_chat_frontend.py       # Streamlit 前端启动入口
 ├── requirements.txt / environment.yml / pyproject.toml
+├── .github/workflows/ci.yml   # Linux/Windows 离线 pytest
 │
 ├── app/                       # 应用主体（分层架构）
 │   ├── main.py                # FastAPI 实例：路由注册、CORS、异常处理、lifespan 建表与任务恢复
@@ -49,11 +50,10 @@ ResearchReview-Agent/
 │   │   ├── subagents/         # 四角色Action执行器与字段权限
 │   │   ├── execution.py       # 执行原语：AgentCancelledError、节点边界检查、LLM 工厂
 │   │   ├── retrieval_loop.py  # ReAct 检索精化循环（从 graph 下沉的策略层）
-│   │   ├── recovery_loop.py   # 路线证据恢复状态机（从 graph 下沉的策略层）
+│   │   ├── recovery/          # 核验反馈、生成恢复、证据恢复与跨动作交接
 │   │   ├── planner.py / slot_extractor.py / intent.py  # 规划、槽位提取与意图识别
 │   │   ├── writing_plan.py / claim_plan.py  # 写作计划构建与声明计划
 │   │   ├── route_validator.py / route_targets.py / provisional_routes.py  # 路线验证、目标推导与候选路线
-│   │   ├── evidence_recovery.py / generation_recovery.py  # 证据恢复与生成恢复
 │   │   ├── global_evidence_gate.py / focus_coverage.py  # 全局证据门禁与焦点覆盖
 │   │   ├── deliverable_router.py / evidence_roles.py  # 交付物路由与证据角色
 │   │   ├── diagnostics.py / state_invariants.py / exceptions.py  # 诊断导出、状态不变量与异常
@@ -101,14 +101,10 @@ ResearchReview-Agent/
 ├── tests/                     # pytest 用例（熔断、并发、引用、意图、质量门控等）
 ├── examples/                  # 标准场景（叙述性综述/相关工作/不支持请求）与对应的预期状态
 ├── docs/                      # 设计与运维文档（CNKI 排障、前端指南、意图识别设计、证据验证等）
-├── data/                      # 运行数据（不入库）
-│   ├── research_review.db     # 主数据库（任务、会话、论文、综述）
-│   ├── pdfs/ parsed/ imports/ reviews/   # PDF 缓存与导入
-│   ├── eval_bundles/          # 每次运行的诊断评估包（graph.py 自动导出）
-│   └── artifacts/             # 命令行脚本产出的结果快照
-├── logs/                      # 运行日志
-└── chromedriver-win64/        # CNKI Selenium 专用 chromedriver
+└── data/、logs/               # 应用按运行需要生成的本地数据与日志
 ```
+
+CNKI 适配器启用时，浏览器驱动由部署环境提供，见 [.env.example](.env.example)。
 
 ## 3. 核心数据流
 
@@ -252,4 +248,4 @@ v2 全量回归在 `rragent` 中通过 **2769 项**，包含原生 pgvector 集�
 
 研究任务先检索和筛选论文，再按需获取 PDF。`parse_pdf.py` 使用 PyMuPDF 的逐页文本提取，清洗后保留页面文本；章节标题规则形成可跨页延续章节身份的 `section_spans`。页码和字符区间以清洗后的页面文本为基准，能回读对应原文区间。随后切块、构建或复用论文内向量索引，按字段混合检索证据，再由 LLM 抽取 PaperCard，进入主张规划与写作。该任务路径采用按需处理与结果缓存；单篇入库服务也可预先生成卡片。
 
-当前解析器没有专门的双栏阅读顺序重排、跨页段落重建、OCR 或表格结构恢复模块；低文本页作为 OCR 候选诊断，阅读顺序标记为未验证。来源定位验证与版面语义正确性分别评估。检索和核验的可复现小规模结果见 [评测报告](docs/benchmarks.md)。
+可用 `PDF_LAYOUT_ENABLED=true` 给新解析开启版面检测。PyMuPDF 坐标用于识别明确的双栏区间，表格检测在诊断中记录单元格、行列及原页矩形。跨页延续章节身份，每页保留自身偏移。检测结果用于专项评测，阅读顺序仍标为未验证。PDF 专项样本与限制见 [版面对照评测](docs/validation/pdf-layout.md)。

@@ -288,6 +288,22 @@ def test_plan_reparses_semantics_after_working_query_changes(monkeypatch):
     assert state["semantic_frame_source_query"] == working
 
 
+def test_plan_node_accepts_explicit_short_acronym_as_english_keyword(monkeypatch):
+    from app.agent import planner
+
+    build_plan = planner.build_search_plan
+
+    def acronym_only_plan(*args, **kwargs):
+        return {**build_plan(*args, **kwargs), "keywords": ["RAG"], "planning_error": None}
+
+    monkeypatch.setattr(planner, "build_search_plan", acronym_only_plan)
+    state = {"user_query": "写一份开放域问答中 RAG 的研究现状", "steps": [], "errors": []}
+    plan_node(state, llm=None, current_year=2026)
+
+    assert "RAG" in state["keywords"]
+    assert not state.get("planning_failed"), state["errors"]
+
+
 def test_plan_uses_current_time_tool_for_relative_year_range():
     state = {
         "user_query": "帮我调研近五年目标检测论文，引用不少于5篇",

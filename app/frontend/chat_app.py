@@ -28,7 +28,7 @@ from app.frontend.progress_labels import (
     recovery_progress_view,
 )
 from app.frontend.query_utils import build_agent_request_payload
-from app.frontend.job_presentation import terminal_job_message, can_download_draft
+from app.frontend.job_presentation import draft_markdown, draft_notice, terminal_job_message
 
 st.set_page_config(
     page_title="ResearchReview-Agent Chat",
@@ -184,13 +184,20 @@ def render_active_job() -> None:
         st.caption(describe_execution_progress(execution))
     else:
         st.progress(min(current / total, 1.0), text=f"进度 {current}/{total}")
-    available=job.get("available_delivery") or {}
-    if available.get("body"):
-        with st.expander("阅读已生成的草稿", expanded=True):
+    available = job.get("available_delivery") or {}
+    notice = draft_notice(available)
+    final = available.get("delivery_status") == "final" and available.get("body")
+    if notice or final:
+        label = "草稿" if notice else "已交付版本"
+        with st.expander(f"阅读{label}", expanded=True):
+            if notice:
+                st.warning(notice)
             st.markdown(available["body"])
-            st.download_button("下载当前草稿", data=available["body"],
-                file_name="research_draft.md", mime="text/markdown",
-                key=f"active_draft_{active['job_id']}_{available.get('published_draft_version')}")
+            st.download_button(f"下载{label}",
+                data=draft_markdown(available) if notice else available["body"],
+                file_name="research_draft.md" if notice else "research_review.md",
+                mime="text/markdown",
+                key=f"active_delivery_{active['job_id']}_{available.get('published_draft_version')}")
 
     if status in {"queued", "running", "cancel_requested"}:
         if st.button(
@@ -218,6 +225,9 @@ def render_assistant_message(
     allow_actions: bool = False,
 ) -> None:
     with st.chat_message("assistant", avatar="🤖"):
+        notice = draft_notice(metadata or {})
+        if notice:
+            st.warning(notice)
         st.markdown(content)
         if metadata:
             render_message_metadata(metadata, allow_actions=allow_actions)
@@ -355,13 +365,11 @@ def render_message_metadata(metadata: dict, *, allow_actions: bool = False) -> N
     if references:
         with st.expander(f"📚 参考文献（{len(references)}）"):
             render_references_compact(references)
-    if (
-        allow_actions
-        and can_download_draft(metadata)
-    ):
+    download = draft_markdown(metadata) if allow_actions else ""
+    if download:
         st.download_button(
             "下载带限制说明的草稿",
-            data=str(metadata["body"]),
+            data=download,
             file_name="research_best_effort_draft.md",
             mime="text/markdown",
             key=f"download_best_effort_{metadata.get('session_id') or 'current'}",

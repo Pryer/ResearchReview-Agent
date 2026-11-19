@@ -12,6 +12,8 @@ mock-based tests. They do not contain API keys and do not require live data sour
   including committed-checkpoint and lease preconditions and retained budgets.
 - clarified_classroom_request.json: merged original request plus clarification,
   with expected working-query terms and constraints (40 references, two sections).
+- [Traceable draft](traceable-draft.md): a draft-format example with sentence-level
+  source links and verification status, based on the repository's generated test PDFs.
 
 ## Hybrid retrieval evaluation fixtures
 

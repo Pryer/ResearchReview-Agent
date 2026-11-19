@@ -124,7 +124,7 @@ def test_writing_output_remains_strict(operation):
 def test_rejected_writing_blocks_both_entrypoints_before_creating_task(rejected_operation):
     from app.agent.action_registry import allowed_actions
     from app.agent.controller import AgentController
-    from app.agent.generation_recovery import input_fingerprint
+    from app.agent.recovery.generation_recovery import input_fingerprint
     state = _state()
     state['recovery_candidate_rejections'] = [{
         'operation': rejected_operation, 'input_fingerprint': input_fingerprint(state),
@@ -137,7 +137,7 @@ def test_rejected_writing_blocks_both_entrypoints_before_creating_task(rejected_
                                objective='换个理由仍不得重复写', state=state,
                                handler=lambda s: pytest.fail('must not write'))
     state['paper_cards'].append({'paper_id': 'new', 'title': '新增证据'})
-    from app.agent.generation_recovery import rewrite_attempt_exhausted
+    from app.agent.recovery.generation_recovery import rewrite_attempt_exhausted
     assert not rewrite_attempt_exhausted(state)
     assert 'generate_deliverables' in allowed_actions(state)
 
@@ -170,7 +170,7 @@ def test_rejected_candidate_restores_verified_draft_without_second_mutating_vali
     monkeypatch.setattr(graph, '_generate_deliverables_or_block', generate)
     monkeypatch.setattr(graph, '_verify_generated_draft', verify)
     monkeypatch.setattr('app.agent.nodes.synthesis._apply_final_quality_gate', lambda s: s.update(quality_gate={'passed': False}))
-    monkeypatch.setattr('app.agent.generation_recovery.candidate_is_not_worse', lambda a, b: False)
+    monkeypatch.setattr('app.agent.recovery.generation_recovery.candidate_is_not_worse', lambda a, b: False)
     def run(loop, current, *, handlers, **kwargs):
         loop.controller.execute(role=ACTION_REGISTRY[operation].role, operation=operation,
             objective='验证候选回滚', state=current,

@@ -1994,6 +1994,8 @@ def test_released_best_effort_draft_is_persisted_with_partial_status():
 
 def test_unauthorized_failed_draft_is_blocked_instead_of_partial_when_budget_exhausted():
     """未获授权草稿在无法继续恢复时必须隔离，不能作为 partial 正文返回。"""
+    from app.core.config import get_settings
+
     db = _db_session()
     service = ResearchConversationService(
         db,
@@ -2001,7 +2003,8 @@ def test_unauthorized_failed_draft_is_blocked_instead_of_partial_when_budget_exh
         agent_runner=lambda *args, **kwargs: {},
     )
     result = _quality_blocked_result(required=3, available=3)
-    result["research_state"]["recovery_action_count"] = 6
+    result["research_state"]["recovery_action_count"] = get_settings().recovery_total_action_budget
+    result["research_state"]["best_effort_on_failure"] = False
     result["answer"] = "## 研究背景\n\nQUARANTINE_SENTINEL 未经验证的正文"
     result["quality_gate"] = {
         "passed": False,

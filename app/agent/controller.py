@@ -124,7 +124,7 @@ class AgentController:
                 raise ValueError("new search results require Analysis authorization before writing")
             if state.get("pending_result_validation"):
                 raise ValueError("candidate is awaiting independent validation")
-            from app.agent.generation_recovery import rewrite_attempt_exhausted
+            from app.agent.recovery.generation_recovery import rewrite_attempt_exhausted
 
             # WHY: 直接调用 Controller 同样受恢复限制，在创建任务、预留预算和
             # 幂等缓存复用前拦截；不能仅靠可用动作列表约束模型决策。

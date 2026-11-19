@@ -7,7 +7,7 @@
 本文件同时承载写作质量边界（主张对齐、引用一致性、引用缺口修复与草稿回滚）和
 最终输出组装。执行原语（协作式取消、节点边界检查、LLM 工厂）在
 ``app.agent.execution``，检索精化循环在 ``app.agent.retrieval_loop``，
-证据恢复状态机在 ``app.agent.recovery_loop``。
+证据恢复状态机在 ``app.agent.recovery.recovery_loop``。
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from app.agent.nodes import (
     validate_routes_node,
     verify_claims_node,
 )
-from app.agent.recovery_loop import run_route_evidence_recovery as _run_route_evidence_recovery
+from app.agent.recovery.recovery_loop import run_route_evidence_recovery as _run_route_evidence_recovery
 from app.agent.retrieval_loop import (
     search_rank_with_refinement as _search_rank_with_refinement,
 )
@@ -128,8 +128,8 @@ def build_research_actions(
         )
 
     def _targeted_search(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
-        from app.agent.delegation_recovery import search_once
-        from app.agent.evidence_recovery import targeted_search_kind
+        from app.agent.recovery.delegation_recovery import search_once
+        from app.agent.recovery.evidence_recovery import targeted_search_kind
         if _arguments.get("queries"):
             current["recovery_decision"]={**(current.get("recovery_decision") or {}),
                 "queries":list(_arguments["queries"]),"gap_ids":list(_arguments.get("gap_ids") or []),
@@ -145,14 +145,14 @@ def build_research_actions(
         from app.agent.nodes import diagnose_evidence_gaps_node, recovery_controller_node
         diagnose_evidence_gaps_node(current, llm=_role_llm(llm, "analysis"))
         recovery_controller_node(current)
-        from app.agent.quality_feedback import diagnose_quality_recovery
+        from app.agent.recovery.quality_feedback import diagnose_quality_recovery
         diagnose_quality_recovery(current)
 
     def _revise_scope(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
         from app.agent.nodes import scope_revision_node
-        from app.agent.recovery_loop import refresh_recovery_queries_from_framework
-        from app.agent.evidence_recovery import route_recovery_stop_reason
-        from app.agent.generation_recovery import recovery_action_count
+        from app.agent.recovery.recovery_loop import refresh_recovery_queries_from_framework
+        from app.agent.recovery.evidence_recovery import route_recovery_stop_reason
+        from app.agent.recovery.generation_recovery import recovery_action_count
         from app.agent.execution_budget import consume
         if (route_recovery_stop_reason(current)
                 or int(current.get("scope_revision_count") or 0) >= settings.evidence_recovery_max_scope_revisions
@@ -187,7 +187,7 @@ def build_research_actions(
                 current,
                 llm=_role_llm(llm, "analysis") if settings.enable_llm_clustering else None,
             )
-        from app.agent.delegation_recovery import settle_after_analysis
+        from app.agent.recovery.delegation_recovery import settle_after_analysis
         settle_after_analysis(current)
 
     def _cluster(current: ResearchAgentState, _arguments: dict[str, Any]) -> None:
@@ -204,13 +204,13 @@ def build_research_actions(
         if current.get("paper_details") and settings.enable_global_evidence_gate:
             global_evidence_gate_node(current)
         if (current.get("pending_evidence_recovery") or {}).get("kind") == "quality":
-            from app.agent.delegation_recovery import settle_after_analysis
+            from app.agent.recovery.delegation_recovery import settle_after_analysis
             settle_after_analysis(current)
 
     def _write(current: ResearchAgentState, arguments: dict[str, Any]) -> None:
-        from app.agent.generation_recovery import input_fingerprint
+        from app.agent.recovery.generation_recovery import input_fingerprint
         if arguments.get("section_ids"):
-            from app.agent.generation_recovery import resolve_rewrite_sections
+            from app.agent.recovery.generation_recovery import resolve_rewrite_sections
             arguments = {**arguments, "section_ids": resolve_rewrite_sections(current, arguments["section_ids"])}
         previous = copy.deepcopy(current)
         # WHY: 保留版本比较到独立分析结束；快照只能由服务加载，不进入模型上下文。
@@ -370,7 +370,7 @@ def build_research_actions(
             final_answer_node(current, prevalidated=True)
             return True
         quality = current.get("quality_gate") or {}
-        from app.agent.generation_recovery import draft_has_unsafe_quality
+        from app.agent.recovery.generation_recovery import draft_has_unsafe_quality
         if status == "partial" and quality.get("draft_released") and not draft_has_unsafe_quality(current):
             current["result_status"] = "partial"
             final_answer_node(current, prevalidated=True)
@@ -417,7 +417,7 @@ def _complete_research_pipeline(state, status, *, progress_callback=None):
         state["answer"] = (state.get("clarification") or {}).get("question", "请补充研究范围。")
     if (state.get("active_quality_recovery")
             and status in {"completed", "partial", "blocked", "failed", "cancelled"}):
-        from app.agent.generation_recovery import complete_recovery_action
+        from app.agent.recovery.generation_recovery import complete_recovery_action
 
         complete_recovery_action(state)
         if state.get("quality_recovery_history") and status in {"failed", "cancelled"}:
@@ -1410,7 +1410,7 @@ def continue_research_agent(
     normalize_orchestration_mode(state)
     normalize_retrieval_profile(state)
     state["agent_operation_mode"] = "incremental"
-    from app.agent.generation_recovery import active_focus_recovery_targets
+    from app.agent.recovery.generation_recovery import active_focus_recovery_targets
 
     if active_focus_recovery_targets(state):
         # WHY: 质量恢复阶梯已决定执行重点补检索；主 Agent 的路线检索动作
@@ -1492,7 +1492,7 @@ def regenerate_research_agent(
         # WHY: 重验只处理真正待补的语义判定。已在报告中明确核验完成或缺引用/
         # 缺片段的结构性主张重验永远 submitted=0，必须在直接执行入口过滤，不能
         # 只靠调度层与提示词；状态未知的目标保留，由验证器按当前证据自行判定。
-        from app.agent.generation_recovery import (
+        from app.agent.recovery.generation_recovery import (
             complete_recovery_action, reverify_eligible_claim_ids, reverify_ineligible_claim_ids,
         )
 

@@ -4,10 +4,11 @@ import json
 
 import pytest
 
-from app.agent import graph, recovery_loop
+from app.agent import graph
+from app.agent.recovery import recovery_loop
 from app.agent.action_registry import allowed_actions, recovery_handoff_action
 from app.agent.context_builder import build_main_agent_context
-from app.agent.evidence_recovery import targeted_search_kind
+from app.agent.recovery.evidence_recovery import targeted_search_kind
 from tests.reference_v1.main_loop import _progress_fingerprint
 from app.agent.nodes.verification import claim_plan_node, claim_evidence_gate_node
 from app.agent.deliverable_router import check_generation_readiness

@@ -819,9 +819,9 @@ class ResearchConversationService:
             return snapshot
 
         editable = dict(state.get("editable_research_state") or {})
-        from app.agent.generation_recovery import recovery_action_count
+        from app.agent.recovery.generation_recovery import recovery_action_count
         from app.core.config import get_settings
-        from app.agent.evidence_recovery import route_recovery_stop_reason
+        from app.agent.recovery.evidence_recovery import route_recovery_stop_reason
 
         stop_reason = (
             "任务级恢复预算已耗尽"
@@ -983,7 +983,7 @@ class ResearchConversationService:
             )
 
         if decision["action"] == "retry_search" and clarification.get("recovery_kind") == "focus_coverage":
-            from app.agent.generation_recovery import decide_generation_recovery
+            from app.agent.recovery.generation_recovery import decide_generation_recovery
             from app.core.config import get_settings
             from app.schemas.recovery_schema import RecoveryAction, RecoveryStatus
 
@@ -1603,7 +1603,7 @@ class ResearchConversationService:
         """诊断写作缺口，并在共享预算内执行无需用户改约束的恢复动作。"""
         if _has_hard_execution_stop(result):
             return None
-        from app.agent.generation_recovery import decide_generation_recovery
+        from app.agent.recovery.generation_recovery import decide_generation_recovery
         from app.core.config import get_settings
         from app.schemas.recovery_schema import RecoveryAction, RecoveryStatus
 
@@ -1764,7 +1764,7 @@ class ResearchConversationService:
         decision: dict[str, Any],
         history: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
-        from app.agent.generation_recovery import start_recovery_action
+        from app.agent.recovery.generation_recovery import start_recovery_action
         from app.schemas.recovery_schema import GenerationRecoveryDecision, RecoveryAction
 
         editable = dict(state.get("editable_research_state") or result.get("research_state") or {})

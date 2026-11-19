@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from app.agent.execution_budget import consume, check_execution
-from app.agent.recovery_loop import (
+from app.agent.recovery.recovery_loop import (
     _append_recovery_history, _route_core_counts, _refresh_evidence_snapshot,
     _record_route_evidence_deficits,
 )
@@ -10,8 +10,8 @@ from app.core.config import get_settings
 
 
 def search_once(state, *, search, rank, should_cancel=None):
-    from app.agent.evidence_recovery import targeted_search_kind
-    from app.agent.generation_recovery import recovery_action_count
+    from app.agent.recovery.evidence_recovery import targeted_search_kind
+    from app.agent.recovery.generation_recovery import recovery_action_count
     kind = targeted_search_kind(state)
     if not kind:
         raise ValueError("targeted search is unavailable in current state")
@@ -71,7 +71,7 @@ def search_once(state, *, search, rank, should_cancel=None):
 
 def settle_after_analysis(state):
     """新证据经过路线分析后才结算边际收益，不能把搜索命中数当证据数。"""
-    from app.agent.evidence_recovery import count_new_relevant_evidence
+    from app.agent.recovery.evidence_recovery import count_new_relevant_evidence
     from app.agent.nodes import diagnose_evidence_gaps_node, global_evidence_gate_node
     from app.schemas.recovery_schema import RecoveryAction, RecoveryStatus
     pending = state.get("pending_evidence_recovery")

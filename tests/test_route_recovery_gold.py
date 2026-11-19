@@ -10,7 +10,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 from app.agent.claim_plan import enforce_claim_evidence_gate
-from app.agent.evidence_recovery import decide_recovery
+from app.agent.recovery.evidence_recovery import decide_recovery
 from app.agent.provisional_routes import validate_routes_against_evidence
 from app.agent.route_validator import guard_anchor_expansions
 from app.schemas.recovery_schema import (
@@ -231,7 +231,7 @@ def test_rr08_claim_stronger_than_evidence_is_weakened():
 
 def test_rr09_route_below_derived_target_enters_gap_report():
     """路线篇数低于交付物派生目标时必须进入缺口报告并带上目标与缺口。"""
-    from app.agent.evidence_recovery import _deterministic_route_gaps
+    from app.agent.recovery.evidence_recovery import _deterministic_route_gaps
 
     state = {
         "core_deliverables": ["research_status"],
@@ -266,7 +266,7 @@ def test_rr09_route_below_derived_target_enters_gap_report():
 
 def test_rr10_split_sub_route_gap_is_not_missed():
     """SPLIT 产出的子路线不在 provisional_routes 中，此前必然漏诊。"""
-    from app.agent.evidence_recovery import _deterministic_route_gaps
+    from app.agent.recovery.evidence_recovery import _deterministic_route_gaps
 
     state = {
         "core_deliverables": ["research_status"],
@@ -351,7 +351,7 @@ def test_shared_recovery_query_is_dispatched_once_and_attributed_to_each_route()
 
 def test_rr14_route_query_regeneration_survives_novelty_gate_without_llm():
     """无 LLM 时路线概念子集组合必须能产生通过新颖度门槛的补检索查询。"""
-    from app.agent.evidence_recovery import _regenerated_route_queries
+    from app.agent.recovery.evidence_recovery import _regenerated_route_queries
 
     route = _route("RR14", "时序对齐", "temporal alignment")
     # 首轮查询已在历史中，novelty=0；核心概念子集是更窄的检索式，仍然新颖。
